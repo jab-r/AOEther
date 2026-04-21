@@ -346,11 +346,26 @@ See the detailed M1 plan below.
 
 ### M3 — Tier 2 hardware, hardware PTP
 
-**Goal:** Bring up same stack on a Tier 2 Linux SBC. Validate sub-µs PTP sync.
+**Goal:** Bring up the same receiver stack on a Tier 2 Linux SBC with hardware-PTP-capable Ethernet. Validate sub-µs `ptp4l` sync. Lay the plumbing for gPTP-disciplined emission (Mode B) and multi-receiver phase alignment.
 
-**Deliverables:** Receiver runs on at least one Tier 2 platform (i.MX 8M Mini recommended). `ptp4l` with hardware timestamping. Two-talker phase alignment measured.
+M3 is split into two sub-phases because it's mostly hardware work:
 
-**Time estimate:** 3–4 weekends, mostly hardware bring-up.
+**Phase A — docs-ready (can land without hardware):**
+- `docs/tier2-bringup.md` — reference platform choice (i.MX 8M Mini), OS choice (Debian 12 arm64 or Yocto), kernel/driver confirmation steps, first-boot checks that exercise the existing M1/M2 receiver on Tier 2 without PTP.
+- `docs/ptp-setup.md` — ptp4l + phc2sys configuration for gPTP (802.1AS) and PTPv2-default profiles; validation against a reference; systemd units for persistent operation; software-fallback mode for Tier 1.
+- No code changes. M1/M2 already runs on Tier 2 as a plain arm64 Debian application — that's a nice property of the Topology B choice.
+
+**Phase B — hardware-required (lands after someone has a Tier 2 board running ptp4l):**
+- Talker `--ptp-clock` / `--presentation-time-offset-ms` flags. When set, `clock_gettime(CLOCK_TAI)` on each emission, stamp `presentation_time = low32(tai_ns + offset_ns)`. Default path unchanged.
+- Receiver `presentation_time`-aware scheduling. Compute target playback time; arrange `snd_pcm_writei()` to hit that target within ALSA's achievable resolution.
+- Statistics on presentation-time arrival jitter for debugging.
+- Measured two-receiver phase alignment on a wired gigabit LAN with a scope; target < 10 µs skew.
+
+**Deliverables:** Both phases. Phase A merges independently; Phase B merges once validated on real hardware.
+
+**Key risks:** Tier 2 hardware bring-up timeline depends on board availability, not on AOEther code complexity. Managed switches often drop PTP silently — documented in `ptp-setup.md`.
+
+**Time estimate:** Phase A 1 weekend (doc writing). Phase B 2–3 weekends once a Tier 2 board is in hand, dominated by ptp4l/phc2sys tuning and scope-based measurement.
 
 ### M4 — IP/UDP transport (WiFi and routed networks)
 
