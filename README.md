@@ -69,7 +69,7 @@ You should hear a clean 1 kHz tone.
 |-----------|--------|-------------|
 | M1 | Done | Stereo PCM, RPi + USB DAC, Mode C rate feedback, Roon/UPnP/system-audio bridges, no PTP |
 | M2 | In progress | Multichannel PCM (up to 7.1.4 / 16ch), hi-res rates (up to 192 kHz), per-DAC test matrix |
-| M3 | Planned | Tier 2 hardware (Linux SBC), hardware PTP |
+| M3 | Docs ready | Tier 2 hardware (Linux SBC), hardware PTP (Phase A); hardware validation pending board |
 | M4 | Planned | IP/UDP transport (WiFi and routed networks) |
 | M5 | Planned | AVTP AAF wire format for Milan interop |
 | M6 | Planned | Native DSD64 through DSD512 end-to-end |
@@ -104,6 +104,9 @@ The same talker and receiver binaries run under every recipe; only the source da
 
 - [`docs/design.md`](docs/design.md) — full architecture and milestone plan (start here for reviewers and contributors)
 - [`docs/wire-format.md`](docs/wire-format.md) — wire protocol reference (for implementers)
+- [`docs/tier2-bringup.md`](docs/tier2-bringup.md) — getting the receiver running on an SBC with hardware PTP (M3 prep)
+- [`docs/ptp-setup.md`](docs/ptp-setup.md) — ptp4l / phc2sys configuration (M3 prep)
+- [`docs/dacs.md`](docs/dacs.md) — tested DAC matrix (growing contribution table)
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to help
 
 ## License
