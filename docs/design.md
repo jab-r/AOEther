@@ -1,12 +1,14 @@
 # Audio-over-Ethernet for USB DACs
 
-**Status:** Draft v1.1 — design doc, pre-implementation
+**Status:** Draft v1.2 — design doc, pre-implementation
 **Audience:** Contributors, reviewers, early adopters
 **License:** Apache 2.0 (proposed)
 
 **Major revision from v0.3:** Architectural pivot to **Topology B (player mode)** as the primary receiver architecture. The receiver is the USB *host* driving a USB DAC, not the USB *gadget* presented to an upstream computer. This sidesteps the `f_uac2` patching problem entirely because Linux's `snd_usb_audio` already supports native DSD up to DSD1024 via per-DAC quirks. Topology A (gadget mode, for pro-AV / DAW integration) is deferred to a later-milestone "pro" track.
 
 **Changes from v1.0:** Added **transport-mode abstraction**. The AoE header is unchanged, but the outer wrapper can be raw Ethernet (L2, default for deterministic wired deployments), AVTP (for Milan interop), or IP/UDP (for WiFi, routed networks, and AES67 interop). This acknowledges reality: WiFi is increasingly used for audio, Ravenna and AES67 are IP-based, and a single-transport design forecloses too much of the addressable user base. Milestone plan reshuffled accordingly: M4 is now "Alternative transports," pushing subsequent milestones down by one.
+
+**Changes from v1.1:** **Ravenna / AES67 interop promoted to its own milestone (M9).** In v1.1 it was a stretch goal inside M8, which was already overloaded with scale/soak/DSD1024-2048/packaging. AES67 interop is a substantial piece of work (RTP encapsulation, SDP session description, SAP announcement, PTPv2 sync) and the Ravenna/AES67 ecosystem is large enough to deserve proper scope. M8 now focuses on scale/soak/DSD-high-rates/packaging without the AES67 distraction.
 
 ## Summary
 
@@ -253,7 +255,7 @@ QoS: talker tags packets with DSCP `EF` (Expedited Forwarding) so WiFi APs route
 
 Timing: gPTP does not work over WiFi in any practical sense today, so Mode 3 over WiFi uses **software PTP** (sync via PTPv2 over UDP, 100s of µs accuracy) or **no sync** (receiver buffers aggressively and relies on async USB feedback from the DAC). Mode 3 over wired gigabit with hardware PTP is viable and gets sub-µs sync; it's the WiFi leg specifically that's timing-degraded.
 
-### Mode 4 — RTP / AES67 (M8 stretch)
+### Mode 4 — RTP / AES67 (M9)
 
 For PCM interop with the AES67 / Ravenna ecosystem. PCM samples are carried in RTP-over-UDP following the AES67 profile: L16 / L24 payload types, 1 ms packet time (or 125 µs for low-latency), 48 kHz baseline. Session described by SDP, discovered via SAP multicast. PTP required on both sides for any meaningful interop.
 
@@ -369,22 +371,43 @@ See the detailed M1 plan below.
 
 **Time estimate:** 6–8 weekends across tracks.
 
-### M8 — Scale, soak, DSD1024/2048, AES67 interop stretch
+### M8 — Scale, soak, DSD1024/2048, packaging
 
-**Goal:** Full Atmos on Linux receivers; DSD1024 / DSD2048 on MCU; AES67 interop for the PCM-over-IP ecosystem.
+**Goal:** Full Atmos on Linux receivers; DSD1024 / DSD2048 on MCU; move from "working prototype" to "deployable streamer."
 
 **Deliverables:**
 - Linux: 7.1.4 PCM Atmos bed, 22.2 streams, 24-hour soak, multi-receiver topologies, failure-mode docs.
 - MCU: multichannel PCM, native DSD64 through DSD1024, DSD2048 stereo. Per-DAC quirk table for major DSD DACs.
 - Linux ALSA: investigate native DSD1024/2048 exposure; propose patches if needed.
-- **AES67 interop (Mode 4):** RTP/AES67 encapsulation for PCM streams. Interop test with `aes67-linux-daemon` and at least one commercial AES67 device (Merging Anubis / Neumann MT 48 / Dante-with-AES67).
-- Deployment recipes (listening room, home theater, small venue), Debian packages, MCU firmware image.
+- Deployment recipes (listening room, home theater, small venue, audiophile rack).
+- Debian packages for talker and Linux receiver; firmware image for MCU receiver.
+- Project website with docs and examples.
 
-**Time estimate:** Ongoing.
+**Time estimate:** 4–6 weekends across tracks plus calendar time for soak runs.
+
+### M9 — Ravenna / AES67 interop
+
+**Goal:** First-class interop with the Ravenna / AES67 ecosystem via Mode 4 (RTP over UDP). Opens the project to a much larger adjacent market: any AES67 device (Merging Anubis, Neumann MT 48, any Ravenna-native gear, any Dante-with-AES67-mode device, any `aes67-linux-daemon` deployment) becomes a valid talker or listener alongside AOEther-native endpoints.
+
+**Deliverables:**
+- **RTP/AES67 encapsulation** for PCM streams: L16 and L24 payload types, 1 ms packet time (PTIME=1 by default, 125 µs optional for low-latency), 48 kHz baseline with optional higher rates.
+- **SDP session description** per AES67 conventions, carrying stream format, packet time, channel count, source, destination, and PTP domain info.
+- **SAP (Session Announcement Protocol)** for stream discovery, interoperable with AES67 discovery implementations.
+- **PTPv2 default profile** support (separate from gPTP which is 802.1AS) for sync with AES67 infrastructure. Linuxptp's `ptp4l` supports both profiles; configuration is per-deployment.
+- **Interop test plan:** confirmed playback with at least `aes67-linux-daemon` (open-source reference), and aspirationally one commercial device per ecosystem (a Dante-with-AES67 device, a Ravenna-native device, a Merging or Neumann endpoint).
+- **Documented constraints:** AES67 is PCM only, so DSD streams remain on Mode 3 (IP/UDP with AoE header). AES67 channel counts typically cap at 8 per stream; higher counts split across streams.
+- **User-facing config** for Mode 4 is kept simple: "I want to send this stream as AES67" / "I want to receive AES67 streams" as first-class options alongside the AOEther-native modes.
+
+**Key risks:**
+- AES67 has enough ambiguity in practice that interop edge cases are expected. Approach: start with `aes67-linux-daemon` as a known-good reference, then expand to commercial gear with iteration.
+- SAP multicast is sometimes blocked by consumer routers; document workarounds (static SDP files, manual stream addition).
+- PTP domain coexistence with gPTP deployments (Milan uses domain 0 typically; AES67 setups often use other domains). Ensure AOEther can participate in both simultaneously if needed.
+
+**Time estimate:** 4–6 weekends.
 
 ### Future work — Topology A (gadget mode), redundancy
 
-Deferred to a post-M8 "pro track." Topology A gadget mode adds DAW integration (receiver-as-UAC2-device), CBS / TSN shaping hardening, and FRER-style redundancy. See Appendix C for details.
+Deferred to post-M9 "pro track." Topology A gadget mode adds DAW integration (receiver-as-UAC2-device), CBS / TSN shaping hardening, and FRER-style redundancy. See Appendix C for details.
 
 ## M1 detailed plan
 
@@ -545,7 +568,7 @@ sudo ./build/receiver --iface eth0 --dac hw:CARD=Dragonfly,DEV=0
 
 **Which Tier 2 platform for first bring-up?** Probably i.MX 8M Mini. Decide at M3 kickoff.
 
-**Discovery: AVDECC vs mDNS-SD vs SAP?** All three eventually. AVDECC for Milan (Mode 2), mDNS-SD for simple home IP use (Mode 3), SAP for AES67 interop (Mode 4).
+**Discovery: AVDECC vs mDNS-SD vs SAP?** All three eventually. AVDECC for Milan (Mode 2, M7), mDNS-SD for simple home IP use (Mode 3, M7), SAP for AES67 interop (Mode 4, M9).
 
 **PTP profile?** gPTP (IEEE 802.1AS-2020) on wired. PTPv2 over UDP for IP mode. Best-effort software PTP over WiFi.
 
@@ -589,7 +612,7 @@ sudo ./build/receiver --iface eth0 --dac hw:CARD=Dragonfly,DEV=0
 
 ## Appendix C: Topology A (gadget mode) — future work
 
-Topology A defers to post-M8 future work, but preserving the design rationale here so we can execute when we get there.
+Topology A defers to post-M9 future work, but preserving the design rationale here so we can execute when we get there.
 
 **Use case.** A computer (DAW, media server, user's laptop) plugs into the receiver via USB. The receiver presents as a UAC2 device — either an audio input (the host records audio from the network) or output (the host plays audio to the network, reverse direction). This is how Milan endpoints integrate with DAW workflows today.
 
@@ -619,6 +642,7 @@ This work is post-M8 future work but could be an early stretch goal if a contrib
 | Milan AVDECC interop edge cases discovered late | Medium | High | Read Milan spec during M2; engage Avnu Alliance early; attend a plugfest as observer |
 | MCU USB host stack performance limits for DSD2048 multichannel | Medium | Low | DSD2048 multichannel is already gigabit-bound; document supported DAC/channel combos per tier |
 | WiFi jitter too variable for usable single-receiver playback | Medium | Medium | Characterize during M4; document recommended buffer depth per WiFi class (5 GHz vs 2.4 GHz, mesh vs single AP); fall back to larger buffers rather than rejecting WiFi |
-| AES67 interop (M8 stretch) blocked by RTP/SDP/SAP edge cases | Medium | Low | Start with `aes67-linux-daemon` as reference; accept that commercial-gear interop may require multiple iterations |
-| `f_uac2` kernel patch for Topology A rejected upstream | Low | Low | Topology A is post-M8 future work, not critical path; maintain out-of-tree if needed; DoP works without the patch |
+| AES67 interop (M9) blocked by RTP/SDP/SAP edge cases | Medium | Medium | Start with `aes67-linux-daemon` as reference; accept that commercial-gear interop may require multiple iterations; budget real time in M9 for commercial-gear testing |
+| PTP domain conflicts when hosting Milan (gPTP) and AES67 (PTPv2) on one network | Medium | Low | Document per-deployment PTP domain selection; AOEther talker supports multiple domains where hardware allows |
+| `f_uac2` kernel patch for Topology A rejected upstream | Low | Low | Topology A is post-M9 future work, not critical path; maintain out-of-tree if needed; DoP works without the patch |
 | Contributors don't materialize | Medium | Medium | Working demo on a $60 Pi + a $20 USB DAC before announcement |

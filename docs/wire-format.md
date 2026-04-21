@@ -1,6 +1,6 @@
 # AOEther Wire Format Specification
 
-**Status:** v1.1 draft — aligned with [`design.md`](design.md) v1.1
+**Status:** v1.2 draft — aligned with [`design.md`](design.md) v1.2
 **Purpose:** Byte-level reference for implementers of talkers, receivers, and test tools.
 
 This document specifies the AOEther wire format at the level of detail needed to build an interoperable implementation. For architectural rationale, see [`design.md`](design.md).
@@ -31,7 +31,7 @@ Mode 3 (IP/UDP, M4+):
 └──────────────────┴──────────┴──────┴──────────────────┴──────────┴─────┘
   UDP port = 8805 (interim, pending IANA)
 
-Mode 4 (RTP/AES67, M8 stretch, PCM only):
+Mode 4 (RTP/AES67, M9, PCM only):
 ┌──────────────────┬──────────┬──────┬──────────────────┬──────────┬─────┐
 │ Ethernet header  │ IPv4/v6  │ UDP  │ RTP (AES67)      │ PCM      │ FCS │
 │ (14 bytes)       │          │      │ (12 bytes)       │ payload  │     │
