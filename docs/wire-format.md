@@ -211,7 +211,7 @@ Mode 1 (L2, M1+):
   EtherType = 0x88B6
 ```
 
-Mode 3 (IP/UDP, M4+) will carry AoE-C frames as UDP datagrams on the same port as data frames, disambiguated by magic byte. No IP-level transport is defined in M1.
+Mode 3 (IP/UDP, M4) carries AoE-C frames as UDP datagrams on the same port as data frames (interim 8805), disambiguated by the magic byte (`0xA1` for control vs `0xA0` for data). Feedback always flows unicast from each receiver to the talker, regardless of whether data is carried unicast or multicast; in multicast deployments the talker aggregates FEEDBACK across all subscribed receivers and takes the slowest non-stale rate.
 
 Destination: unicast to the peer's MAC (receiver → talker, talker → receiver for future frame types).
 

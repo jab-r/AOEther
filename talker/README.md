@@ -23,14 +23,17 @@ sudo ./build/talker --iface eno1 \
 Flags:
 
 - `--iface IF` (required) — egress interface, e.g. `eno1`, `enp3s0`.
-- `--dest-mac AA:BB:CC:DD:EE:FF` (required) — receiver's MAC.
+- `--transport l2|ip` — default `l2` (raw Ethernet). `ip` switches to UDP (Mode 3).
+- `--dest-mac AA:BB:CC:DD:EE:FF` — receiver's MAC (required with `--transport l2`).
+- `--dest-ip IP` — destination IPv4 or IPv6 literal (required with `--transport ip`). Multicast groups (224.0.0.0/4 or ff00::/8) are auto-detected.
+- `--port N` — UDP port (IP mode only, default 8805).
 - `--source testtone|wav|alsa` — default `testtone` (1 kHz sine, −6 dBFS).
 - `--file PATH` — WAV file when `--source wav`. Accepts PCM 24-bit at any of the supported channel counts and rates; the file loops.
 - `--capture hw:CARD=...` — ALSA PCM name when `--source alsa`. Point at one half of a `snd-aloop` pair to receive from Roon/UPnP/PipeWire; see `docs/recipe-*.md`.
 - `--channels N` — channel count (1..64, default 2). Receiver must match.
 - `--rate HZ` — one of 44100, 48000, 88200, 96000, 176400, 192000 (default 48000). Receiver must match.
 
-Needs `CAP_NET_RAW` to open `AF_PACKET`; easiest path is `sudo`.
+Needs `CAP_NET_RAW` to open `AF_PACKET` in L2 mode; easiest path is `sudo`. IP mode doesn't require root in principle (bind on ephemeral port is unprivileged), but if you want to bind to port 8805 < 1024 you'd need capabilities anyway — 8805 is fine without.
 
 ## What it does, exactly
 

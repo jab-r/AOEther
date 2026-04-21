@@ -367,15 +367,21 @@ M3 is split into two sub-phases because it's mostly hardware work:
 
 **Time estimate:** Phase A 1 weekend (doc writing). Phase B 2–3 weekends once a Tier 2 board is in hand, dominated by ptp4l/phc2sys tuning and scope-based measurement.
 
-### M4 — IP/UDP transport (WiFi and routed networks)
+### M4 — IP/UDP transport (WiFi, routed networks, multicast)
 
-**Goal:** Add IP/UDP transport (Mode 3) alongside the existing L2 mode so streams work over WiFi, across VLANs, and through routers. Same AoE header inside a UDP datagram.
+**Goal:** Add IP/UDP transport (Mode 3) alongside the existing L2 mode so streams work over WiFi, across VLANs, and through routers. Same AoE header inside a UDP datagram. Both IPv4 and IPv6. Both unicast and multicast. Same `snd-aloop` bridge recipes keep working — only the transport wrapper changes.
 
-**Deliverables:** Talker and receiver gain `--transport ip` flag. Unicast UDP works; multicast UDP (for multi-receiver streams) documented and tested for IPv4 and IPv6. DSCP tagging with `EF` for WMM / WiFi QoS. Receiver handles both L2 and IP on the same instance (configurable per stream). End-to-end demo: talker on wired, receiver on Pi connected via WiFi, audio plays cleanly with documented latency and jitter numbers.
+**Deliverables:**
+- Talker and receiver gain `--transport l2|ip`, `--port` flags. Talker adds `--dest-ip` accepting either IPv4 or IPv6 literals. Receiver adds `--group IP` for multicast membership.
+- IPv4 + IPv6 unicast and multicast working end to end. Address family auto-detected from the literal; multicast auto-detected from the address range (`224.0.0.0/4` or `ff00::/8`).
+- DSCP tagging with Expedited Forwarding (0xB8) via `IP_TOS` / `IPV6_TCLASS`. Advisory — improves WMM AC_VO handling on WiFi and DSCP-aware wired switches.
+- Talker-side Mode C arbitration over multiple FEEDBACK sources (up to 16 receivers): take the **slowest** non-stale rate so no receiver xruns. Per-source sequence numbers track independently.
+- Single-socket IP design: talker uses one UDP socket for TX data + RX feedback; receiver uses one for RX data + TX feedback. Magic byte (`0xA0` vs `0xA1`) disambiguates.
+- End-to-end demo: talker on wired, receiver on Pi connected via WiFi, audio plays cleanly with documented latency and jitter numbers. Second demo: talker + two receivers on IPv4 multicast, both playing in lockstep.
 
-**Key risks:** WiFi jitter is highly variable; need to characterize what buffer depth keeps a single-receiver stream glitch-free on typical home WiFi. Multi-receiver phase alignment over WiFi is explicitly not a goal — document clearly.
+**Key risks:** WiFi jitter is highly variable; need to characterize what buffer depth keeps a single-receiver stream glitch-free on typical home WiFi. Multi-receiver phase alignment over WiFi is explicitly not a goal (that needs gPTP, which WiFi can't do) — document clearly. Multicast through consumer home switches sometimes gets flooded as broadcast; mention as a known limitation in recipes.
 
-**Time estimate:** 2–3 weekends including WiFi characterization.
+**Time estimate:** 2–3 weekends including WiFi characterization and multicast testing through at least one consumer switch.
 
 ### M5 — AVTP AAF transport (Milan interop)
 

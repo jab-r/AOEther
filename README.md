@@ -70,7 +70,7 @@ You should hear a clean 1 kHz tone.
 | M1 | Done | Stereo PCM, RPi + USB DAC, Mode C rate feedback, Roon/UPnP/system-audio bridges, no PTP |
 | M2 | In progress | Multichannel PCM (up to 7.1.4 / 16ch), hi-res rates (up to 192 kHz), per-DAC test matrix |
 | M3 | Docs ready | Tier 2 hardware (Linux SBC), hardware PTP (Phase A); hardware validation pending board |
-| M4 | Planned | IP/UDP transport (WiFi and routed networks) |
+| M4 | In progress | IP/UDP transport, IPv4+IPv6, unicast+multicast, multi-receiver Mode C arbitration |
 | M5 | Planned | AVTP AAF wire format for Milan interop |
 | M6 | Planned | Native DSD64 through DSD512 end-to-end |
 | M7 | Planned | AVDECC, MCU receiver track kickoff |
