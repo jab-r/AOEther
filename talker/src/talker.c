@@ -8,6 +8,8 @@
 #include <linux/if_packet.h>
 #include <net/ethernet.h>
 #include <net/if.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -32,6 +34,17 @@
 
 /* Ethernet II data payload max (frame - eth header) for standard 1500 MTU. */
 #define ETH_MTU_PAYLOAD       1500
+
+/* IP/UDP transport default port (interim; IANA TBD per docs/wire-format.md). */
+#define DEFAULT_UDP_PORT      8805
+
+/* DSCP Expedited Forwarding = 46 (0xB8 when shifted into TOS byte). */
+#define DSCP_EF_TOS           0xB8
+
+enum transport_mode {
+    TRANSPORT_L2 = 0,   /* raw Ethernet, AF_PACKET, EtherType 0x88B5/0x88B6 */
+    TRANSPORT_IP = 1,   /* UDP over IPv4, magic-byte disambiguation */
+};
 
 /* Safety clamp on feedback-derived rate: ±1000 ppm of nominal. */
 #define RATE_CLAMP_PPM        1000.0
@@ -100,10 +113,21 @@ static int64_t ts_diff_ms(struct timespec a, struct timespec b)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "usage: %s --iface IF --dest-mac AA:BB:CC:DD:EE:FF [options]\n"
+        "usage: %s --iface IF [transport options] [stream options]\n"
+        "\n"
+        "Transport (pick one):\n"
+        "  --transport l2               raw Ethernet, default\n"
+        "    --dest-mac AA:BB:CC:DD:EE:FF    (required)\n"
+        "  --transport ip               UDP over IPv4 (Mode 3, M4)\n"
+        "    --dest-ip X.Y.Z.W               (required)\n"
+        "    --port N                        UDP port, default %d\n"
+        "\n"
+        "Source:\n"
         "  --source testtone|wav|alsa   default: testtone\n"
         "  --file   PATH                WAV file, required with --source wav\n"
         "  --capture hw:CARD=...        ALSA capture device, required with --source alsa\n"
+        "\n"
+        "Stream format:\n"
         "  --channels N                 channel count (1..64, default %d)\n"
         "  --rate    HZ                 44100|48000|88200|96000|176400|192000 (default %d)\n"
         "\n"
@@ -112,35 +136,48 @@ static void usage(const char *prog)
         "For music playback, point --capture at one half of a snd-aloop pair\n"
         "and route Roon/UPnP/AirPlay/PipeWire at the other half; see\n"
         "docs/recipe-*.md.\n",
-        prog, DEFAULT_CHANNELS, DEFAULT_RATE_HZ);
+        prog, DEFAULT_UDP_PORT, DEFAULT_CHANNELS, DEFAULT_RATE_HZ);
 }
 
 int main(int argc, char **argv)
 {
     const char *iface = NULL;
-    const char *dest_s = NULL;
+    const char *dest_mac_s = NULL;
+    const char *dest_ip_s = NULL;
     const char *source = "testtone";
     const char *wav_path = NULL;
     const char *capture_pcm = NULL;
     int channels = DEFAULT_CHANNELS;
     int rate_hz = DEFAULT_RATE_HZ;
+    enum transport_mode transport = TRANSPORT_L2;
+    int udp_port = DEFAULT_UDP_PORT;
 
     static const struct option opts[] = {
-        { "iface",    required_argument, 0, 'i' },
-        { "dest-mac", required_argument, 0, 'd' },
-        { "source",   required_argument, 0, 's' },
-        { "file",     required_argument, 0, 'f' },
-        { "capture",  required_argument, 0, 'c' },
-        { "channels", required_argument, 0, 'C' },
-        { "rate",     required_argument, 0, 'r' },
-        { "help",     no_argument,       0, 'h' },
+        { "iface",     required_argument, 0, 'i' },
+        { "dest-mac",  required_argument, 0, 'd' },
+        { "dest-ip",   required_argument, 0, 'I' },
+        { "transport", required_argument, 0, 'T' },
+        { "port",      required_argument, 0, 'P' },
+        { "source",    required_argument, 0, 's' },
+        { "file",      required_argument, 0, 'f' },
+        { "capture",   required_argument, 0, 'c' },
+        { "channels",  required_argument, 0, 'C' },
+        { "rate",      required_argument, 0, 'r' },
+        { "help",      no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "i:d:s:f:c:C:r:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:d:I:T:P:s:f:c:C:r:h", opts, NULL)) != -1) {
         switch (c) {
         case 'i': iface = optarg; break;
-        case 'd': dest_s = optarg; break;
+        case 'd': dest_mac_s = optarg; break;
+        case 'I': dest_ip_s = optarg; break;
+        case 'T':
+            if (strcmp(optarg, "l2") == 0) transport = TRANSPORT_L2;
+            else if (strcmp(optarg, "ip") == 0) transport = TRANSPORT_IP;
+            else { fprintf(stderr, "talker: --transport must be l2 or ip\n"); return 2; }
+            break;
+        case 'P': udp_port = atoi(optarg); break;
         case 's': source = optarg; break;
         case 'f': wav_path = optarg; break;
         case 'c': capture_pcm = optarg; break;
@@ -150,8 +187,20 @@ int main(int argc, char **argv)
         default:  usage(argv[0]); return 2;
         }
     }
-    if (!iface || !dest_s) {
+    if (!iface) {
         usage(argv[0]);
+        return 2;
+    }
+    if (transport == TRANSPORT_L2 && !dest_mac_s) {
+        fprintf(stderr, "talker: --dest-mac required for --transport l2\n");
+        return 2;
+    }
+    if (transport == TRANSPORT_IP && !dest_ip_s) {
+        fprintf(stderr, "talker: --dest-ip required for --transport ip\n");
+        return 2;
+    }
+    if (udp_port < 1 || udp_port > 65535) {
+        fprintf(stderr, "talker: --port out of range\n");
         return 2;
     }
     if (channels < 1 || channels > 64) {
@@ -178,10 +227,47 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    /* Destination resolution. Exactly one of (dest_mac) or (dest_ss) is
+     * populated depending on transport. For IP, auto-detect v4/v6 and
+     * unicast/multicast from the literal in --dest-ip. */
     uint8_t dest_mac[6];
-    if (parse_mac(dest_s, dest_mac) < 0) {
-        fprintf(stderr, "talker: bad --dest-mac\n");
-        return 2;
+    struct sockaddr_storage dest_ss;
+    socklen_t dest_ss_len = 0;
+    int dest_family = AF_UNSPEC;
+    int dest_is_multicast = 0;
+    memset(&dest_ss, 0, sizeof(dest_ss));
+
+    if (transport == TRANSPORT_L2) {
+        if (parse_mac(dest_mac_s, dest_mac) < 0) {
+            fprintf(stderr, "talker: bad --dest-mac\n");
+            return 2;
+        }
+    } else {
+        struct in_addr v4;
+        struct in6_addr v6;
+        if (inet_pton(AF_INET, dest_ip_s, &v4) == 1) {
+            dest_family = AF_INET;
+            struct sockaddr_in *sin = (struct sockaddr_in *)&dest_ss;
+            sin->sin_family = AF_INET;
+            sin->sin_port = htons((uint16_t)udp_port);
+            sin->sin_addr = v4;
+            dest_ss_len = sizeof(*sin);
+            /* IPv4 multicast = 224.0.0.0/4 (first octet 224..239). */
+            uint8_t first = ((uint8_t *)&v4)[0];
+            dest_is_multicast = (first >= 224 && first <= 239);
+        } else if (inet_pton(AF_INET6, dest_ip_s, &v6) == 1) {
+            dest_family = AF_INET6;
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&dest_ss;
+            sin6->sin6_family = AF_INET6;
+            sin6->sin6_port = htons((uint16_t)udp_port);
+            sin6->sin6_addr = v6;
+            dest_ss_len = sizeof(*sin6);
+            /* IPv6 multicast = ff00::/8. */
+            dest_is_multicast = (v6.s6_addr[0] == 0xff);
+        } else {
+            fprintf(stderr, "talker: --dest-ip %s is neither IPv4 nor IPv6\n", dest_ip_s);
+            return 2;
+        }
     }
 
     struct audio_source *src = NULL;
@@ -213,43 +299,129 @@ int main(int argc, char **argv)
     }
     if (!src) return 1;
 
-    /* Data socket: sends audio on EtherType 0x88B5. */
-    int data_sock = socket(AF_PACKET, SOCK_RAW, htons(AOE_ETHERTYPE));
-    if (data_sock < 0) {
-        perror("socket(AF_PACKET, SOCK_RAW) data");
-        fprintf(stderr, "talker: raw sockets need CAP_NET_RAW (try sudo)\n");
-        return 1;
-    }
+    /* Socket setup. L2 mode uses two AF_PACKET raw sockets (one per
+     * EtherType). IP mode uses one AF_INET/AF_INET6 UDP socket for both
+     * TX data and RX feedback, distinguished by magic byte (0xA0 vs 0xA1). */
+    int data_sock = -1;
+    int fb_sock = -1;      /* == data_sock in IP mode */
+    int ifindex = 0;
+    uint8_t src_mac[6] = {0};
+    struct sockaddr_ll data_to_ll = {0};   /* used only in L2 */
 
-    int ifindex;
-    uint8_t src_mac[6];
-    if (iface_lookup(data_sock, iface, &ifindex, src_mac) < 0) return 1;
+    if (transport == TRANSPORT_L2) {
+        data_sock = socket(AF_PACKET, SOCK_RAW, htons(AOE_ETHERTYPE));
+        if (data_sock < 0) {
+            perror("socket(AF_PACKET, SOCK_RAW) data");
+            fprintf(stderr, "talker: raw sockets need CAP_NET_RAW (try sudo)\n");
+            return 1;
+        }
+        if (iface_lookup(data_sock, iface, &ifindex, src_mac) < 0) return 1;
 
-    struct sockaddr_ll data_to = {
-        .sll_family = AF_PACKET,
-        .sll_protocol = htons(AOE_ETHERTYPE),
-        .sll_ifindex = ifindex,
-        .sll_halen = 6,
-    };
-    memcpy(data_to.sll_addr, dest_mac, 6);
+        data_to_ll.sll_family = AF_PACKET;
+        data_to_ll.sll_protocol = htons(AOE_ETHERTYPE);
+        data_to_ll.sll_ifindex = ifindex;
+        data_to_ll.sll_halen = 6;
+        memcpy(data_to_ll.sll_addr, dest_mac, 6);
 
-    /* Feedback socket: receives FEEDBACK on EtherType 0x88B6. */
-    int fb_sock = socket(AF_PACKET, SOCK_RAW, htons(AOE_C_ETHERTYPE));
-    if (fb_sock < 0) {
-        perror("socket(AF_PACKET, SOCK_RAW) feedback");
-        return 1;
+        fb_sock = socket(AF_PACKET, SOCK_RAW, htons(AOE_C_ETHERTYPE));
+        if (fb_sock < 0) {
+            perror("socket(AF_PACKET, SOCK_RAW) feedback");
+            return 1;
+        }
+        struct sockaddr_ll fb_bind = {
+            .sll_family = AF_PACKET,
+            .sll_protocol = htons(AOE_C_ETHERTYPE),
+            .sll_ifindex = ifindex,
+        };
+        if (bind(fb_sock, (struct sockaddr *)&fb_bind, sizeof(fb_bind)) < 0) {
+            perror("bind(fb_sock)");
+            return 1;
+        }
+        int fl = fcntl(fb_sock, F_GETFL, 0);
+        if (fl >= 0) fcntl(fb_sock, F_SETFL, fl | O_NONBLOCK);
+    } else {
+        /* IP/UDP mode. Single SOCK_DGRAM socket, bound to port 0 (kernel
+         * picks local port) so the receiver can learn our (ip,port) from
+         * the source address of our data datagrams and FEEDBACK returns
+         * flow back on the same socket. */
+        data_sock = socket(dest_family, SOCK_DGRAM, 0);
+        if (data_sock < 0) {
+            perror("socket(AF_INET*, SOCK_DGRAM)");
+            return 1;
+        }
+        if (iface_lookup(data_sock, iface, &ifindex, src_mac) < 0) return 1;
+
+        /* DSCP EF: encourages WMM AC_VO on WiFi, priority queueing on
+         * DSCP-aware wired switches. Advisory. */
+        int tos = DSCP_EF_TOS;
+        if (dest_family == AF_INET) {
+            if (setsockopt(data_sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) < 0) {
+                perror("setsockopt(IP_TOS)");
+                /* non-fatal */
+            }
+        } else {
+            int tclass = DSCP_EF_TOS;
+            if (setsockopt(data_sock, IPPROTO_IPV6, IPV6_TCLASS,
+                           &tclass, sizeof(tclass)) < 0) {
+                perror("setsockopt(IPV6_TCLASS)");
+            }
+        }
+
+        if (dest_is_multicast) {
+            /* Outgoing multicast interface + TTL + suppress loopback. */
+            if (dest_family == AF_INET) {
+                struct ip_mreqn mreq;
+                memset(&mreq, 0, sizeof(mreq));
+                mreq.imr_ifindex = ifindex;
+                if (setsockopt(data_sock, IPPROTO_IP, IP_MULTICAST_IF,
+                               &mreq, sizeof(mreq)) < 0) {
+                    perror("setsockopt(IP_MULTICAST_IF)");
+                }
+                int ttl = 16;
+                setsockopt(data_sock, IPPROTO_IP, IP_MULTICAST_TTL,
+                           &ttl, sizeof(ttl));
+                int loop = 0;
+                setsockopt(data_sock, IPPROTO_IP, IP_MULTICAST_LOOP,
+                           &loop, sizeof(loop));
+            } else {
+                if (setsockopt(data_sock, IPPROTO_IPV6, IPV6_MULTICAST_IF,
+                               &ifindex, sizeof(ifindex)) < 0) {
+                    perror("setsockopt(IPV6_MULTICAST_IF)");
+                }
+                int hops = 16;
+                setsockopt(data_sock, IPPROTO_IPV6, IPV6_MULTICAST_HOPS,
+                           &hops, sizeof(hops));
+                int loop = 0;
+                setsockopt(data_sock, IPPROTO_IPV6, IPV6_MULTICAST_LOOP,
+                           &loop, sizeof(loop));
+            }
+        }
+
+        /* Bind to ephemeral local port. Needed so recvfrom() on this
+         * socket picks up FEEDBACK replies. */
+        if (dest_family == AF_INET) {
+            struct sockaddr_in local = { .sin_family = AF_INET };
+            local.sin_addr.s_addr = htonl(INADDR_ANY);
+            local.sin_port = 0;
+            if (bind(data_sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
+                perror("bind(udp v4)");
+                return 1;
+            }
+        } else {
+            struct sockaddr_in6 local = { .sin6_family = AF_INET6 };
+            local.sin6_addr = in6addr_any;
+            local.sin6_port = 0;
+            if (bind(data_sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
+                perror("bind(udp v6)");
+                return 1;
+            }
+        }
+
+        int fl = fcntl(data_sock, F_GETFL, 0);
+        if (fl >= 0) fcntl(data_sock, F_SETFL, fl | O_NONBLOCK);
+
+        fb_sock = data_sock;   /* single-socket IP mode */
     }
-    struct sockaddr_ll fb_bind = {
-        .sll_family = AF_PACKET,
-        .sll_protocol = htons(AOE_C_ETHERTYPE),
-        .sll_ifindex = ifindex,
-    };
-    if (bind(fb_sock, (struct sockaddr *)&fb_bind, sizeof(fb_bind)) < 0) {
-        perror("bind(fb_sock)");
-        return 1;
-    }
-    int fl = fcntl(fb_sock, F_GETFL, 0);
-    if (fl >= 0) fcntl(fb_sock, F_SETFL, fl | O_NONBLOCK);
 
     int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
     if (tfd < 0) { perror("timerfd_create"); return 1; }
@@ -268,31 +440,69 @@ int main(int argc, char **argv)
     uint8_t *frame = calloc(1, max_frame);
     if (!frame) return 1;
 
-    struct ether_header *eth = (struct ether_header *)frame;
-    memcpy(eth->ether_dhost, dest_mac, 6);
-    memcpy(eth->ether_shost, src_mac, 6);
-    eth->ether_type = htons(AOE_ETHERTYPE);
-
+    /* L2-only prefix (filled lazily and ignored in IP mode). */
+    if (transport == TRANSPORT_L2) {
+        struct ether_header *eth = (struct ether_header *)frame;
+        memcpy(eth->ether_dhost, dest_mac, 6);
+        memcpy(eth->ether_shost, src_mac, 6);
+        eth->ether_type = htons(AOE_ETHERTYPE);
+    }
     struct aoe_hdr *hdr = (struct aoe_hdr *)(frame + sizeof(struct ether_header));
     uint8_t *payload = frame + sizeof(struct ether_header) + AOE_HDR_LEN;
+    /* IP mode skips the 14-byte Ethernet-header prefix on the wire. */
+    const size_t tx_offset = (transport == TRANSPORT_L2) ? 0 : sizeof(struct ether_header);
 
-    fprintf(stderr,
-            "talker: iface=%s ifindex=%d\n"
-            "        src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x\n"
-            "        fmt=PCM_s24le-3 ch=%d rate=%d pps=8000 nominal_spp=%.2f max_spp=%d max_frame=%zuB feedback=on\n",
-            iface, ifindex,
-            src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
-            dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3], dest_mac[4], dest_mac[5],
-            channels, rate_hz, nominal_spm, max_samples_per_packet, max_frame);
+    if (transport == TRANSPORT_L2) {
+        fprintf(stderr,
+                "talker: transport=l2 iface=%s ifindex=%d\n"
+                "        src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x\n"
+                "        fmt=PCM_s24le-3 ch=%d rate=%d pps=8000 nominal_spp=%.2f max_spp=%d max_frame=%zuB feedback=on\n",
+                iface, ifindex,
+                src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
+                dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3], dest_mac[4], dest_mac[5],
+                channels, rate_hz, nominal_spm, max_samples_per_packet, max_frame);
+    } else {
+        char ip_str[INET6_ADDRSTRLEN] = {0};
+        if (dest_family == AF_INET) {
+            inet_ntop(AF_INET,
+                      &((struct sockaddr_in *)&dest_ss)->sin_addr,
+                      ip_str, sizeof(ip_str));
+        } else {
+            inet_ntop(AF_INET6,
+                      &((struct sockaddr_in6 *)&dest_ss)->sin6_addr,
+                      ip_str, sizeof(ip_str));
+        }
+        fprintf(stderr,
+                "talker: transport=ip dest=%s:%d family=%s %s\n"
+                "        iface=%s ifindex=%d\n"
+                "        fmt=PCM_s24le-3 ch=%d rate=%d pps=8000 nominal_spp=%.2f max_spp=%d max_payload=%zuB feedback=on\n",
+                ip_str, udp_port,
+                dest_family == AF_INET ? "v4" : "v6",
+                dest_is_multicast ? "multicast" : "unicast",
+                iface, ifindex, channels, rate_hz,
+                nominal_spm, max_samples_per_packet,
+                max_frame - sizeof(struct ether_header));
+    }
 
     /* Mode C talker state: current target samples-per-microframe, fractional
-     * accumulator, and bookkeeping for stale-feedback fallback. */
+     * accumulator. The effective rate is recomputed each tick from the
+     * per-source feedback tracker below, so multi-receiver multicast picks
+     * the slowest consumer to avoid xruns at any endpoint. */
     double samples_per_microframe = nominal_spm;
     double sample_accum = 0.0;
-    struct timespec last_fb_rx_ts = { 0, 0 };
-    int have_fb = 0;
-    uint16_t last_fb_seq = 0;
-    int have_fb_seq = 0;
+
+    /* Multi-source feedback tracking (IP mode). In L2 mode there's only
+     * one receiver so slot 0 is used exclusively. */
+#define MAX_FB_SOURCES 16
+    struct fb_source {
+        int in_use;
+        struct sockaddr_storage addr;  /* IP mode: sender addr; L2: unused */
+        socklen_t addrlen;
+        uint32_t last_q;               /* Q16.16 samples/ms */
+        uint16_t last_seq;
+        int have_seq;
+        struct timespec last_rx;
+    } fb_src[MAX_FB_SOURCES] = {0};
 
     uint32_t seq = 0;
     uint64_t late_wakeups = 0;
@@ -302,28 +512,31 @@ int main(int argc, char **argv)
         /* 1. Drain any pending feedback frames (non-blocking). */
         for (;;) {
             uint8_t fb_buf[128];
-            ssize_t fn = recv(fb_sock, fb_buf, sizeof(fb_buf), 0);
+            struct sockaddr_storage src_addr;
+            socklen_t src_addrlen = sizeof(src_addr);
+            ssize_t fn;
+            if (transport == TRANSPORT_L2) {
+                fn = recv(fb_sock, fb_buf, sizeof(fb_buf), 0);
+            } else {
+                fn = recvfrom(fb_sock, fb_buf, sizeof(fb_buf), 0,
+                              (struct sockaddr *)&src_addr, &src_addrlen);
+            }
             if (fn < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                 if (errno == EINTR) continue;
                 perror("recv(fb)");
                 break;
             }
-            if ((size_t)fn < sizeof(struct ether_header) + AOE_C_HDR_LEN) continue;
-            const struct aoe_c_hdr *fh =
-                (const struct aoe_c_hdr *)(fb_buf + sizeof(struct ether_header));
+
+            /* Locate the AoE-C header. L2 has the Ethernet header in front;
+             * IP has just the UDP payload. */
+            const struct aoe_c_hdr *fh;
+            size_t hdr_off = (transport == TRANSPORT_L2) ? sizeof(struct ether_header) : 0;
+            if ((size_t)fn < hdr_off + AOE_C_HDR_LEN) continue;
+            fh = (const struct aoe_c_hdr *)(fb_buf + hdr_off);
             if (!aoe_c_hdr_valid(fh)) continue;
             if (fh->frame_type != AOE_C_TYPE_FEEDBACK) continue;
             if (ntohs(fh->stream_id) != STREAM_ID) continue;
-
-            uint16_t s = ntohs(fh->sequence);
-            if (have_fb_seq) {
-                /* Reject stale (out-of-order) feedback to avoid rate whiplash. */
-                int16_t d = (int16_t)(s - last_fb_seq);
-                if (d <= 0) { fb_ignored++; continue; }
-            }
-            last_fb_seq = s;
-            have_fb_seq = 1;
 
             uint32_t q = ntohl(fh->value);
             double spms = (double)q / 65536.0;
@@ -336,20 +549,83 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            samples_per_microframe = new_spm;
-            clock_gettime(CLOCK_MONOTONIC, &last_fb_rx_ts);
-            have_fb = 1;
+            /* Find or allocate a slot for this source. In L2 mode, every
+             * feedback comes from the single receiver — use slot 0. In IP
+             * mode, match by family + addr + port. */
+            int slot = -1;
+            if (transport == TRANSPORT_L2) {
+                slot = 0;
+                fb_src[0].in_use = 1;
+            } else {
+                for (int i = 0; i < MAX_FB_SOURCES; i++) {
+                    if (!fb_src[i].in_use) continue;
+                    if (fb_src[i].addr.ss_family != src_addr.ss_family) continue;
+                    int match = 0;
+                    if (src_addr.ss_family == AF_INET) {
+                        const struct sockaddr_in *a = (const struct sockaddr_in *)&fb_src[i].addr;
+                        const struct sockaddr_in *b = (const struct sockaddr_in *)&src_addr;
+                        match = (a->sin_port == b->sin_port) &&
+                                (a->sin_addr.s_addr == b->sin_addr.s_addr);
+                    } else {
+                        const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)&fb_src[i].addr;
+                        const struct sockaddr_in6 *b = (const struct sockaddr_in6 *)&src_addr;
+                        match = (a->sin6_port == b->sin6_port) &&
+                                (memcmp(&a->sin6_addr, &b->sin6_addr, 16) == 0);
+                    }
+                    if (match) { slot = i; break; }
+                }
+                if (slot < 0) {
+                    for (int i = 0; i < MAX_FB_SOURCES; i++) {
+                        if (!fb_src[i].in_use) {
+                            slot = i;
+                            fb_src[i].in_use = 1;
+                            memcpy(&fb_src[i].addr, &src_addr, src_addrlen);
+                            fb_src[i].addrlen = src_addrlen;
+                            fb_src[i].have_seq = 0;
+                            break;
+                        }
+                    }
+                }
+                if (slot < 0) {
+                    /* Table full; drop. A real deployment would evict LRU;
+                     * for M4 with MAX=16 this is a soft upper bound. */
+                    fb_ignored++;
+                    continue;
+                }
+            }
+
+            /* Reject stale (out-of-order) feedback from the same source. */
+            uint16_t s16 = ntohs(fh->sequence);
+            if (fb_src[slot].have_seq) {
+                int16_t d = (int16_t)(s16 - fb_src[slot].last_seq);
+                if (d <= 0) { fb_ignored++; continue; }
+            }
+            fb_src[slot].last_seq = s16;
+            fb_src[slot].have_seq = 1;
+            fb_src[slot].last_q = q;
+            clock_gettime(CLOCK_MONOTONIC, &fb_src[slot].last_rx);
             fb_rx++;
         }
 
-        /* 2. Stale-feedback fallback: revert to nominal after FEEDBACK_STALE_MS. */
-        if (have_fb) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            if (ts_diff_ms(now, last_fb_rx_ts) > FEEDBACK_STALE_MS) {
-                samples_per_microframe = nominal_spm;
-                have_fb = 0;
+        /* 2. Compute effective rate = min(q) across non-stale sources.
+         * Taking the slowest keeps every receiver from xrunning. */
+        struct timespec now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        uint32_t min_q = 0;
+        int have_any = 0;
+        for (int i = 0; i < MAX_FB_SOURCES; i++) {
+            if (!fb_src[i].in_use) continue;
+            if (ts_diff_ms(now_ts, fb_src[i].last_rx) > FEEDBACK_STALE_MS) continue;
+            if (!have_any || fb_src[i].last_q < min_q) {
+                min_q = fb_src[i].last_q;
+                have_any = 1;
             }
+        }
+        if (have_any) {
+            double spms = (double)min_q / 65536.0;
+            samples_per_microframe = spms / (double)MICROFRAMES_PER_MS;
+        } else {
+            samples_per_microframe = nominal_spm;
         }
 
         /* 3. Wait for timer tick(s). */
@@ -362,8 +638,8 @@ int main(int argc, char **argv)
         }
         if (ticks > 1) late_wakeups++;
 
-        /* 4. Emit `ticks` packets. Each packet's payload_count is the integer
-         *    part of the accumulator; residual carries to the next packet. */
+        /* 4. Emit `ticks` packets. Each packet's payload_count is the
+         *    integer part of the accumulator; residual carries forward. */
         for (uint64_t i = 0; i < ticks && !g_stop; i++) {
             sample_accum += samples_per_microframe;
             int pc = (int)sample_accum;
@@ -379,12 +655,18 @@ int main(int argc, char **argv)
                           (uint8_t)channels, FORMAT_CODE, (uint8_t)pc,
                           AOE_FLAG_LAST_IN_GROUP);
 
-            size_t frame_len =
+            size_t frame_len_total =
                 sizeof(struct ether_header) + AOE_HDR_LEN
                 + (size_t)pc * channels * BYTES_PER_SAMPLE;
 
-            ssize_t sent = sendto(data_sock, frame, frame_len, 0,
-                                  (struct sockaddr *)&data_to, sizeof(data_to));
+            ssize_t sent;
+            if (transport == TRANSPORT_L2) {
+                sent = sendto(data_sock, frame, frame_len_total, 0,
+                              (struct sockaddr *)&data_to_ll, sizeof(data_to_ll));
+            } else {
+                sent = sendto(data_sock, frame + tx_offset, frame_len_total - tx_offset, 0,
+                              (struct sockaddr *)&dest_ss, dest_ss_len);
+            }
             if (sent < 0) {
                 if (errno == EINTR) break;
                 perror("sendto");
@@ -402,7 +684,7 @@ int main(int argc, char **argv)
 
     src->close(src);
     close(tfd);
-    close(fb_sock);
+    if (fb_sock != data_sock) close(fb_sock);
     close(data_sock);
     free(frame);
     return 0;
