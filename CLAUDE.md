@@ -18,11 +18,15 @@ Implementation language is **C** (per CONTRIBUTING.md and the M1 sketch in `desi
 
 A two-binary system plus a future MCU firmware:
 
-- **`talker/`** — Linux userspace. Reads audio from a source (test tone, WAV, ALSA capture), constructs AoE frames, emits them via `AF_PACKET` at 8000 pps aligned to USB microframes. Depends on libc; optionally libasound2 for live capture.
+- **`talker/`** — Linux userspace. Reads audio from a source (test tone, WAV, ALSA capture), constructs AoE frames, emits them via `AF_PACKET` at 8000 pps aligned to USB microframes. Depends on libc and libasound2 (the latter for the capture source).
 - **`receiver/`** — Linux userspace on Raspberry Pi (Tier 1) or a PTP-capable SBC (Tier 2). Reads AoE frames from `AF_PACKET`, writes samples to an ALSA PCM device backed by `snd_usb_audio`. M1 target is ~100 lines of C. Depends on libasound2.
 - **MCU receiver** (Tier 3, from M7) — bare-metal firmware for NXP MIMXRT1170-EVKB. Hand-rolled USB host UAC2 stack; not present in early milestones.
 
 The core architectural commitment (see `design.md` §"Architecture overview" and Appendix B): the receiver is a **USB host** driving a USB DAC (Topology B). Do **not** reintroduce gadget mode (`f_uac2`, UAC2 device emulation) into the primary path — it is deliberately deferred to post-M9 per Appendix C.
+
+### Music sources are bridged, not native
+
+From M1 onward, AOEther does NOT implement RAAT (Roon), UPnP MediaRenderer, AirPlay, or Spotify Connect natively. These ecosystems are reached by running the appropriate existing daemon (RoonBridge, gmrender-resurrect / rygel, shairport-sync, librespot) on the talker box, having it write to one half of a `snd-aloop` kernel loopback, and running the AOEther talker with `--source alsa --capture hw:Loopback,1,N` on the other half. Recipes live in `docs/recipe-*.md`. This pattern is deliberate — it covers every mainstream Linux music source at effectively zero code cost on our side and inherits Mode C's DAC-clock propagation all the way upstream (snd-aloop's shared ring transmits back-pressure to the source daemon's ALSA write side). Do not add native protocol implementations for these ecosystems without an explicit design-discussion issue that explains why the bridge pattern no longer suffices.
 
 ### Wire format invariants
 

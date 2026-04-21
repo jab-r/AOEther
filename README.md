@@ -4,7 +4,7 @@
 
 AOEther is an open-source system for transporting multichannel PCM and DSD audio over a network into any USB DAC — from a $20 USB headphone dongle to a $10,000 audiophile DAC — with minimal processing on the receiver side. A small program on a Raspberry Pi (or a Linux SBC, or an MCU) copies samples from Ethernet into the DAC's UAC2 input. No sample-rate conversion. No resampling. No DSP. Just bytes from the network to the DAC.
 
-> **Status:** M1 implementation in progress. Design is at [v1.3](docs/design.md). M1 (stereo PCM, RPi + USB DAC, Mode C rate feedback, no PTP) targets its first working build in ~2 weekends of effort.
+> **Status:** M1 implementation in progress. Design is at [v1.3](docs/design.md). M1 — stereo PCM, RPi + USB DAC, Mode C rate feedback, real music sources (Roon / UPnP / system audio via the `snd-aloop` bridge pattern), no PTP — targets first working build in ~3 weekends of effort.
 
 ## What it does
 
@@ -67,7 +67,7 @@ You should hear a clean 1 kHz tone.
 
 | Milestone | Status | Description |
 |-----------|--------|-------------|
-| M1 | In progress | Stereo PCM, RPi + USB DAC, Mode C rate feedback, no PTP |
+| M1 | In progress | Stereo PCM, RPi + USB DAC, Mode C rate feedback, Roon/UPnP/system-audio bridges, no PTP |
 | M2 | Planned | Multichannel PCM (5.1, 7.1, 7.1.4) |
 | M3 | Planned | Tier 2 hardware (Linux SBC), hardware PTP |
 | M4 | Planned | IP/UDP transport (WiFi and routed networks) |
@@ -88,6 +88,17 @@ See [`docs/design.md`](docs/design.md) for the detailed milestone plan and archi
 | 3 | NXP MIMXRT1170 MCU | $200 eval, sub-$50 BOM | Embedded product-grade streamers |
 
 All three run the same protocol.
+
+## How to play music through it
+
+AOEther doesn't implement Roon, UPnP, or AirPlay natively — it bridges them via the kernel's ALSA loopback. Any program that can play to ALSA on Linux becomes a valid AOEther source. Pick the recipe that matches your setup:
+
+- [`docs/quickstart.md`](docs/quickstart.md) — 30-minute bring-up, test-tone smoke test, pointers to the recipes below
+- [`docs/recipe-roon.md`](docs/recipe-roon.md) — Roon (via RoonBridge)
+- [`docs/recipe-upnp.md`](docs/recipe-upnp.md) — UPnP / DLNA controllers (via gmrender-resurrect)
+- [`docs/recipe-capture.md`](docs/recipe-capture.md) — desktop audio (browser, Tidal/Spotify apps, etc.) via PipeWire
+
+The same talker and receiver binaries run under every recipe; only the source daemon changes. AirPlay (shairport-sync) and Spotify Connect (librespot) plug in with the same pattern.
 
 ## Documentation
 
