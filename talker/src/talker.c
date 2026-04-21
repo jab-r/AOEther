@@ -88,8 +88,15 @@ static int64_t ts_diff_ms(struct timespec a, struct timespec b)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "usage: %s --iface IF --dest-mac AA:BB:CC:DD:EE:FF\n"
-        "           [--source testtone|wav] [--file PATH]\n",
+        "usage: %s --iface IF --dest-mac AA:BB:CC:DD:EE:FF [options]\n"
+        "  --source testtone|wav|alsa   default: testtone\n"
+        "  --file   PATH                WAV file, required with --source wav\n"
+        "  --capture hw:CARD=...        ALSA capture device, required with --source alsa\n"
+        "\n"
+        "M1 stream is hardcoded 48 kHz / 2ch / s24le-3. Sources must match.\n"
+        "For music playback, point --capture at one half of a snd-aloop pair\n"
+        "and route Roon/UPnP/AirPlay/PipeWire at the other half; see\n"
+        "docs/recipe-*.md.\n",
         prog);
 }
 
@@ -99,22 +106,25 @@ int main(int argc, char **argv)
     const char *dest_s = NULL;
     const char *source = "testtone";
     const char *wav_path = NULL;
+    const char *capture_pcm = NULL;
 
     static const struct option opts[] = {
         { "iface",    required_argument, 0, 'i' },
         { "dest-mac", required_argument, 0, 'd' },
         { "source",   required_argument, 0, 's' },
         { "file",     required_argument, 0, 'f' },
+        { "capture",  required_argument, 0, 'c' },
         { "help",     no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "i:d:s:f:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:d:s:f:c:h", opts, NULL)) != -1) {
         switch (c) {
         case 'i': iface = optarg; break;
         case 'd': dest_s = optarg; break;
         case 's': source = optarg; break;
         case 'f': wav_path = optarg; break;
+        case 'c': capture_pcm = optarg; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -139,6 +149,12 @@ int main(int argc, char **argv)
             return 2;
         }
         src = audio_source_wav_open(wav_path);
+    } else if (strcmp(source, "alsa") == 0) {
+        if (!capture_pcm) {
+            fprintf(stderr, "talker: --capture hw:... required with --source alsa\n");
+            return 2;
+        }
+        src = audio_source_alsa_open(capture_pcm, CHANNELS, SAMPLE_RATE_HZ);
     } else {
         fprintf(stderr, "talker: unknown --source %s\n", source);
         return 2;

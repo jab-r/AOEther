@@ -315,13 +315,17 @@ Underruns substitute silence (rather than blocking). Overruns drop oldest slot. 
 
 ## Milestone plan
 
-### M1 — RPi + USB DAC, stereo PCM, Mode C feedback, point-to-point, no PTP
+### M1 — RPi + USB DAC, stereo PCM, Mode C feedback, real music sources, no PTP
 
-**Goal:** Prove Topology B end-to-end with the smallest code that actually holds up. Plug a USB DAC into a Raspberry Pi, stream stereo PCM from a Linux talker, hear clean audio indefinitely. Includes the Mode C feedback loop from day one — an M1 without it fails its own 1-hour soak test (see §"Clock architecture" for why).
+**Goal:** Ship an AOEther that's actually usable for listening, not just a test-tone demo. Plug a USB DAC into a Raspberry Pi, stream stereo PCM from a Linux talker whose input is real music — from Roon, a UPnP controller, AirPlay, Spotify, or any application playing through the OS audio stack — and hear clean audio indefinitely. Includes the Mode C feedback loop from day one — an M1 without it fails its own 1-hour soak test (see §"Clock architecture" for why).
 
-**Deliverables:** Working stereo audio with Mode C clock discipline, talker + receiver in one public repo, README with "first audio in 30 minutes" quickstart. Talker ~400 lines of userspace C; receiver ~250 lines.
+**Approach to music sources:** the talker gains an ALSA capture source. Everything else — Roon (via RoonBridge), UPnP (via gmrender-resurrect or rygel), AirPlay (via shairport-sync), Spotify (via librespot), OS audio (via PipeWire/Pulse) — integrates through the kernel's `snd-aloop` module: the external daemon plays to `hw:Loopback,0,N`, the talker captures from `hw:Loopback,1,N`. No per-ecosystem code in AOEther; one recipe per ecosystem in `docs/recipe-*.md`.
 
-**Time estimate:** 2 weekends.
+This also means the DAC clock propagates all the way up to the source daemon for free — see §"Clock architecture". Adaptive daemons (PipeWire, shairport-sync, RoonBridge) adapt glitch-free; naïve daemons (gmrender, librespot) may xrun rarely and self-recover.
+
+**Deliverables:** Working stereo audio with Mode C clock discipline, real music playback via at least one of {Roon, UPnP, system capture}, talker + receiver in one public repo, per-recipe quickstart docs. Talker ~500 lines of userspace C; receiver ~250 lines.
+
+**Time estimate:** 3 weekends.
 
 See the detailed M1 plan below.
 
@@ -474,7 +478,7 @@ Mode C control path (receiver → talker):
 
 ### Talker (`talker/`)
 
-~400 lines of C, no dependencies beyond libc. Shares `packet.{h,c}` with the receiver via `common/`.
+~500 lines of C, depends on libasound2 for the capture source. Shares `packet.{h,c}` with the receiver via `common/`.
 
 ```
 talker/
@@ -483,8 +487,9 @@ talker/
 └── src/
     ├── talker.c              — main loop, timerfd, sockets, sample accumulator, feedback RX
     ├── audio_source.h        — abstract source interface
-    ├── audio_source_test.c   — 1 kHz sine wave
-    └── audio_source_wav.c    — WAV file loop
+    ├── audio_source_test.c   — 1 kHz sine wave (bring-up, diagnostics)
+    ├── audio_source_wav.c    — WAV file loop (bring-up, diagnostics)
+    └── audio_source_alsa.c   — ALSA capture (primary music-source path; see docs/recipe-*.md)
 ```
 
 Additional Mode C responsibilities:
@@ -577,9 +582,11 @@ sudo ./build/receiver --iface eth0 --dac hw:CARD=Dragonfly,DEV=0
 - [ ] Talker compiles on Ubuntu 22.04 / 24.04.
 - [ ] Receiver compiles on Raspberry Pi OS Bookworm.
 - [ ] Mode C feedback loop working: 1-hour soak with bounded buffer fill (test 6) and a positive control via `--no-feedback` (test 7).
+- [ ] ALSA capture source working: talker plays back a real music stream from at least one of {Roon, UPnP MediaRenderer, PipeWire/Pulse system capture} through to the receiver's USB DAC.
 - [ ] `README.md` with BOM, setup, "first audio in 30 minutes" quickstart.
 - [ ] `docs/design.md` (this doc).
 - [ ] `docs/wire-format.md` including §"Control frames".
+- [ ] `docs/recipe-roon.md`, `docs/recipe-upnp.md`, `docs/recipe-capture.md` bridge recipes.
 - [ ] `CONTRIBUTING.md`.
 - [ ] GitHub Actions CI.
 - [ ] Short demo video.
