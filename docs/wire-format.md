@@ -1,6 +1,6 @@
 # AOEther Wire Format Specification
 
-**Status:** v1.3 draft — aligned with [`design.md`](design.md) v1.3
+**Status:** v1.4 draft — aligned with [`design.md`](design.md) v1.4
 **Purpose:** Byte-level reference for implementers of talkers, receivers, and test tools.
 
 This document specifies the AOEther wire format at the level of detail needed to build an interoperable implementation. For architectural rationale, see [`design.md`](design.md).
@@ -44,7 +44,7 @@ Mode 4 (RTP/AES67, M9, PCM only):
   No AoE header; RTP payload type and format per AES67 profile.
 ```
 
-Modes 1–3 carry the same AoE header and any supported format code (PCM, DoP, native DSD). Mode 4 is a separate PCM-only encoding for AES67 interop; see AES67 / RFC 3190 for RTP payload details. This document covers the AoE header itself, which appears in Modes 1, 2 (DSD vendor subtype), and 3.
+Modes 1, 3, and the DSD vendor-subtype path of Mode 2 carry the same AoE header and any supported format code (PCM, DoP, native DSD). The PCM path of Mode 2 carries IEEE 1722 AVTP AAF instead — see §"Mode 2 (AVTP AAF)" below. Mode 4 is a separate PCM-only encoding for AES67 interop; see AES67 / RFC 3190 for RTP payload details. This document covers the AoE header (§"AoE header"), the AAF header (§"Mode 2 (AVTP AAF)"), and the shared AoE-C control header (§"Control frames").
 
 **Destination address:**
 - Mode 1 / Mode 2: Ethernet unicast for point-to-point; multicast MAC range `01:1B:19:00:00:00/40` (AVTP reserved) for future multicast streams.
@@ -193,6 +193,78 @@ For payload sizes that exceed the MTU (native DSD2048 stereo is 2822 bytes per m
 | Stereo Native DSD64 | 88 B | 122 B |
 | Stereo Native DSD512 | 704 B | 738 B |
 | Stereo Native DSD2048 | 2822 B total → 2 pkts of 1411 B | 2 × 1445 B |
+
+## Mode 2 (AVTP AAF)
+
+When the talker is configured with `--transport avtp`, PCM streams are emitted as IEEE 1722-2016 AVTP AAF frames on EtherType `0x22F0` instead of the AOE wrapper. This is what makes a stream visible to off-the-shelf Milan listeners (Hive-controlled MOTU AVB interfaces, L-Acoustics speakers, audiophile devices that speak Milan, etc.). The control plane (AVDECC entity model, stream reservation) is **not** implemented in M5 — the talker emits frames as if AVDECC had already negotiated the stream, and the listener must be told out-of-band which stream ID and listener-side talker MAC to subscribe to. AVDECC integration arrives in M7.
+
+DSD streams continue to use Mode 1 / Mode 3; AAF doesn't carry DSD.
+
+### AVTP-AAF header (24 bytes)
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   subtype     |sv|version|mr|rsv|tv|  sequence_num |   rsv  |tu|
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                          stream_id                            |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       avtp_timestamp                          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   format    | nsr  | rsv |     channels_per_frame  | bit_depth|
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       stream_data_length      |sp|         reserved           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+| Offset | Field | Width | Notes |
+|---|---|---|---|
+| 0 | subtype | 8 | `0x02` (AAF) |
+| 8 | sv | 1 | `1` (stream_id valid) |
+| 9 | version | 3 | `0` (AVTPv0) |
+| 12 | mr | 1 | media reset; toggled on stream restart, `0` otherwise |
+| 15 | tv | 1 | `1` if `avtp_timestamp` is valid; `0` until M3 PTP lands |
+| 16 | sequence_num | 8 | per-stream packet counter, wraps at 256 |
+| 31 | tu | 1 | timestamp uncertain; `0` for valid, `1` while gPTP is unlocked |
+| 32 | stream_id | 64 | AOEther mints `(src_mac << 16) | stream_id` until M7 |
+| 96 | avtp_timestamp | 32 | gPTP nanoseconds, low 32 bits; `0` when `tv=0` |
+| 128 | format | 8 | `0x03` (INT_24) for our s24 PCM; `0x04` INT_16, `0x02` INT_32, `0x01` FLOAT_32 also defined by spec |
+| 136 | nsr | 4 | sample-rate code (Table below) |
+| 144 | channels_per_frame | 10 | 1..1023 |
+| 152 | bit_depth | 8 | bits actually used per sample (24 for our INT_24) |
+| 160 | stream_data_length | 16 | bytes of PCM payload following the header |
+| 176 | sp | 1 | sparse mode; `0` for normal |
+
+Bit packing follows IEEE 1722-2016 Table 18 — the 32-bit `format / nsr / cpf / bit_depth` word at octets 16-19 packs as: format in the high byte, nsr in the next nibble, two reserved bits, then 10 bits of channels_per_frame, then 8 bits of bit_depth. The 32-bit `stream_data_length / sp / reserved` word at octets 20-23 carries the data length in the high half. The `common/avtp.c` helpers `avtp_aaf_hdr_build()` / `avtp_aaf_hdr_parse()` produce and consume this layout.
+
+### NSR codes
+
+| Code | Rate (Hz) |
+|---:|---:|
+| `0x01` | 8000 |
+| `0x02` | 16000 |
+| `0x03` | 32000 |
+| `0x04` | 44100 |
+| `0x05` | 48000 |
+| `0x06` | 88200 |
+| `0x07` | 96000 |
+| `0x08` | 176400 |
+| `0x09` | 192000 |
+| `0x0A` | 24000 |
+
+### Sample byte order
+
+**AAF samples are big-endian on the wire.** AOEther's source/sink path (ALSA `S24_3LE`) is little-endian, so the talker byte-swaps each 3-byte sample on AVTP egress and the receiver byte-swaps on AVTP ingress. This is the only data-path divergence between Mode 1/3 (which keep ALSA-native LE on the wire) and Mode 2.
+
+### Mode C feedback over AVTP
+
+AOEther's Mode C clock-discipline FEEDBACK frames continue to flow on EtherType `0x88B6` (see §"Control frames") regardless of data transport. A Milan listener that receives an AVTP stream from AOEther will simply ignore the unknown EtherType — it has no effect on AVTP framing or playback. When AOEther is the *receiver* and the talker is a third-party Milan device, FEEDBACK frames are still emitted but the third-party talker will ignore them; in that deployment Mode C is inactive and the AOEther receiver depends on the Milan talker's gPTP-disciplined media clock for stability.
+
+### Stream addressing
+
+Milan typically uses multicast destination MACs in the AVTP-reserved range `91:E0:F0:00:00:00/40`. AOEther's talker accepts any unicast or multicast MAC via `--dest-mac`; it does not register addresses with a switch via MSRP (that's Avnu/Milan controller territory and arrives no earlier than M7 alongside AVDECC).
 
 ## Control frames
 

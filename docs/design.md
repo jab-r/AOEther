@@ -1,6 +1,6 @@
 # Audio-over-Ethernet for USB DACs
 
-**Status:** Draft v1.3 — design doc, M1 implementation in progress
+**Status:** Draft v1.4 — M1–M4 merged to main; M5 (AVTP AAF) code complete on `feature/m5-avtp-aaf`
 **Audience:** Contributors, reviewers, early adopters
 **License:** Apache 2.0 (proposed)
 
@@ -387,9 +387,24 @@ M3 is split into two sub-phases because it's mostly hardware work:
 
 **Goal:** Add AVTP (Mode 2) for Milan/AVB interop on PCM streams. DSD streams continue to use Mode 1 or 3.
 
-**Deliverables:** Talker emits AVTP AAF for PCM when `--transport avtp` is set. Receiver parses AVTP on the configured interface. Interop test with at least one Milan listener (Hive-controlled Motu AVB interface or equivalent).
+**Status:** Code complete; interop test pending hardware access to a Milan listener.
 
-**Time estimate:** 2 weekends.
+**Deliverables:**
+- `--transport avtp` on talker emits IEEE 1722-2016 AVTP AAF frames at EtherType `0x22F0` for any AOEther-supported PCM rate (44.1/48/88.2/96/176.4/192 kHz, 1..1023 channels).
+- `--transport avtp` on receiver parses AAF and writes to ALSA. Format / NSR / channels / bit-depth must match CLI; mismatched frames are dropped.
+- AAF byte-order conversion (big-endian on the wire ↔ ALSA little-endian) handled in-place by `common/avtp.c::avtp_swap24_inplace`.
+- Mode C feedback unchanged: AOEther's `0x88B6` control frames continue to flow alongside AVTP data; Milan-only listeners ignore the unknown EtherType.
+- Wire-format documentation in `docs/wire-format.md` §"Mode 2 (AVTP AAF)" with full byte layout, NSR table, and sample-byte-order rule.
+- Operator recipe in `docs/recipe-milan.md` covering Wireshark AVTP-dissector verification and listener-side stream subscription.
+
+**Out of scope (deferred to M7):**
+- AVDECC entity model (ATDECC over IEEE 1722.1) — required for Milan controllers like Hive to *discover* the stream automatically. Without it, listener-side stream ID and talker MAC must be configured manually.
+- MSRP / SRP stream reservation. AOEther emits at line rate without per-class shaping; works on quiet wires and TSN-class switches that accept best-effort AAF traffic.
+- gPTP-disciplined `avtp_timestamp`. M5 emits `tv=0` and `avtp_timestamp=0`. Listeners that require a valid presentation time will reject; many do not. Real PTP integration arrives in M3 Phase B (hardware) and is wired into the AVTP timestamp here in M7.
+
+**Key risks:** Milan listeners vary in strictness about AVDECC pre-negotiation. Without M7's AVDECC support, some won't accept AOEther's stream regardless of how correct the AAF bits are. The recipe doc calls this out and recommends Hive's "manual stream connection" workflow for testing.
+
+**Time estimate:** 2 weekends for the code (done); interop verification depends on listener access.
 
 ### M6 — Native DSD end-to-end
 

@@ -4,15 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-**Pre-implementation.** There is no source code yet — only design documents. The canonical artifacts are:
+**M1–M4 merged to main; M5 (AVTP AAF) on its feature branch.** Canonical artifacts:
 
-- `docs/design.md` (v1.2) — architecture, rationale, milestone plan. Source of truth.
-- `docs/wire-format.md` (v1.2) — byte-level AoE header and transport encapsulation reference.
+- `docs/design.md` (v1.4) — architecture, rationale, milestone plan. Source of truth when in conflict with the code.
+- `docs/wire-format.md` (v1.4) — byte-level reference for the AoE header, AAF header, and AoE-C control header.
 - `CONTRIBUTING.md` — style and PR flow.
+- `docs/recipe-*.md` — operator-facing recipes for music sources (Roon, UPnP, PipeWire) and transport modes (Milan/AVTP).
 
-Any code you write must match what these documents specify. When design and code disagree, update the design doc in the same change — the doc is the canonical record (see CONTRIBUTING.md "Design discussion").
+When design and code disagree, update the design doc in the same change — the doc is the canonical record (see CONTRIBUTING.md "Design discussion").
 
-Implementation language is **C** (per CONTRIBUTING.md and the M1 sketch in `design.md`).
+Implementation language is **C** (per CONTRIBUTING.md). MCU firmware (Tier 3, M7+) will also be C.
 
 ## What's being built
 
@@ -30,10 +31,17 @@ From M1 onward, AOEther does NOT implement RAAT (Roon), UPnP MediaRenderer, AirP
 
 ### Wire format invariants
 
-Two coexisting protocols:
+Three coexisting protocols on the wire:
 
-- **Data frames** — 16-byte AoE header (Magic `0xA0`, Version `0x01`) on EtherType `0x88B5` (L2), AVTP `0x22F0` (Milan), or IP/UDP port 8805 (Mode 3). Only the outer wrapper changes across transport modes; the AoE header itself is identical.
-- **Control frames** — 16-byte AoE-C header (Magic `0xA1`, Version `0x01`) on EtherType `0x88B6`. Currently only FEEDBACK frames (type `0x01`) for Mode C clock discipline; see `docs/wire-format.md` §"Control frames". Any new out-of-band signaling should live here, not overloaded onto data frames.
+- **AOE data frames** — 16-byte AoE header (Magic `0xA0`, Version `0x01`) on EtherType `0x88B5` (L2) or IP/UDP port 8805 (Mode 3). The AoE header itself is identical across modes; only the outer wrapper varies.
+- **AVTP AAF data frames** (Mode 2, M5+) — 24-byte IEEE 1722 AAF header on EtherType `0x22F0` for PCM streams when `--transport avtp` is used. Format codes / NSR / channels are AAF-native, **not** AOE format codes. Samples are big-endian on the wire (AOE wrappers carry ALSA-native little-endian); `common/avtp.c::avtp_swap24_inplace` handles the byte-swap on the AVTP edge. DSD streams continue to use Mode 1 / Mode 3.
+- **Control frames** — 16-byte AoE-C header (Magic `0xA1`, Version `0x01`) on EtherType `0x88B6`, used by Mode C clock-discipline FEEDBACK regardless of which data transport is active. Milan listeners ignore unknown EtherTypes, so AOEther's feedback loop is invisible to them. Any new out-of-band signaling should live here, not overloaded onto data frames.
+
+Multi-byte fields are big-endian. Format codes, flag bits, control-frame value encodings, and the AAF byte layout are enumerated in `docs/wire-format.md` — treat that file as the authoritative spec; don't redefine codes locally.
+
+### AVDECC and Milan control-plane scope
+
+AOEther's M5 ships AVTP **data-plane** interop only. AVDECC (the IEEE 1722.1 entity model that lets Hive and other Milan controllers discover and bind streams), MSRP (stream reservation), and gPTP-disciplined `avtp_timestamp` are deliberately deferred to M7. Until then, Milan-listener subscription is manual (see `docs/recipe-milan.md`). Do not start an AVDECC implementation under a different milestone — it has design implications for the discovery layer that need to be considered alongside mDNS-SD (IP discovery) all at once in M7.
 
 Multi-byte fields are big-endian. Format codes, flag bits, and control-frame value encodings are enumerated in `docs/wire-format.md` — treat that file as the authoritative spec; don't redefine codes locally.
 
@@ -56,19 +64,26 @@ Non-negotiable data-path rules (from `design.md` Goals / Non-goals):
 
 ## Commands
 
-No build system exists yet. Once M1 lands there will be `talker/Makefile` and `receiver/Makefile`. Planned entry points (from `design.md` §M1):
-
 ```sh
-cd talker && make
-sudo ./build/talker --iface eno1 --dest-mac <pi-mac> --source testtone
+cd talker && make            # → build/talker
+cd receiver && make          # → build/receiver
 
-cd receiver && make
+# Default L2 (raw Ethernet) — M1 baseline:
 sudo ./build/receiver --iface eth0 --dac hw:CARD=<name>,DEV=0
+sudo ./build/talker   --iface eno1 --dest-mac <pi-mac> --source testtone
+
+# IP/UDP transport (M4) — IPv4 / IPv6, unicast or multicast:
+sudo ./build/receiver --iface eth0 --dac hw:... --transport ip --port 8805 --group 239.10.20.30
+sudo ./build/talker   --iface eno1 --transport ip --dest-ip 239.10.20.30 --source testtone
+
+# AVTP AAF transport (M5) — Milan interop:
+sudo ./build/receiver --iface eth0 --dac hw:... --transport avtp
+sudo ./build/talker   --iface eno1 --transport avtp --dest-mac 91:E0:F0:00:01:00 --source testtone
 ```
 
-Both binaries need `CAP_NET_RAW` (hence `sudo` during development) because they open raw `AF_PACKET` sockets. Required Linux build deps: `build-essential`, `libasound2-dev`. `linuxptp` is added at M3, `libnl-3-dev` later for TSN.
+Both binaries need `CAP_NET_RAW` (hence `sudo` during development) for raw `AF_PACKET` sockets in L2 / AVTP modes. IP mode binds an unprivileged UDP port. Required Linux build deps: `build-essential`, `libasound2-dev`. `linuxptp` is added at M3 Phase B (hardware PTP); `libnl-3-dev` later for TSN.
 
-There is no CI config, no `.clang-format`, and no `.editorconfig` yet — CONTRIBUTING.md says these land with M1. Until then, match the style spelled out there manually.
+There is no CI config, no `.clang-format`, and no `.editorconfig` yet. Match the style spelled out in CONTRIBUTING.md manually.
 
 ## Code style (from CONTRIBUTING.md)
 

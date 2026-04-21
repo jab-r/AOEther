@@ -1,4 +1,5 @@
 #include "audio_source.h"
+#include "avtp.h"
 #include "packet.h"
 
 #include <arpa/inet.h>
@@ -42,8 +43,9 @@
 #define DSCP_EF_TOS           0xB8
 
 enum transport_mode {
-    TRANSPORT_L2 = 0,   /* raw Ethernet, AF_PACKET, EtherType 0x88B5/0x88B6 */
-    TRANSPORT_IP = 1,   /* UDP over IPv4, magic-byte disambiguation */
+    TRANSPORT_L2 = 0,    /* raw Ethernet, AF_PACKET, EtherType 0x88B5/0x88B6 */
+    TRANSPORT_IP = 1,    /* UDP over IPv4/v6, magic-byte disambiguation */
+    TRANSPORT_AVTP = 2,  /* IEEE 1722 AVTP AAF, EtherType 0x22F0 (Milan) */
 };
 
 /* Safety clamp on feedback-derived rate: ±1000 ppm of nominal. */
@@ -116,11 +118,13 @@ static void usage(const char *prog)
         "usage: %s --iface IF [transport options] [stream options]\n"
         "\n"
         "Transport (pick one):\n"
-        "  --transport l2               raw Ethernet, default\n"
+        "  --transport l2               raw Ethernet, AOE wrapper, default\n"
         "    --dest-mac AA:BB:CC:DD:EE:FF    (required)\n"
-        "  --transport ip               UDP over IPv4 (Mode 3, M4)\n"
-        "    --dest-ip X.Y.Z.W               (required)\n"
+        "  --transport ip               UDP over IPv4/v6 (Mode 3, M4)\n"
+        "    --dest-ip X.Y.Z.W | v6:literal  (required)\n"
         "    --port N                        UDP port, default %d\n"
+        "  --transport avtp             IEEE 1722 AAF, Milan interop (Mode 2, M5)\n"
+        "    --dest-mac AA:BB:CC:DD:EE:FF    (required; unicast or AVTP multicast)\n"
         "\n"
         "Source:\n"
         "  --source testtone|wav|alsa   default: testtone\n"
@@ -173,9 +177,10 @@ int main(int argc, char **argv)
         case 'd': dest_mac_s = optarg; break;
         case 'I': dest_ip_s = optarg; break;
         case 'T':
-            if (strcmp(optarg, "l2") == 0) transport = TRANSPORT_L2;
-            else if (strcmp(optarg, "ip") == 0) transport = TRANSPORT_IP;
-            else { fprintf(stderr, "talker: --transport must be l2 or ip\n"); return 2; }
+            if      (strcmp(optarg, "l2") == 0)   transport = TRANSPORT_L2;
+            else if (strcmp(optarg, "ip") == 0)   transport = TRANSPORT_IP;
+            else if (strcmp(optarg, "avtp") == 0) transport = TRANSPORT_AVTP;
+            else { fprintf(stderr, "talker: --transport must be l2, ip, or avtp\n"); return 2; }
             break;
         case 'P': udp_port = atoi(optarg); break;
         case 's': source = optarg; break;
@@ -191,8 +196,9 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return 2;
     }
-    if (transport == TRANSPORT_L2 && !dest_mac_s) {
-        fprintf(stderr, "talker: --dest-mac required for --transport l2\n");
+    if ((transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) && !dest_mac_s) {
+        fprintf(stderr, "talker: --dest-mac required for --transport %s\n",
+                transport == TRANSPORT_L2 ? "l2" : "avtp");
         return 2;
     }
     if (transport == TRANSPORT_IP && !dest_ip_s) {
@@ -213,18 +219,31 @@ int main(int argc, char **argv)
     }
 
     /* MTU check: at worst we need nominal samples-per-microframe plus a
-     * small drift margin, times channels × bytes. Plus eth (14) + AoE (16). */
+     * small drift margin, times channels × bytes. Plus eth (14) + protocol
+     * header (16 for AOE, 24 for AVTP-AAF). */
+    const size_t proto_hdr_len = (transport == TRANSPORT_AVTP) ? AVTP_HDR_LEN
+                                                               : AOE_HDR_LEN;
     const double nominal_spm = (double)rate_hz / 1000.0 / MICROFRAMES_PER_MS;
     const int max_samples_per_packet = (int)(nominal_spm + 0.5) + 4;
     const size_t max_payload = (size_t)max_samples_per_packet * channels * BYTES_PER_SAMPLE;
-    const size_t max_frame = sizeof(struct ether_header) + AOE_HDR_LEN + max_payload;
-    if (max_payload + AOE_HDR_LEN > ETH_MTU_PAYLOAD) {
+    const size_t max_frame = sizeof(struct ether_header) + proto_hdr_len + max_payload;
+    if (max_payload + proto_hdr_len > ETH_MTU_PAYLOAD) {
         fprintf(stderr,
                 "talker: ch=%d rate=%d needs %zu-byte frames — exceeds 1500-byte MTU.\n"
                 "  (Packet splitting for very-high-rate multichannel is deferred; try\n"
                 "  fewer channels or a lower rate. Worst-case payload = %zu B.)\n",
                 channels, rate_hz, max_frame, max_payload);
         return 2;
+    }
+
+    /* AVTP AAF only carries integer PCM rates from the standard nsr table.
+     * Reject AOE rates that don't have an AAF code. */
+    uint8_t avtp_nsr_code = 0;
+    if (transport == TRANSPORT_AVTP) {
+        if (avtp_aaf_nsr_from_hz(rate_hz, &avtp_nsr_code) < 0) {
+            fprintf(stderr, "talker: AVTP AAF has no NSR code for rate %d\n", rate_hz);
+            return 2;
+        }
     }
 
     /* Destination resolution. Exactly one of (dest_mac) or (dest_ss) is
@@ -237,7 +256,7 @@ int main(int argc, char **argv)
     int dest_is_multicast = 0;
     memset(&dest_ss, 0, sizeof(dest_ss));
 
-    if (transport == TRANSPORT_L2) {
+    if (transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) {
         if (parse_mac(dest_mac_s, dest_mac) < 0) {
             fprintf(stderr, "talker: bad --dest-mac\n");
             return 2;
@@ -308,8 +327,10 @@ int main(int argc, char **argv)
     uint8_t src_mac[6] = {0};
     struct sockaddr_ll data_to_ll = {0};   /* used only in L2 */
 
-    if (transport == TRANSPORT_L2) {
-        data_sock = socket(AF_PACKET, SOCK_RAW, htons(AOE_ETHERTYPE));
+    if (transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) {
+        uint16_t data_etype = (transport == TRANSPORT_AVTP) ? AVTP_ETHERTYPE
+                                                            : AOE_ETHERTYPE;
+        data_sock = socket(AF_PACKET, SOCK_RAW, htons(data_etype));
         if (data_sock < 0) {
             perror("socket(AF_PACKET, SOCK_RAW) data");
             fprintf(stderr, "talker: raw sockets need CAP_NET_RAW (try sudo)\n");
@@ -318,11 +339,13 @@ int main(int argc, char **argv)
         if (iface_lookup(data_sock, iface, &ifindex, src_mac) < 0) return 1;
 
         data_to_ll.sll_family = AF_PACKET;
-        data_to_ll.sll_protocol = htons(AOE_ETHERTYPE);
+        data_to_ll.sll_protocol = htons(data_etype);
         data_to_ll.sll_ifindex = ifindex;
         data_to_ll.sll_halen = 6;
         memcpy(data_to_ll.sll_addr, dest_mac, 6);
 
+        /* Mode C feedback always travels on AOE-C (0x88B6) regardless of
+         * data transport — Milan listeners ignore unknown EtherTypes. */
         fb_sock = socket(AF_PACKET, SOCK_RAW, htons(AOE_C_ETHERTYPE));
         if (fb_sock < 0) {
             perror("socket(AF_PACKET, SOCK_RAW) feedback");
@@ -440,26 +463,45 @@ int main(int argc, char **argv)
     uint8_t *frame = calloc(1, max_frame);
     if (!frame) return 1;
 
-    /* L2-only prefix (filled lazily and ignored in IP mode). */
-    if (transport == TRANSPORT_L2) {
+    /* L2 / AVTP have an Ethernet header prefix; IP mode does not. */
+    if (transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) {
         struct ether_header *eth = (struct ether_header *)frame;
         memcpy(eth->ether_dhost, dest_mac, 6);
         memcpy(eth->ether_shost, src_mac, 6);
-        eth->ether_type = htons(AOE_ETHERTYPE);
+        eth->ether_type = htons(transport == TRANSPORT_AVTP
+                                ? AVTP_ETHERTYPE : AOE_ETHERTYPE);
     }
-    struct aoe_hdr *hdr = (struct aoe_hdr *)(frame + sizeof(struct ether_header));
-    uint8_t *payload = frame + sizeof(struct ether_header) + AOE_HDR_LEN;
+    struct aoe_hdr      *aoe_hdr_p  = (struct aoe_hdr *)
+        (frame + sizeof(struct ether_header));
+    struct avtp_aaf_hdr *avtp_hdr_p = (struct avtp_aaf_hdr *)
+        (frame + sizeof(struct ether_header));
+    uint8_t *payload = frame + sizeof(struct ether_header) + proto_hdr_len;
     /* IP mode skips the 14-byte Ethernet-header prefix on the wire. */
-    const size_t tx_offset = (transport == TRANSPORT_L2) ? 0 : sizeof(struct ether_header);
+    const size_t tx_offset = (transport == TRANSPORT_IP) ? sizeof(struct ether_header) : 0;
 
-    if (transport == TRANSPORT_L2) {
+    /* AVTP stream_id convention: source MAC in high 6 bytes, our 16-bit
+     * STREAM_ID in the low 2. Milan AVDECC normally allocates these via
+     * the entity model; we mint a stable one ourselves until M7. */
+    const uint64_t avtp_stream_id =
+          ((uint64_t)src_mac[0] << 56)
+        | ((uint64_t)src_mac[1] << 48)
+        | ((uint64_t)src_mac[2] << 40)
+        | ((uint64_t)src_mac[3] << 32)
+        | ((uint64_t)src_mac[4] << 24)
+        | ((uint64_t)src_mac[5] << 16)
+        | (uint64_t)STREAM_ID;
+    uint8_t avtp_seq8 = 0;
+
+    if (transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) {
+        const char *label = (transport == TRANSPORT_AVTP) ? "avtp" : "l2";
         fprintf(stderr,
-                "talker: transport=l2 iface=%s ifindex=%d\n"
+                "talker: transport=%s iface=%s ifindex=%d\n"
                 "        src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x\n"
-                "        fmt=PCM_s24le-3 ch=%d rate=%d pps=8000 nominal_spp=%.2f max_spp=%d max_frame=%zuB feedback=on\n",
-                iface, ifindex,
+                "        fmt=%s ch=%d rate=%d pps=8000 nominal_spp=%.2f max_spp=%d max_frame=%zuB feedback=on\n",
+                label, iface, ifindex,
                 src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
                 dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3], dest_mac[4], dest_mac[5],
+                transport == TRANSPORT_AVTP ? "AAF_INT24(BE)" : "PCM_s24le-3",
                 channels, rate_hz, nominal_spm, max_samples_per_packet, max_frame);
     } else {
         char ip_str[INET6_ADDRSTRLEN] = {0};
@@ -515,11 +557,11 @@ int main(int argc, char **argv)
             struct sockaddr_storage src_addr;
             socklen_t src_addrlen = sizeof(src_addr);
             ssize_t fn;
-            if (transport == TRANSPORT_L2) {
-                fn = recv(fb_sock, fb_buf, sizeof(fb_buf), 0);
-            } else {
+            if (transport == TRANSPORT_IP) {
                 fn = recvfrom(fb_sock, fb_buf, sizeof(fb_buf), 0,
                               (struct sockaddr *)&src_addr, &src_addrlen);
+            } else {
+                fn = recv(fb_sock, fb_buf, sizeof(fb_buf), 0);
             }
             if (fn < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -531,7 +573,7 @@ int main(int argc, char **argv)
             /* Locate the AoE-C header. L2 has the Ethernet header in front;
              * IP has just the UDP payload. */
             const struct aoe_c_hdr *fh;
-            size_t hdr_off = (transport == TRANSPORT_L2) ? sizeof(struct ether_header) : 0;
+            size_t hdr_off = (transport == TRANSPORT_IP) ? 0 : sizeof(struct ether_header);
             if ((size_t)fn < hdr_off + AOE_C_HDR_LEN) continue;
             fh = (const struct aoe_c_hdr *)(fb_buf + hdr_off);
             if (!aoe_c_hdr_valid(fh)) continue;
@@ -553,7 +595,8 @@ int main(int argc, char **argv)
              * feedback comes from the single receiver — use slot 0. In IP
              * mode, match by family + addr + port. */
             int slot = -1;
-            if (transport == TRANSPORT_L2) {
+            if (transport != TRANSPORT_IP) {
+                /* L2 / AVTP: a single physical talker-receiver pair, slot 0. */
                 slot = 0;
                 fb_src[0].in_use = 1;
             } else {
@@ -651,21 +694,39 @@ int main(int argc, char **argv)
                 g_stop = 1;
                 break;
             }
-            aoe_hdr_build(hdr, STREAM_ID, seq, 0,
-                          (uint8_t)channels, FORMAT_CODE, (uint8_t)pc,
-                          AOE_FLAG_LAST_IN_GROUP);
 
+            const size_t payload_bytes =
+                (size_t)pc * channels * BYTES_PER_SAMPLE;
             size_t frame_len_total =
-                sizeof(struct ether_header) + AOE_HDR_LEN
-                + (size_t)pc * channels * BYTES_PER_SAMPLE;
+                sizeof(struct ether_header) + proto_hdr_len + payload_bytes;
+
+            if (transport == TRANSPORT_AVTP) {
+                /* AAF carries 24-bit samples big-endian; ALSA gives us LE.
+                 * Swap in place before transmit. */
+                avtp_swap24_inplace(payload,
+                                    (size_t)pc * (size_t)channels);
+                avtp_aaf_hdr_build(avtp_hdr_p,
+                                   avtp_stream_id,
+                                   avtp_seq8++,
+                                   0,                    /* avtp_timestamp (no PTP yet) */
+                                   AAF_FORMAT_INT24,
+                                   avtp_nsr_code,
+                                   (uint16_t)channels,
+                                   24,                   /* bit_depth */
+                                   (uint16_t)payload_bytes);
+            } else {
+                aoe_hdr_build(aoe_hdr_p, STREAM_ID, seq, 0,
+                              (uint8_t)channels, FORMAT_CODE, (uint8_t)pc,
+                              AOE_FLAG_LAST_IN_GROUP);
+            }
 
             ssize_t sent;
-            if (transport == TRANSPORT_L2) {
-                sent = sendto(data_sock, frame, frame_len_total, 0,
-                              (struct sockaddr *)&data_to_ll, sizeof(data_to_ll));
-            } else {
+            if (transport == TRANSPORT_IP) {
                 sent = sendto(data_sock, frame + tx_offset, frame_len_total - tx_offset, 0,
                               (struct sockaddr *)&dest_ss, dest_ss_len);
+            } else {
+                sent = sendto(data_sock, frame, frame_len_total, 0,
+                              (struct sockaddr *)&data_to_ll, sizeof(data_to_ll));
             }
             if (sent < 0) {
                 if (errno == EINTR) break;

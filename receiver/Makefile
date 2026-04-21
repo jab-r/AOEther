@@ -6,12 +6,13 @@ BUILD     := build
 INCLUDES  := -Isrc -I../common
 SRCS      := \
     src/receiver.c \
-    ../common/packet.c
+    ../common/packet.c \
+    ../common/avtp.c
 
 .PHONY: all clean
 all: $(BUILD)/receiver
 
-$(BUILD)/receiver: $(SRCS) ../common/packet.h | $(BUILD)
+$(BUILD)/receiver: $(SRCS) ../common/packet.h ../common/avtp.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) $(SRCS) -o $@ $(LDLIBS)
 
 $(BUILD):

@@ -32,7 +32,7 @@ sudo ./build/receiver --iface eth0 \
 Flags:
 
 - `--iface IF`, `--dac hw:...` (required) — as above.
-- `--transport l2|ip` — default `l2` (raw Ethernet). `ip` switches to UDP (Mode 3).
+- `--transport l2|ip|avtp` — default `l2` (raw Ethernet, AOE wrapper). `ip` switches to UDP (Mode 3, M4). `avtp` accepts IEEE 1722 AAF on EtherType `0x22F0` (Mode 2, M5); see [`docs/recipe-milan.md`](../docs/recipe-milan.md).
 - `--port N` — UDP port to bind (IP mode only, default 8805).
 - `--group IP` — multicast group to join (IP mode only). IPv4 in 224.0.0.0/4 or IPv6 in ff00::/8. Omit for unicast.
 - `--channels N` — channel count (1..64, default 2). Must match the talker.
@@ -44,7 +44,7 @@ Needs `CAP_NET_RAW` for the raw sockets in L2 mode; easiest path is `sudo`. IP m
 
 ## What it does, exactly
 
-- Opens two `AF_PACKET` sockets: one for RX on EtherType `0x88B5` (data), one for TX on `0x88B6` (Mode C FEEDBACK).
+- Opens two `AF_PACKET` sockets: one for RX on EtherType `0x88B5` (data — or `0x22F0` with `--transport avtp`), one for TX on `0x88B6` (Mode C FEEDBACK).
 - Accepts only data frames matching the M1 format: magic `0xA0`, version `0x01`, format `0x11` (PCM s24le-3), 2 channels.
 - Opens the named ALSA device at `S24_3LE`, 2ch, 48 kHz, ALSA soft-resample disabled.
 - Forwards payload bytes directly into `snd_pcm_writei`. ALSA is the jitter buffer; `snd_usb_audio` is the UAC2 stack and runs UAC2 async feedback with the DAC.
