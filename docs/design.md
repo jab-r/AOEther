@@ -1,6 +1,6 @@
 # Audio-over-Ethernet for USB DACs
 
-**Status:** Draft v1.2 — design doc, pre-implementation
+**Status:** Draft v1.3 — design doc, M1 implementation in progress
 **Audience:** Contributors, reviewers, early adopters
 **License:** Apache 2.0 (proposed)
 
@@ -9,6 +9,8 @@
 **Changes from v1.0:** Added **transport-mode abstraction**. The AoE header is unchanged, but the outer wrapper can be raw Ethernet (L2, default for deterministic wired deployments), AVTP (for Milan interop), or IP/UDP (for WiFi, routed networks, and AES67 interop). This acknowledges reality: WiFi is increasingly used for audio, Ravenna and AES67 are IP-based, and a single-transport design forecloses too much of the addressable user base. Milestone plan reshuffled accordingly: M4 is now "Alternative transports," pushing subsequent milestones down by one.
 
 **Changes from v1.1:** **Ravenna / AES67 interop promoted to its own milestone (M9).** In v1.1 it was a stretch goal inside M8, which was already overloaded with scale/soak/DSD1024-2048/packaging. AES67 interop is a substantial piece of work (RTP encapsulation, SDP session description, SAP announcement, PTPv2 sync) and the Ravenna/AES67 ecosystem is large enough to deserve proper scope. M8 now focuses on scale/soak/DSD-high-rates/packaging without the AES67 distraction.
+
+**Changes from v1.2:** **Mode C (DAC-disciplined clock) promoted from "M8+" to M1 baseline**, reframed as extending UAC2 asynchronous feedback across Ethernet. Mode A (talker-clock open-loop) is reclassified as diagnostic-only — it does not survive real-world crystal drift for more than tens of seconds at typical oscillator tolerance, and shipping M1 without Mode C would contradict M1's own 1-hour soak test. The wire format gains a small control-frame subprotocol on EtherType `0x88B6` carrying Q16.16 samples-per-ms feedback, modeled directly on UAC2 HS feedback-endpoint format. M1's time estimate rises from 1 weekend to 2 weekends. M8's clock-related scope shrinks accordingly.
 
 ## Summary
 
@@ -276,23 +278,31 @@ A stream is in exactly one mode end-to-end. The talker emits in the mode configu
 
 ## Clock architecture
 
-Three clocks: talker's audio source, network time (gPTP), and the DAC's internal clock (reflected through the receiver's USB SOF to the DAC's feedback endpoint). Three operating modes:
+Three independent physical clocks appear in the system: the talker's audio source clock, the network's gPTP time (when PTP is available), and the DAC's internal clock. The DAC's clock is the only one that matters for audio correctness at the output — it's the clock that samples hit the physical world at. Every other clock either tracks it or causes audible artifacts.
 
-### Mode A: Talker is clock master (M1–M3)
+### AoE extends UAC2 async feedback across Ethernet
 
-Talker emits at its local rate. Receiver writes to ALSA at the same nominal rate. `snd_usb_audio` handles USB async feedback with the DAC. Small drift is absorbed by ALSA buffers and ultimately resolved by the DAC's async feedback. Correct for casual use; sufficient for most listener applications.
+The `snd_usb_audio` kernel driver on the receiver already slaves its isochronous USB OUT rate to the DAC via UAC2 **asynchronous feedback**: the DAC's feedback endpoint reports a Q16.16 samples-per-1ms value, and the host adjusts how many samples it places in each isoc microframe to match. The core AOEther clock insight is that **we extend this same feedback loop one hop upstream, across Ethernet.**
 
-### Mode B: gPTP is clock master (M3+, Tier 2+)
+- The receiver observes its ALSA consumption rate (already locked to the DAC by `snd_usb_audio`'s own async-feedback handling), re-expresses it as a Q16.16 samples-per-1ms value, and sends it back to the talker in a small **control frame** (EtherType `0x88B6`; see [`wire-format.md`](wire-format.md) §"Control frames").
+- The talker maintains a fractional sample accumulator driven by the latest feedback value. Each outgoing data frame carries a *variable* number of samples — the integer part of the accumulator; the fractional residual carries to the next packet. This is exactly how a USB host adjusts microframe payload size under UAC2 async.
+- Packet cadence (the `timerfd` tick on the talker) stays at exactly nominal microframe rate. **Payload count, not timer period, absorbs the drift.** No ppm-precision timer math is needed on the talker.
 
-Talker derives its audio clock from gPTP. Multiple talkers produce phase-aligned output. Receivers participate in gPTP passively. DAC remains asynchronous and pulls at its own rate via feedback.
+Semantically the talker is a USB host with a very long cable; the receiver is the DAC's async feedback endpoint extended across the network.
 
-### Mode C: DAC is clock master (M8+)
+### Operating modes
 
-The receiver measures the DAC's preferred rate (from the USB async feedback stream) against gPTP and reports it back to the talker. Talker adjusts its emission to match. The DAC's clock becomes the system-wide master. Useful for audiophile setups where the DAC's clock is deliberately superior (OCXO / rubidium references).
+**Mode A — open-loop (diagnostic only).** Talker emits at exactly nominal rate with a fixed sample count per packet and ignores any feedback. Receiver consumes whatever arrives. Fill level drifts monotonically with the crystal offset between talker and DAC (~1 sample/sec at 20 ppm) and exhausts the jitter buffer within seconds to minutes. Mode A is useful for bring-up and wire-format testing; it is **not a viable operating mode for listening.** Earlier versions of this doc called Mode A "sufficient for casual use" — that was incorrect and is retracted here.
+
+**Mode C — UAC2-extended feedback (baseline, from M1).** Receiver emits FEEDBACK control frames at 20–50 Hz (see wire-format.md). Talker maintains a fractional sample accumulator driven by the latest feedback value. Payload size varies per packet; packet cadence is constant. Single-receiver, single-stream control loop; stability is trivial because the receiver side has a large smoothing window (ALSA buffer fill level over tens of ms) and the talker side applies ppm-scale corrections. Mode C works over any transport that can carry its feedback frames, including IP/UDP over WiFi (at higher jitter-buffer cost).
+
+**Mode B — gPTP-disciplined emission (M3+, Tier 2+).** On hardware-PTP-capable platforms the talker can additionally discipline its *emission* clock to gPTP, giving multi-receiver phase alignment. This does not replace Mode C — consumer USB DACs are free-running crystals that nothing in the network disciplines, so every receiver still needs Mode C to rate-match locally. Mode B adds a shared time reference so multiple receivers agree on *when* to present a sample; Mode C handles *how fast* samples should flow into each DAC. The two modes do different jobs and coexist.
+
+In a Milan-grade pro-AV deployment where endpoints have gPTP-disciplined media clocks (rather than free-running crystals), Mode B alone is sufficient because all clocks in the system track gPTP. AOEther supports that deployment but doesn't require it.
 
 ### WiFi timing caveat
 
-The clock modes above assume gPTP or similar hardware-timestamped sync. On WiFi (Mode 3 IP/UDP transport), hardware PTP is unavailable and software PTP achieves only 100s of µs accuracy. For single-receiver WiFi deployments this is fine — the DAC's async USB feedback smooths the timing at the last hop, and a 5–10 ms jitter buffer absorbs WiFi's packet-delay variation. For multi-receiver phase alignment, wired gigabit between endpoints is required; WiFi cannot deliver sub-ms inter-receiver sync with any technology deployed today.
+Mode C over WiFi works — the feedback frame is just a UDP datagram in Mode 3, and WiFi jitter affects required buffer depth (10–50 ms typical) not clock discipline. Mode B over WiFi does not work: gPTP needs hardware timestamping at both ends of every WiFi hop, which consumer WiFi hardware does not provide. Single-receiver Mode C over WiFi is fine; multi-receiver phase alignment over WiFi is not.
 
 ## Jitter buffer
 
@@ -305,13 +315,13 @@ Underruns substitute silence (rather than blocking). Overruns drop oldest slot. 
 
 ## Milestone plan
 
-### M1 — RPi + USB DAC, stereo PCM, point-to-point, no PTP
+### M1 — RPi + USB DAC, stereo PCM, Mode C feedback, point-to-point, no PTP
 
-**Goal:** Prove Topology B end-to-end with the smallest possible code. Plug a USB DAC into a Raspberry Pi, stream stereo PCM from a Linux talker, hear audio.
+**Goal:** Prove Topology B end-to-end with the smallest code that actually holds up. Plug a USB DAC into a Raspberry Pi, stream stereo PCM from a Linux talker, hear clean audio indefinitely. Includes the Mode C feedback loop from day one — an M1 without it fails its own 1-hour soak test (see §"Clock architecture" for why).
 
-**Deliverables:** Working stereo audio, talker + receiver in one public repo, README with "first audio in 30 minutes" quickstart. Receiver is ~100 lines of userspace C.
+**Deliverables:** Working stereo audio with Mode C clock discipline, talker + receiver in one public repo, README with "first audio in 30 minutes" quickstart. Talker ~400 lines of userspace C; receiver ~250 lines.
 
-**Time estimate:** 1 weekend.
+**Time estimate:** 2 weekends.
 
 See the detailed M1 plan below.
 
@@ -442,62 +452,78 @@ That's the whole setup. No kernel overlays, no configfs scripts, no USB device-m
 
 ### Wire format for M1
 
-Hardcoded:
+Hardcoded for the audio (data) path:
+
 - Stream ID: `0x0001`
 - Format: `0x11` (PCM s24le-3)
 - Channels: 2
-- Sample rate: 48 kHz
-- Payload count: 6 samples per channel per packet
-- Cadence: 8000 pps via `timerfd`
-- Destination MAC: hardcoded
+- Sample rate: 48 kHz nominal
+- Payload count: 6 samples/ch/packet nominal; **varies per packet under Mode C feedback** (integer part of the talker's fractional sample accumulator)
+- Cadence: 8000 pps via `timerfd` (fixed, does not retune)
+- EtherType: `0x88B5`
+- Destination MAC: hardcoded at talker; receiver learns source MAC from the first data frame
+
+Mode C control path (receiver → talker):
+
+- EtherType: `0x88B6`
+- Frame type: `0x01` (FEEDBACK)
+- Feedback value: Q16.16 samples per 1 ms, derived from the receiver's ALSA consumption rate via `snd_pcm_delay()` / `snd_pcm_status()` tracking
+- Cadence: ~50 Hz (every 20 ms)
+- Stale-feedback fallback: talker reverts to nominal rate after ~5 s of silence
+- See [`wire-format.md`](wire-format.md) §"Control frames" for the 16-byte AoE-C header layout
 
 ### Talker (`talker/`)
 
-~250 lines of C, no dependencies beyond libc and optionally libasound2 for live capture.
+~400 lines of C, no dependencies beyond libc. Shares `packet.{h,c}` with the receiver via `common/`.
 
 ```
 talker/
 ├── Makefile
 ├── README.md
 └── src/
-    ├── talker.c              — main loop, timerfd, raw socket
+    ├── talker.c              — main loop, timerfd, sockets, sample accumulator, feedback RX
     ├── audio_source.h        — abstract source interface
     ├── audio_source_test.c   — 1 kHz sine wave
-    ├── audio_source_wav.c    — WAV file loop
-    ├── audio_source_alsa.c   — ALSA capture (optional)
-    └── packet.c              — AoE header construction
+    └── audio_source_wav.c    — WAV file loop
 ```
+
+Additional Mode C responsibilities:
+
+- Open a second `AF_PACKET` socket on EtherType `0x88B6` (non-blocking) for FEEDBACK frames.
+- Drain pending feedback once per timer tick; update `samples_per_microframe` from the latest Q16.16 value, clamped to a ±1000 ppm safety band.
+- Maintain a Q64 fractional sample accumulator. Each packet's `payload_count` is the integer part of the accumulator; the fractional residual carries into the next packet.
+- Vary `sendto()` length per packet: `14 + 16 + payload_count * channels * bytes_per_sample`.
+- Revert to nominal rate (48 kHz) if no FEEDBACK has arrived for ~5 s.
 
 Run: `sudo ./build/talker --iface eno1 --dest-mac aa:bb:cc:dd:ee:ff --source testtone`
 
 ### Receiver (`receiver/`)
 
-~100 lines of userspace C, depends on libasound2.
+~250 lines of userspace C, depends on libasound2. Shares `packet.{h,c}` with the talker via `common/`.
 
 ```
 receiver/
 ├── Makefile
 ├── README.md
 └── src/
-    ├── receiver.c            — main loop
-    └── packet.c              — AoE header parsing (shared with talker)
+    └── receiver.c            — main loop, rate estimator, feedback TX
 ```
 
-Sketch of `receiver.c`:
+Data-path sketch (Mode C feedback logic elided):
 
 ```c
 int sock = socket(AF_PACKET, SOCK_RAW, htons(0x88B5));
-// bind to interface
+/* bind to interface */
 
 snd_pcm_t *pcm;
-snd_pcm_open(&pcm, argv_dac_name, SND_PCM_STREAM_PLAYBACK, 0);
+snd_pcm_open(&pcm, dac_name, SND_PCM_STREAM_PLAYBACK, 0);
 snd_pcm_set_params(pcm,
                    SND_PCM_FORMAT_S24_3LE,
                    SND_PCM_ACCESS_RW_INTERLEAVED,
                    2 /*channels*/,
                    48000 /*rate*/,
                    0 /*soft_resample off*/,
-                   500 /*latency_us*/);
+                   5000 /*latency_us — headroom for Mode C*/);
 
 uint8_t buf[2048];
 while (1) {
@@ -508,10 +534,11 @@ while (1) {
     if (hdr->format != 0x11 || hdr->channel_count != 2) continue;
     uint8_t *payload = buf + 14 + 16;
     snd_pcm_writei(pcm, payload, hdr->payload_count);
+    /* plus: periodic FEEDBACK frame emission; see receiver/src/receiver.c */
 }
 ```
 
-That's the whole receiver. ALSA is the jitter buffer; `snd_usb_audio` is the UAC2 stack.
+ALSA is the jitter buffer; `snd_usb_audio` handles UAC2 async feedback with the DAC. The receiver additionally runs a rate estimator — sampling `snd_pcm_delay()` at ~50 Hz and tracking `frames_written − delay` over time to derive DAC consumption rate — and emits a Q16.16 FEEDBACK frame on EtherType `0x88B6` to discipline the talker. See `receiver/src/receiver.c` for the complete loop.
 
 ### Build and run
 
@@ -535,32 +562,38 @@ sudo ./build/receiver --iface eth0 --dac hw:CARD=Dragonfly,DEV=0
 3. Talker stopped → audio silence (no pop) → talker restart → audio resumes.
 
 **Timing:**
-4. Measure end-to-end latency by generating a test click at the talker source and timing its arrival at the DAC output. Target: under 2 ms on a direct Ethernet link.
+4. Measure end-to-end latency by generating a test click at the talker source and timing its arrival at the DAC output. Target: under 10 ms on a direct Ethernet link (higher than the project-wide 5 ms goal — M1 runs with a deliberately generous jitter buffer to absorb `timerfd` scheduler jitter).
 5. CPU load on Pi in steady state. Target: under 10% on a single core.
 
+**Clock discipline (Mode C):**
+6. 1-hour test tone with receiver logging ALSA buffer fill level at 1 Hz. Fill level should stay within a bounded band (±10 ms worth of samples) across the full run, not drift monotonically.
+7. Positive control: run with `--no-feedback` on the receiver (omits FEEDBACK emission). System must drift and xrun within minutes, confirming the feedback loop is doing real work in (6).
+
 **Soak:**
-6. 1-hour test tone, zero audible glitches, zero ALSA underruns reported.
+8. 1-hour test tone, zero audible glitches, zero ALSA underruns reported.
 
 ### Deliverables checklist for M1
 
 - [ ] Talker compiles on Ubuntu 22.04 / 24.04.
 - [ ] Receiver compiles on Raspberry Pi OS Bookworm.
+- [ ] Mode C feedback loop working: 1-hour soak with bounded buffer fill (test 6) and a positive control via `--no-feedback` (test 7).
 - [ ] `README.md` with BOM, setup, "first audio in 30 minutes" quickstart.
 - [ ] `docs/design.md` (this doc).
-- [ ] `docs/wire-format.md`.
+- [ ] `docs/wire-format.md` including §"Control frames".
 - [ ] `CONTRIBUTING.md`.
 - [ ] GitHub Actions CI.
 - [ ] Short demo video.
 
 ### Known deferred items from M1
 
-- No PTP; `timerfd` cadence with millisecond-class jitter under load.
+- No gPTP. Clock discipline is Mode C only (UAC2-extended feedback); gPTP-disciplined emission (Mode B, for multi-receiver phase alignment) arrives in M3.
+- `timerfd` cadence with millisecond-class jitter under load. The generous jitter buffer absorbs it.
 - No capability discovery; hardcoded format.
-- No stream setup / control plane.
-- Single stream, single direction (talker → receiver).
+- No stream setup / control plane beyond FEEDBACK frames.
+- Single audio direction (talker → receiver); only FEEDBACK frames travel the other way.
 - No authentication, no encryption.
 - PCM only; DSD arrives in M6.
-- L2 Ethernet transport only (Mode 1); WiFi / IP arrives in M4.
+- L2 Ethernet transport only (Mode 1) for both audio and control frames; WiFi / IP arrives in M4.
 
 ## Open questions
 

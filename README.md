@@ -4,7 +4,7 @@
 
 AOEther is an open-source system for transporting multichannel PCM and DSD audio over a network into any USB DAC — from a $20 USB headphone dongle to a $10,000 audiophile DAC — with minimal processing on the receiver side. A small program on a Raspberry Pi (or a Linux SBC, or an MCU) copies samples from Ethernet into the DAC's UAC2 input. No sample-rate conversion. No resampling. No DSP. Just bytes from the network to the DAC.
 
-> **Status:** Pre-implementation. Design is at [v1.2](docs/design.md). M1 (stereo PCM, RPi + USB DAC, no PTP) targets its first working build in one weekend of effort.
+> **Status:** M1 implementation in progress. Design is at [v1.3](docs/design.md). M1 (stereo PCM, RPi + USB DAC, Mode C rate feedback, no PTP) targets its first working build in ~2 weekends of effort.
 
 ## What it does
 
@@ -67,7 +67,7 @@ You should hear a clean 1 kHz tone.
 
 | Milestone | Status | Description |
 |-----------|--------|-------------|
-| M1 | Planned | Stereo PCM, RPi + USB DAC, no PTP |
+| M1 | In progress | Stereo PCM, RPi + USB DAC, Mode C rate feedback, no PTP |
 | M2 | Planned | Multichannel PCM (5.1, 7.1, 7.1.4) |
 | M3 | Planned | Tier 2 hardware (Linux SBC), hardware PTP |
 | M4 | Planned | IP/UDP transport (WiFi and routed networks) |

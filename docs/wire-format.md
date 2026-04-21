@@ -1,9 +1,14 @@
 # AOEther Wire Format Specification
 
-**Status:** v1.2 draft — aligned with [`design.md`](design.md) v1.2
+**Status:** v1.3 draft — aligned with [`design.md`](design.md) v1.3
 **Purpose:** Byte-level reference for implementers of talkers, receivers, and test tools.
 
 This document specifies the AOEther wire format at the level of detail needed to build an interoperable implementation. For architectural rationale, see [`design.md`](design.md).
+
+AOEther has two wire protocols that coexist on the same interface:
+
+- **Data frames** (EtherType `0x88B5`, §"AoE header") carry audio samples from talker to receiver.
+- **Control frames** (EtherType `0x88B6`, §"Control frames") carry small messages between endpoints, currently only UAC2-shape clock-discipline feedback from receiver to talker. This frame class is new in v1.3 and supports Mode C clock discipline (see `design.md` §"Clock architecture").
 
 ## Transport encapsulation
 
@@ -189,6 +194,83 @@ For payload sizes that exceed the MTU (native DSD2048 stereo is 2822 bytes per m
 | Stereo Native DSD512 | 704 B | 738 B |
 | Stereo Native DSD2048 | 2822 B total → 2 pkts of 1411 B | 2 × 1445 B |
 
+## Control frames
+
+Control frames carry out-of-band signaling between endpoints. They share the Ethernet wire with data frames but use a distinct EtherType (`0x88B6`) and a distinct header magic byte (`0xA1` vs. `0xA0`), so the two classes are trivially separable by any receiver. Implementations that do not understand a given control frame type MUST discard it without affecting the audio path.
+
+The only control frame type defined in v1.3 is **FEEDBACK** (type `0x01`), which carries clock-discipline feedback from the receiver to the talker. It mirrors USB UAC2 HS async-feedback format directly — a Q16.16 samples-per-1ms value — so receivers with a real UAC2 feedback path can forward the DAC's feedback value with no unit conversion.
+
+### Transport encapsulation
+
+```
+Mode 1 (L2, M1+):
+┌──────────────────┬──────────────────┬──────────────────────┐
+│ Ethernet header  │ AoE-C header     │ Padding & FCS        │
+│ (14 bytes)       │ (16 bytes)       │ (to 64-byte min)     │
+└──────────────────┴──────────────────┴──────────────────────┘
+  EtherType = 0x88B6
+```
+
+Mode 3 (IP/UDP, M4+) will carry AoE-C frames as UDP datagrams on the same port as data frames, disambiguated by magic byte. No IP-level transport is defined in M1.
+
+Destination: unicast to the peer's MAC (receiver → talker, talker → receiver for future frame types).
+
+### AoE-C header (16 bytes)
+
+All multi-byte integer fields are big-endian.
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|    Magic      |    Version    |  Frame Type   |    Flags      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Stream ID            |           Sequence            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Value (frame-type-dependent)               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                           Reserved                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+| Offset | Field | Size | Type | Notes |
+|--------|-------|------|------|-------|
+| 0 | Magic | 1 | `u8` | Constant `0xA1`. Receivers MUST discard control frames with any other value. Distinguishes control from data frames (`0xA0`). |
+| 1 | Version | 1 | `u8` | `0x01`. Receivers SHOULD discard frames with unrecognized versions. |
+| 2 | Frame Type | 1 | `u8` | `0x01` = FEEDBACK. Other values reserved. Receivers MUST discard unrecognized types without effect on the audio path. |
+| 3 | Flags | 1 | `u8` | Reserved; must be `0` on transmit, ignored on receive. |
+| 4 | Stream ID | 2 | `u16` BE | Identifies which audio stream this control frame refers to. Matches the Stream ID in the data-frame header. |
+| 6 | Sequence | 2 | `u16` BE | Monotonically increasing per (stream, frame-type), wraps at 2^16. Lets the peer drop out-of-order or stale frames. |
+| 8 | Value | 4 | `u32` BE | Frame-type-dependent. For FEEDBACK: Q16.16 samples per 1 ms. |
+| 12 | Reserved | 4 | `u32` BE | Must be `0` on transmit, ignored on receive. |
+
+### FEEDBACK frame semantics (Frame Type `0x01`)
+
+The receiver observes the DAC's consumption rate — on Linux, via `snd_pcm_status_get_htstamp()` timestamping and `snd_pcm_delay()` tracking; on the MCU tier, via equivalent USB-host instrumentation — and emits this rate as a Q16.16 samples-per-1ms value. The format is identical to the UAC2 HS async feedback-endpoint format (4-byte Q16.16, samples-per-frame).
+
+Nominal reference values:
+
+| Stream rate | Q16.16 samples/ms | Hex |
+|---|---:|---|
+| 44.1 kHz | 44.100 | `0x002C199A` |
+| 48 kHz | 48.000 | `0x00300000` |
+| 88.2 kHz | 88.200 | `0x00583333` |
+| 96 kHz | 96.000 | `0x00600000` |
+| 176.4 kHz | 176.400 | `0x00B06666` |
+| 192 kHz | 192.000 | `0x00C00000` |
+
+Update cadence: SHOULD emit at 20–50 Hz. Lower cadence is allowed but widens the buffer-fill band the receiver must tolerate; higher cadence wastes network capacity for no controller-stability benefit.
+
+Talker handling: treat the latest valid FEEDBACK `Value` as the current rate target. Maintain a fractional sample accumulator. Each outgoing data frame's `payload_count` is the integer part of the accumulator; the fractional residual carries. Data-frame cadence is unchanged — **payload size, not cadence, absorbs drift.** Talkers SHOULD clamp the accepted rate to a safety band (e.g., ±1000 ppm of the nominal stream rate) and SHOULD revert to nominal if no FEEDBACK arrives for several seconds.
+
+Startup: the receiver SHOULD emit its first FEEDBACK frame within 100 ms of beginning playback so the talker doesn't run free for long.
+
+Loss tolerance: FEEDBACK is advisory, not authoritative. A single dropped frame is harmless; the talker simply uses the previous value until the next one arrives. Implementations MUST NOT retransmit FEEDBACK frames.
+
+### Frame size
+
+Ethernet header (14 B) + AoE-C header (16 B) = 30 B, which the MAC layer pads to the 60-byte Ethernet minimum before the 4-byte FCS.
+
 ## Stream lifetime
 
 Streams are created via the control plane (out of scope for this document; see [`design.md`](design.md) M6+ for AVDECC / mDNS-SD discovery). At the wire-format level:
@@ -227,3 +309,23 @@ A0 01 00 01 00 00 00 2A 00 00 00 00 02 11 06 01
 ```
 
 Followed by 36 bytes of PCM payload (2 channels × 3 bytes × 6 samples).
+
+## Diagnostic control frame example
+
+A FEEDBACK frame advertising the DAC's current rate as 48.0000 samples/ms:
+
+```
+Bytes (hex, space-separated for clarity):
+A1 01 01 00 00 01 03 E8 00 30 00 00 00 00 00 00
+│  │  │  │  │     │     │           │
+│  │  │  │  │     │     │           └─ reserved: 0
+│  │  │  │  │     │     └───────────── value (Q16.16): 0x00300000 = 48.000 s/ms
+│  │  │  │  │     └─────────────────── sequence: 1000
+│  │  │  │  └───────────────────────── stream ID: 1
+│  │  │  └──────────────────────────── flags: 0
+│  │  └─────────────────────────────── frame type: 0x01 FEEDBACK
+│  └────────────────────────────────── version: 1
+└───────────────────────────────────── magic: 0xA1
+```
+
+On the wire: 14-byte Ethernet header + these 16 bytes + 30 bytes of MAC padding + 4-byte FCS = 64 bytes total.
