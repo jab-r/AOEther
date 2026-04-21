@@ -27,17 +27,18 @@ Flags:
 - `--dest-mac AA:BB:CC:DD:EE:FF` — receiver's MAC (required with `--transport l2` or `--transport avtp`; for AVTP this is typically the listener's stream destination MAC, often a Milan-range multicast like `91:E0:F0:00:01:00`).
 - `--dest-ip IP` — destination IPv4 or IPv6 literal (required with `--transport ip`). Multicast groups (224.0.0.0/4 or ff00::/8) are auto-detected.
 - `--port N` — UDP port (IP mode only, default 8805).
-- `--source testtone|wav|alsa` — default `testtone` (1 kHz sine, −6 dBFS).
+- `--source testtone|wav|alsa|dsdsilence` — default `testtone` for PCM, `dsdsilence` for DSD. `testtone` is 1 kHz sine at −6 dBFS. `dsdsilence` emits the DSD idle pattern (`0x69`) — silent on a real DAC, used to verify the wire path.
 - `--file PATH` — WAV file when `--source wav`. Accepts PCM 24-bit at any of the supported channel counts and rates; the file loops.
 - `--capture hw:CARD=...` — ALSA PCM name when `--source alsa`. Point at one half of a `snd-aloop` pair to receive from Roon/UPnP/PipeWire; see `docs/recipe-*.md`.
 - `--channels N` — channel count (1..64, default 2). Receiver must match.
-- `--rate HZ` — one of 44100, 48000, 88200, 96000, 176400, 192000 (default 48000). Receiver must match.
+- `--rate HZ` — PCM only: one of 44100, 48000, 88200, 96000, 176400, 192000 (default 48000). Ignored for DSD — rate is implied by `--format`.
+- `--format FMT` — `pcm` (default) or `dsd64 | dsd128 | dsd256 | dsd512` (M6). AVTP transport is PCM-only and rejects `dsd*` at startup. See [`docs/recipe-dsd.md`](../docs/recipe-dsd.md).
 
 Needs `CAP_NET_RAW` to open `AF_PACKET` in L2 mode; easiest path is `sudo`. IP mode doesn't require root in principle (bind on ephemeral port is unprivileged), but if you want to bind to port 8805 < 1024 you'd need capabilities anyway — 8805 is fine without.
 
 ## What it does, exactly
 
-- Stream ID `0x0001`, format `0x11` (PCM s24le-3). Channels and rate are runtime-configured via `--channels` and `--rate`; defaults match M1 (2 channels, 48 kHz).
+- Stream ID `0x0001`. Format code is chosen by `--format`: `0x11` (PCM s24le-3, default), or `0x30..0x33` (native DSD64..DSD512, M6). Channels and rate are runtime-configured via `--channels` and `--rate`; defaults match M1 (2 channels, 48 kHz PCM).
 - Emits 1 packet per 125 µs tick from `timerfd`. The timer never retunes.
 - Ethernet II frame, EtherType `0x88B5`, AoE header per [`docs/wire-format.md`](../docs/wire-format.md). With `--transport avtp` the wrapper switches to IEEE 1722 AAF (24-byte header, samples big-endian on the wire) at EtherType `0x22F0`; Mode C feedback continues on `0x88B6` regardless.
 - `payload_count` is **nominally `rate_hz / 8000` samples per packet but varies under Mode C feedback** — the talker keeps a fractional sample accumulator driven by the latest FEEDBACK value and writes the integer part into each packet. This is how USB hosts drive async DACs; we extend the same scheme across Ethernet.

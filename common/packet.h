@@ -13,6 +13,30 @@
 #define AOE_FMT_PCM_S24LE_4      0x12
 #define AOE_FMT_PCM_S32LE        0x13
 
+/* DoP (DSD over PCM, RFC-style markers): payload is PCM s24le-3 at the
+ * inflated rate listed below; high byte alternates 0x05/0xFA. snd_usb_audio
+ * detects the marker pattern and switches the DAC into DSD mode. */
+#define AOE_FMT_DOP_DSD64        0x20   /* PCM s24le-3 @ 176.4 kHz */
+#define AOE_FMT_DOP_DSD128       0x21   /* PCM s24le-3 @ 352.8 kHz */
+#define AOE_FMT_DOP_DSD256       0x22   /* PCM s24le-3 @ 705.6 kHz */
+#define AOE_FMT_DOP_DSD512       0x23   /* PCM s24le-3 @ 1411.2 kHz */
+
+/* Native DSD: payload is the raw DSD bitstream, MSB-first within each byte,
+ * interleaved by channel. payload_count is bytes per channel in this packet
+ * (each byte = 8 DSD bits). DSD1024 / DSD2048 (codes 0x34/0x35) defined but
+ * deferred to M8. */
+#define AOE_FMT_NATIVE_DSD64     0x30   /* 2.8224 MHz/ch */
+#define AOE_FMT_NATIVE_DSD128    0x31   /* 5.6448 MHz/ch */
+#define AOE_FMT_NATIVE_DSD256    0x32   /* 11.2896 MHz/ch */
+#define AOE_FMT_NATIVE_DSD512    0x33   /* 22.5792 MHz/ch */
+#define AOE_FMT_NATIVE_DSD1024   0x34   /* 45.1584 MHz/ch (deferred to M8) */
+#define AOE_FMT_NATIVE_DSD2048   0x35   /* 90.3168 MHz/ch (deferred to M8) */
+
+/* DSD idle/silence pattern. Per Sony DSD spec, alternating-pulse DC zero is
+ * encoded as 01101001 (0x69) repeated. Some DACs prefer 0x96; both are
+ * acoustically silent. Used by talker's DSD silence source. */
+#define AOE_DSD_IDLE_BYTE        0x69
+
 #define AOE_FLAG_LAST_IN_GROUP   0x01
 #define AOE_FLAG_DISCONTINUITY   0x02
 #define AOE_FLAG_MARKER          0x04

@@ -33,7 +33,7 @@ From M1 onward, AOEther does NOT implement RAAT (Roon), UPnP MediaRenderer, AirP
 
 Three coexisting protocols on the wire:
 
-- **AOE data frames** — 16-byte AoE header (Magic `0xA0`, Version `0x01`) on EtherType `0x88B5` (L2) or IP/UDP port 8805 (Mode 3). The AoE header itself is identical across modes; only the outer wrapper varies.
+- **AOE data frames** — 16-byte AoE header (Magic `0xA0`, Version `0x01`) on EtherType `0x88B5` (L2) or IP/UDP port 8805 (Mode 3). The AoE header itself is identical across modes; only the outer wrapper varies. The `format` byte selects payload encoding: `0x11..0x13` PCM, `0x20..0x23` DoP-DSD (wire reserved, encoder not shipped yet), `0x30..0x33` native DSD64..512 (M6). Native DSD payload is MSB-first within each byte, interleaved across channels at **byte** granularity — matches `SND_PCM_FORMAT_DSD_U8` 1:1; other DSD_U* ALSA formats require a receiver-side transpose.
 - **AVTP AAF data frames** (Mode 2, M5+) — 24-byte IEEE 1722 AAF header on EtherType `0x22F0` for PCM streams when `--transport avtp` is used. Format codes / NSR / channels are AAF-native, **not** AOE format codes. Samples are big-endian on the wire (AOE wrappers carry ALSA-native little-endian); `common/avtp.c::avtp_swap24_inplace` handles the byte-swap on the AVTP edge. DSD streams continue to use Mode 1 / Mode 3.
 - **Control frames** — 16-byte AoE-C header (Magic `0xA1`, Version `0x01`) on EtherType `0x88B6`, used by Mode C clock-discipline FEEDBACK regardless of which data transport is active. Milan listeners ignore unknown EtherTypes, so AOEther's feedback loop is invisible to them. Any new out-of-band signaling should live here, not overloaded onto data frames.
 

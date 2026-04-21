@@ -1,6 +1,6 @@
 # Audio-over-Ethernet for USB DACs
 
-**Status:** Draft v1.4 — M1–M4 merged to main; M5 (AVTP AAF) code complete on `feature/m5-avtp-aaf`
+**Status:** Draft v1.5 — M1–M4 merged to main; M5 (AVTP AAF) and M6 (native DSD64–DSD512) code complete on their feature branches
 **Audience:** Contributors, reviewers, early adopters
 **License:** Apache 2.0 (proposed)
 
@@ -410,11 +410,26 @@ M3 is split into two sub-phases because it's mostly hardware work:
 
 **Goal:** Native DSD64 through DSD512 working through the full pipeline. DoP as a selectable fallback.
 
-**Deliverables:** Wire format format-code parsing, ALSA native-DSD format selection on receiver, verified audio playback through a native-DSD-capable DAC (Topping D90, Holo May, RME ADI-2, etc.). DoP mode selectable when DAC prefers it. Works over L2 (Mode 1) and IP/UDP (Mode 3); AVTP does not carry DSD.
+**Status:** Wire-format and code paths complete; real-DAC listening test pending hardware access.
+
+**Deliverables:**
+- Format codes `0x30..0x33` (native DSD64/128/256/512) defined in `common/packet.h` and wired through talker and receiver.
+- Talker `--format dsd64|dsd128|dsd256|dsd512` switches payload semantics to DSD bytes/microframe (integer alternation around the non-integer target, e.g., 44/45 for DSD64) with no other plumbing changes — the same fractional accumulator that drives PCM payload_count also drives the DSD byte count, so Mode C works unmodified.
+- Talker built-in DSD silence source (`--source dsdsilence`, default when `--format` is DSD) emits the `0x69` idle pattern. Enough to verify the wire path and ALSA format selection end to end; real file playback comes in M8.
+- Receiver `--format dsd64..dsd512` opens ALSA at `SND_PCM_FORMAT_DSD_U8`. The wire format's per-byte channel interleaving and MSB-first bit order match DSD_U8 1:1, so no reorder is needed.
+- Mode C clock discipline continues to work under DSD rates (tested in code path; rate numbers are ~352.8..2822.4 samples/ms, outside UAC2 HS feedback legal range but AOEther treats the Q16.16 value as opaque rate telemetry).
+- Both L2 (Mode 1) and IP/UDP (Mode 3) transports carry DSD; AVTP (Mode 2) rejects DSD at startup per IEEE 1722 AAF's PCM-only scope.
+- Operator recipe in [`docs/recipe-dsd.md`](recipe-dsd.md) with smoke-test procedure, troubleshooting, and a clear statement of what's deferred.
+
+**Out of scope for M6 (tracked as follow-ups):**
+- `SND_PCM_FORMAT_DSD_U32_BE` / `_U16_LE` on the receiver. These formats require an N-byte-granularity channel interleave, i.e. a small transpose before `snd_pcm_writei`. Many DACs advertise only these formats via `snd_usb_audio` quirks — the follow-up unlocks those. Wire format is unchanged.
+- DoP encoder on the talker (format codes `0x20..0x23`). The wire format already reserves them; wiring up a PCM-wrapped-DSD source needs a small DoP modulator which is straightforward but didn't make M6's code budget.
+- DSF / DFF file reader. `.dsf` is simple (Sony spec, LSB-first per-byte bit order — inverse of our wire format, so a bit-reverse step is needed on read) but the per-DAC quirk testing it enables is better concentrated in M8 alongside DSD1024/2048.
+- DSD1024 / DSD2048. At DSD1024 stereo the per-microframe byte count exceeds MTU; packet splitting + `last-in-group` reassembly arrives in M8.
 
 **Key note:** This milestone is dramatically simpler than it was in earlier drafts because `snd_usb_audio` already does the hard work. Our code is about wire format and format selection, not kernel drivers.
 
-**Time estimate:** 2 weekends including real-DAC testing.
+**Time estimate:** 2 weekends for wire-format plumbing + silence-path smoke test (done). DAC-matrix build-out (M8 overlap) and U32_BE follow-up add incrementally.
 
 ### M7 — AVDECC, discovery, and MCU receiver track kickoff
 

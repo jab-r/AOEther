@@ -9,6 +9,7 @@ SRCS      := \
     src/audio_source_test.c \
     src/audio_source_wav.c \
     src/audio_source_alsa.c \
+    src/audio_source_dsd.c \
     ../common/packet.c \
     ../common/avtp.c
 
