@@ -1,3 +1,4 @@
+#include "avtp.h"
 #include "packet.h"
 
 #include <alsa/asoundlib.h>
@@ -42,6 +43,7 @@
 enum transport_mode {
     TRANSPORT_L2 = 0,
     TRANSPORT_IP = 1,
+    TRANSPORT_AVTP = 2,
 };
 
 static int rate_supported(int hz)
@@ -68,7 +70,8 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "usage: %s --iface IF --dac hw:CARD=NAME,DEV=0 [options]\n"
-        "  --transport l2|ip    transport mode, default l2\n"
+        "  --transport l2|ip|avtp  transport mode, default l2\n"
+        "                       (avtp = IEEE 1722 AAF, EtherType 0x22F0, Milan interop)\n"
         "  --port N             UDP port (IP mode, default %d)\n"
         "  --group IP           multicast group to join (IP mode, optional;\n"
         "                       IPv4 in 224.0.0.0/4 or IPv6 in ff00::/8)\n"
@@ -135,9 +138,10 @@ int main(int argc, char **argv)
         case 'i': iface = optarg; break;
         case 'd': dac = optarg; break;
         case 'T':
-            if (strcmp(optarg, "l2") == 0) transport = TRANSPORT_L2;
-            else if (strcmp(optarg, "ip") == 0) transport = TRANSPORT_IP;
-            else { fprintf(stderr, "receiver: --transport must be l2 or ip\n"); return 2; }
+            if      (strcmp(optarg, "l2") == 0)   transport = TRANSPORT_L2;
+            else if (strcmp(optarg, "ip") == 0)   transport = TRANSPORT_IP;
+            else if (strcmp(optarg, "avtp") == 0) transport = TRANSPORT_AVTP;
+            else { fprintf(stderr, "receiver: --transport must be l2, ip, or avtp\n"); return 2; }
             break;
         case 'P': udp_port = atoi(optarg); break;
         case 'G': group_s = optarg; break;
@@ -157,9 +161,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "receiver: --port out of range\n");
         return 2;
     }
-    if (transport == TRANSPORT_L2 && group_s) {
+    if (transport != TRANSPORT_IP && group_s) {
         fprintf(stderr, "receiver: --group only makes sense with --transport ip\n");
         return 2;
+    }
+
+    /* AVTP AAF only carries the standard NSR rates. */
+    uint8_t avtp_nsr_code = 0;
+    if (transport == TRANSPORT_AVTP) {
+        if (avtp_aaf_nsr_from_hz(rate_hz, &avtp_nsr_code) < 0) {
+            fprintf(stderr, "receiver: AVTP AAF has no NSR code for rate %d\n", rate_hz);
+            return 2;
+        }
     }
     if (channels < 1 || channels > 64) {
         fprintf(stderr, "receiver: --channels must be 1..64 (got %d)\n", channels);
@@ -180,8 +193,10 @@ int main(int argc, char **argv)
     int group_family = AF_UNSPEC;
     int use_multicast = 0;
 
-    if (transport == TRANSPORT_L2) {
-        data_sock = socket(AF_PACKET, SOCK_RAW, htons(AOE_ETHERTYPE));
+    if (transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) {
+        uint16_t data_etype = (transport == TRANSPORT_AVTP) ? AVTP_ETHERTYPE
+                                                            : AOE_ETHERTYPE;
+        data_sock = socket(AF_PACKET, SOCK_RAW, htons(data_etype));
         if (data_sock < 0) {
             perror("socket(AF_PACKET, SOCK_RAW) data");
             fprintf(stderr, "receiver: raw sockets need CAP_NET_RAW (try sudo)\n");
@@ -190,13 +205,14 @@ int main(int argc, char **argv)
         if (iface_lookup(data_sock, iface, &ifindex, my_mac) < 0) return 1;
         struct sockaddr_ll bind_ll = {
             .sll_family = AF_PACKET,
-            .sll_protocol = htons(AOE_ETHERTYPE),
+            .sll_protocol = htons(data_etype),
             .sll_ifindex = ifindex,
         };
         if (bind(data_sock, (struct sockaddr *)&bind_ll, sizeof(bind_ll)) < 0) {
             perror("bind(data_sock)");
             return 1;
         }
+        /* Mode C feedback is unchanged across L2 / AVTP — both ride 0x88B6. */
         ctl_sock = socket(AF_PACKET, SOCK_RAW, htons(AOE_C_ETHERTYPE));
         if (ctl_sock < 0) {
             perror("socket(AF_PACKET, SOCK_RAW) control");
@@ -312,10 +328,13 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    if (transport == TRANSPORT_L2) {
+    if (transport != TRANSPORT_IP) {
         fprintf(stderr,
-                "receiver: transport=l2 iface=%s dac=%s fmt=S24_3LE ch=%d rate=%d latency_us=%d feedback=%s\n",
-                iface, dac, channels, rate_hz, latency_us,
+                "receiver: transport=%s iface=%s dac=%s fmt=%s ch=%d rate=%d latency_us=%d feedback=%s\n",
+                transport == TRANSPORT_AVTP ? "avtp" : "l2",
+                iface, dac,
+                transport == TRANSPORT_AVTP ? "AAF_INT24(BE)→S24_3LE" : "S24_3LE",
+                channels, rate_hz, latency_us,
                 feedback_enabled ? "on" : "off");
     } else {
         fprintf(stderr,
@@ -361,7 +380,7 @@ int main(int argc, char **argv)
         (struct aoe_c_hdr *)(fb_frame + sizeof(struct ether_header));
     struct aoe_c_hdr *fb_hdr_ip =
         (struct aoe_c_hdr *)fb_frame;
-    if (transport == TRANSPORT_L2) {
+    if (transport != TRANSPORT_IP) {
         memcpy(fb_eth->ether_shost, my_mac, 6);
         fb_eth->ether_type = htons(AOE_C_ETHERTYPE);
     }
@@ -387,11 +406,11 @@ int main(int argc, char **argv)
             struct sockaddr_storage src_addr;
             socklen_t src_addrlen = sizeof(src_addr);
             ssize_t n;
-            if (transport == TRANSPORT_L2) {
-                n = recv(data_sock, buf, sizeof(buf), 0);
-            } else {
+            if (transport == TRANSPORT_IP) {
                 n = recvfrom(data_sock, buf, sizeof(buf), 0,
                              (struct sockaddr *)&src_addr, &src_addrlen);
+            } else {
+                n = recv(data_sock, buf, sizeof(buf), 0);
             }
             if (n < 0) {
                 if (errno == EINTR) continue;
@@ -399,50 +418,95 @@ int main(int argc, char **argv)
                 break;
             }
 
-            size_t hdr_off = (transport == TRANSPORT_L2) ? sizeof(struct ether_header) : 0;
-            if ((size_t)n < hdr_off + AOE_HDR_LEN) {
-                dropped++;
-                goto check_feedback;
-            }
-            const struct aoe_hdr *hdr =
-                (const struct aoe_hdr *)(buf + hdr_off);
-            if (!aoe_hdr_valid(hdr) ||
-                hdr->format != AOE_FMT_PCM_S24LE_3 ||
-                hdr->channel_count != channels) {
-                dropped++;
-                goto check_feedback;
+            /* Parse the protocol header into a uniform (frames, payload_ptr,
+             * sequence) tuple, then fall through to the common ALSA-write
+             * and talker-learning path. */
+            size_t hdr_off = (transport == TRANSPORT_IP) ? 0 : sizeof(struct ether_header);
+            size_t frames = 0;
+            size_t payload_bytes = 0;
+            uint8_t *payload_p = NULL;
+            uint32_t seq = 0;
+
+            if (transport == TRANSPORT_AVTP) {
+                if ((size_t)n < hdr_off + AVTP_HDR_LEN) { dropped++; goto check_feedback; }
+                const struct avtp_aaf_hdr *ah =
+                    (const struct avtp_aaf_hdr *)(buf + hdr_off);
+                uint8_t  af, ans, abd, aseq;
+                uint16_t acpf, asdl;
+                uint64_t asid;
+                uint32_t ats;
+                if (avtp_aaf_hdr_parse(ah, &asid, &aseq, &ats,
+                                       &af, &ans, &acpf, &abd, &asdl) < 0) {
+                    dropped++; goto check_feedback;
+                }
+                if (af != AAF_FORMAT_INT24 ||
+                    ans != avtp_nsr_code  ||
+                    abd != 24             ||
+                    acpf != channels) {
+                    dropped++; goto check_feedback;
+                }
+                payload_bytes = asdl;
+                if ((size_t)n < hdr_off + AVTP_HDR_LEN + payload_bytes) {
+                    dropped++; goto check_feedback;
+                }
+                size_t per_sample = (size_t)channels * BYTES_PER_SAMPLE;
+                if (per_sample == 0 || payload_bytes % per_sample != 0) {
+                    dropped++; goto check_feedback;
+                }
+                frames = payload_bytes / per_sample;
+                payload_p = buf + hdr_off + AVTP_HDR_LEN;
+                /* AAF samples are big-endian on the wire; ALSA wants LE. */
+                avtp_swap24_inplace(payload_p, frames * (size_t)channels);
+                /* AVTP only carries an 8-bit sequence; widen against last. */
+                seq = (uint32_t)aseq;
+            } else {
+                if ((size_t)n < hdr_off + AOE_HDR_LEN) { dropped++; goto check_feedback; }
+                const struct aoe_hdr *hdr =
+                    (const struct aoe_hdr *)(buf + hdr_off);
+                if (!aoe_hdr_valid(hdr) ||
+                    hdr->format != AOE_FMT_PCM_S24LE_3 ||
+                    hdr->channel_count != channels) {
+                    dropped++; goto check_feedback;
+                }
+                frames = hdr->payload_count;
+                payload_bytes = frames * (size_t)channels * BYTES_PER_SAMPLE;
+                if ((size_t)n < hdr_off + AOE_HDR_LEN + payload_bytes) {
+                    dropped++; goto check_feedback;
+                }
+                seq = ntohl(hdr->sequence);
+                payload_p = buf + hdr_off + AOE_HDR_LEN;
             }
 
-            size_t frames = hdr->payload_count;
-            size_t payload_bytes = (size_t)frames * (size_t)channels * BYTES_PER_SAMPLE;
-            if ((size_t)n < hdr_off + AOE_HDR_LEN + payload_bytes) {
-                dropped++;
-                goto check_feedback;
-            }
-
-            uint32_t seq = ntohl(hdr->sequence);
             if (have_seq) {
-                int32_t delta = (int32_t)(seq - last_seq);
-                if (delta > 1) lost += (uint64_t)(delta - 1);
+                /* AVTP wraps every 256 packets; AOE every 2^32. Both work
+                 * with a signed-difference compare against the appropriate
+                 * width — for AVTP we treat seq as 8-bit. */
+                if (transport == TRANSPORT_AVTP) {
+                    int8_t d8 = (int8_t)((uint8_t)seq - (uint8_t)last_seq);
+                    if (d8 > 1) lost += (uint64_t)(d8 - 1);
+                } else {
+                    int32_t delta = (int32_t)(seq - last_seq);
+                    if (delta > 1) lost += (uint64_t)(delta - 1);
+                }
             }
             last_seq = seq;
             have_seq = 1;
 
             if (!have_talker) {
-                if (transport == TRANSPORT_L2) {
+                if (transport == TRANSPORT_IP) {
+                    memcpy(&talker_addr, &src_addr, src_addrlen);
+                    talker_addr_len = src_addrlen;
+                } else {
+                    /* L2 / AVTP both have an Ethernet header in front. */
                     const struct ether_header *eth = (const struct ether_header *)buf;
                     memcpy(talker_mac, eth->ether_shost, 6);
                     memcpy(fb_eth->ether_dhost, talker_mac, 6);
                     memcpy(fb_to_ll.sll_addr, talker_mac, 6);
-                } else {
-                    memcpy(&talker_addr, &src_addr, src_addrlen);
-                    talker_addr_len = src_addrlen;
                 }
                 have_talker = 1;
             }
 
-            const uint8_t *payload = buf + hdr_off + AOE_HDR_LEN;
-            snd_pcm_sframes_t w = snd_pcm_writei(pcm, payload, frames);
+            snd_pcm_sframes_t w = snd_pcm_writei(pcm, payload_p, frames);
             if (w == -EPIPE) {
                 underruns++;
                 snd_pcm_prepare(pcm);
@@ -501,7 +565,7 @@ check_feedback:
             double spms = rate_est_hz / 1000.0;
             uint32_t q = (uint32_t)(spms * 65536.0 + 0.5);
             ssize_t ss;
-            if (transport == TRANSPORT_L2) {
+            if (transport != TRANSPORT_IP) {
                 aoe_c_hdr_build_feedback(fb_hdr_l2, STREAM_ID, fb_seq++, q);
                 ss = sendto(ctl_sock, fb_frame, sizeof(fb_frame), 0,
                             (struct sockaddr *)&fb_to_ll, sizeof(fb_to_ll));

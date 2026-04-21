@@ -9,12 +9,13 @@ SRCS      := \
     src/audio_source_test.c \
     src/audio_source_wav.c \
     src/audio_source_alsa.c \
-    ../common/packet.c
+    ../common/packet.c \
+    ../common/avtp.c
 
 .PHONY: all clean
 all: $(BUILD)/talker
 
-$(BUILD)/talker: $(SRCS) src/audio_source.h ../common/packet.h | $(BUILD)
+$(BUILD)/talker: $(SRCS) src/audio_source.h ../common/packet.h ../common/avtp.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) $(SRCS) -o $@ $(LDLIBS)
 
 $(BUILD):
