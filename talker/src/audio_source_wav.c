@@ -108,9 +108,17 @@ struct audio_source *audio_source_wav_open(const char *path)
         off += 8 + sz + (sz & 1);
     }
 
-    if (fmt_tag != 1 || channels != 2 || rate != 48000 || bits != 24) {
+    /* M2 accepts any channel count and any supported rate, but the sample
+     * format is still locked to 24-bit little-endian (s24le-3 on the wire). */
+    static const int rates[] = { 44100, 48000, 88200, 96000, 176400, 192000 };
+    int rate_ok = 0;
+    for (size_t i = 0; i < sizeof(rates)/sizeof(rates[0]); i++) {
+        if (rate == rates[i]) { rate_ok = 1; break; }
+    }
+    if (fmt_tag != 1 || channels < 1 || channels > 64 || !rate_ok || bits != 24) {
         fprintf(stderr,
-                "wav: M1 requires PCM 48000 Hz 2ch 24-bit; got tag=%d ch=%d rate=%d bits=%d\n",
+                "wav: need PCM 1..64ch 24-bit at a supported rate "
+                "(44.1/48/88.2/96/176.4/192 kHz); got tag=%d ch=%d rate=%d bits=%d\n",
                 fmt_tag, channels, rate, bits);
         munmap((void *)map, sb.st_size);
         return NULL;

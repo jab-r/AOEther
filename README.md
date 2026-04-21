@@ -4,7 +4,7 @@
 
 AOEther is an open-source system for transporting multichannel PCM and DSD audio over a network into any USB DAC — from a $20 USB headphone dongle to a $10,000 audiophile DAC — with minimal processing on the receiver side. A small program on a Raspberry Pi (or a Linux SBC, or an MCU) copies samples from Ethernet into the DAC's UAC2 input. No sample-rate conversion. No resampling. No DSP. Just bytes from the network to the DAC.
 
-> **Status:** M1 implementation in progress. Design is at [v1.3](docs/design.md). M1 — stereo PCM, RPi + USB DAC, Mode C rate feedback, real music sources (Roon / UPnP / system audio via the `snd-aloop` bridge pattern), no PTP — targets first working build in ~3 weekends of effort.
+> **Status:** M2 implementation in progress. Design is at [v1.3](docs/design.md). M1 (stereo PCM, Mode C feedback, Roon/UPnP/system-audio bridges) is complete. M2 extends to multichannel and hi-res PCM with per-DAC test coverage.
 
 ## What it does
 
@@ -67,8 +67,8 @@ You should hear a clean 1 kHz tone.
 
 | Milestone | Status | Description |
 |-----------|--------|-------------|
-| M1 | In progress | Stereo PCM, RPi + USB DAC, Mode C rate feedback, Roon/UPnP/system-audio bridges, no PTP |
-| M2 | Planned | Multichannel PCM (5.1, 7.1, 7.1.4) |
+| M1 | Done | Stereo PCM, RPi + USB DAC, Mode C rate feedback, Roon/UPnP/system-audio bridges, no PTP |
+| M2 | In progress | Multichannel PCM (up to 7.1.4 / 16ch), hi-res rates (up to 192 kHz), per-DAC test matrix |
 | M3 | Planned | Tier 2 hardware (Linux SBC), hardware PTP |
 | M4 | Planned | IP/UDP transport (WiFi and routed networks) |
 | M5 | Planned | AVTP AAF wire format for Milan interop |

@@ -18,18 +18,34 @@
 #include <time.h>
 #include <unistd.h>
 
-/* M1: hardcoded stream format. See docs/design.md §"M1 detailed plan". */
+/* Stream format. Channels and rate are runtime-configured from M2 on; the
+ * sample format is still locked to s24le-3 (other widths arrive later). See
+ * docs/design.md §"M2" for the scope of what's parameterizable. */
 #define STREAM_ID         0x0001
-#define SAMPLE_RATE_HZ    48000
-#define CHANNELS          2
 #define BYTES_PER_SAMPLE  3
 
-/* Generous M1 latency: Mode C corrects a little ppm of drift slowly; the
- * buffer also absorbs timerfd jitter on the talker. See design.md §M1
- * "Known deferred items". */
+/* Defaults match M1's previous hardcoded values. */
+#define DEFAULT_CHANNELS      2
+#define DEFAULT_RATE_HZ       48000
 #define DEFAULT_LATENCY_US    5000
 #define FEEDBACK_PERIOD_MS    20
 #define POLL_TIMEOUT_MS       FEEDBACK_PERIOD_MS
+
+/* Packet RX buffer: largest legal M2 frame is 12 ch × 3 B × 48 samples
+ * (192 kHz microframe) = 1728 B plus 30 B header. 4 KiB is plenty. */
+#define RX_BUF_BYTES     4096
+
+static int rate_supported(int hz)
+{
+    switch (hz) {
+    case 44100: case 48000:
+    case 88200: case 96000:
+    case 176400: case 192000:
+        return 1;
+    default:
+        return 0;
+    }
+}
 
 static volatile sig_atomic_t g_stop;
 
@@ -43,9 +59,12 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "usage: %s --iface IF --dac hw:CARD=NAME,DEV=0 [options]\n"
+        "  --channels N     stream channel count (1..64, default %d)\n"
+        "  --rate HZ        44100 | 48000 | 88200 | 96000 | 176400 | 192000\n"
+        "                   (default %d)\n"
         "  --latency-us N   ALSA period latency hint (default %d)\n"
         "  --no-feedback    do not emit Mode C FEEDBACK frames (diagnostic)\n",
-        prog, DEFAULT_LATENCY_US);
+        prog, DEFAULT_CHANNELS, DEFAULT_RATE_HZ, DEFAULT_LATENCY_US);
 }
 
 static int64_t ts_diff_ns(struct timespec a, struct timespec b)
@@ -76,22 +95,28 @@ int main(int argc, char **argv)
 {
     const char *iface = NULL;
     const char *dac = NULL;
+    int channels = DEFAULT_CHANNELS;
+    int rate_hz = DEFAULT_RATE_HZ;
     int latency_us = DEFAULT_LATENCY_US;
     int feedback_enabled = 1;
 
     static const struct option opts[] = {
         { "iface",       required_argument, 0, 'i' },
         { "dac",         required_argument, 0, 'd' },
+        { "channels",    required_argument, 0, 'C' },
+        { "rate",        required_argument, 0, 'r' },
         { "latency-us",  required_argument, 0, 'l' },
         { "no-feedback", no_argument,       0, 'n' },
         { "help",        no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "i:d:l:nh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:d:C:r:l:nh", opts, NULL)) != -1) {
         switch (c) {
         case 'i': iface = optarg; break;
         case 'd': dac = optarg; break;
+        case 'C': channels = atoi(optarg); break;
+        case 'r': rate_hz = atoi(optarg); break;
         case 'l': latency_us = atoi(optarg); break;
         case 'n': feedback_enabled = 0; break;
         case 'h': usage(argv[0]); return 0;
@@ -100,6 +125,14 @@ int main(int argc, char **argv)
     }
     if (!iface || !dac) {
         usage(argv[0]);
+        return 2;
+    }
+    if (channels < 1 || channels > 64) {
+        fprintf(stderr, "receiver: --channels must be 1..64 (got %d)\n", channels);
+        return 2;
+    }
+    if (!rate_supported(rate_hz)) {
+        fprintf(stderr, "receiver: unsupported --rate %d\n", rate_hz);
         return 2;
     }
 
@@ -143,12 +176,16 @@ int main(int argc, char **argv)
     err = snd_pcm_set_params(pcm,
                              SND_PCM_FORMAT_S24_3LE,
                              SND_PCM_ACCESS_RW_INTERLEAVED,
-                             CHANNELS,
-                             SAMPLE_RATE_HZ,
+                             (unsigned int)channels,
+                             (unsigned int)rate_hz,
                              0,              /* disable ALSA soft-resample */
                              (unsigned int)latency_us);
     if (err < 0) {
-        fprintf(stderr, "snd_pcm_set_params: %s\n", snd_strerror(err));
+        fprintf(stderr,
+                "snd_pcm_set_params (ch=%d rate=%d S24_3LE): %s\n"
+                "  (DAC must natively support this configuration; "
+                "AOEther never resamples.)\n",
+                channels, rate_hz, snd_strerror(err));
         return 1;
     }
 
@@ -157,11 +194,11 @@ int main(int argc, char **argv)
 
     fprintf(stderr,
             "receiver: iface=%s dac=%s fmt=S24_3LE ch=%d rate=%d latency_us=%d feedback=%s\n",
-            iface, dac, CHANNELS, SAMPLE_RATE_HZ, latency_us,
+            iface, dac, channels, rate_hz, latency_us,
             feedback_enabled ? "on" : "off");
 
     /* Data-path buffer and counters. */
-    uint8_t buf[2048];
+    uint8_t buf[RX_BUF_BYTES];
     uint32_t last_seq = 0;
     int have_seq = 0;
     uint64_t rx = 0, dropped = 0, lost = 0, underruns = 0;
@@ -220,13 +257,13 @@ int main(int argc, char **argv)
                 (const struct aoe_hdr *)(buf + sizeof(struct ether_header));
             if (!aoe_hdr_valid(hdr) ||
                 hdr->format != AOE_FMT_PCM_S24LE_3 ||
-                hdr->channel_count != CHANNELS) {
+                hdr->channel_count != channels) {
                 dropped++;
                 goto check_feedback;
             }
 
             size_t frames = hdr->payload_count;
-            size_t payload_bytes = frames * CHANNELS * BYTES_PER_SAMPLE;
+            size_t payload_bytes = (size_t)frames * (size_t)channels * BYTES_PER_SAMPLE;
             if ((size_t)n < sizeof(struct ether_header) + AOE_HDR_LEN + payload_bytes) {
                 dropped++;
                 goto check_feedback;
@@ -302,11 +339,12 @@ check_feedback:
         }
 
         double dt_s = (double)dt_ns / 1e9;
-        double rate_hz = (double)(consumed - last_consumed) / dt_s;
+        double rate_est_hz = (double)(consumed - last_consumed) / dt_s;
 
-        /* Sanity band: ±20% of nominal, generous to admit startup transients. */
-        if (rate_hz > 0.8 * SAMPLE_RATE_HZ && rate_hz < 1.2 * SAMPLE_RATE_HZ) {
-            double spms = rate_hz / 1000.0;
+        /* Sanity band: ±20% of configured nominal rate, generous enough to
+         * admit startup transients but tight enough to reject garbage. */
+        if (rate_est_hz > 0.8 * rate_hz && rate_est_hz < 1.2 * rate_hz) {
+            double spms = rate_est_hz / 1000.0;
             uint32_t q = (uint32_t)(spms * 65536.0 + 0.5);
             aoe_c_hdr_build_feedback(fb_hdr, STREAM_ID, fb_seq++, q);
             ssize_t ss = sendto(ctl_sock, fb_frame, sizeof(fb_frame), 0,
