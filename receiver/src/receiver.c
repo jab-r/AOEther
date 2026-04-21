@@ -20,11 +20,16 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Stream format. Channels and rate are runtime-configured from M2 on; the
- * sample format is still locked to s24le-3 (other widths arrive later). See
- * docs/design.md §"M2" for the scope of what's parameterizable. */
+/* Stream format. Channels, rate, and sample format are all runtime-
+ * configured from M6 on. See docs/design.md §"M6" for the DSD path.
+ * "rate" generalizes to samples-or-DSD-bytes per sec per channel so the
+ * per-microframe math matches talker semantics. */
 #define STREAM_ID         0x0001
-#define BYTES_PER_SAMPLE  3
+
+#define DSD64_BYTE_RATE   352800
+#define DSD128_BYTE_RATE  705600
+#define DSD256_BYTE_RATE  1411200
+#define DSD512_BYTE_RATE  2822400
 
 /* Defaults match M1's previous hardcoded values. */
 #define DEFAULT_CHANNELS      2
@@ -58,6 +63,40 @@ static int rate_supported(int hz)
     }
 }
 
+struct stream_format {
+    uint8_t              wire_code;
+    int                  bytes_per_sample;
+    int                  rate_override;   /* >0 overrides --rate (DSD) */
+    snd_pcm_format_t     alsa_format;
+    int                  is_dsd;
+    const char          *name;
+};
+
+/* M6 ships DSD via SND_PCM_FORMAT_DSD_U8 only, which matches the wire-format
+ * byte order 1:1 (per-byte channel interleaving, MSB-first within each
+ * byte). DACs that require DSD_U16/U32 formats arrive in a follow-up with
+ * a reorder step. */
+static int parse_format(const char *s, struct stream_format *f)
+{
+    if (!s) return -1;
+    static const struct stream_format table[] = {
+        { AOE_FMT_PCM_S24LE_3,   3, 0,                SND_PCM_FORMAT_S24_3LE, 0, "pcm"    },
+        { AOE_FMT_NATIVE_DSD64,  1, DSD64_BYTE_RATE,  SND_PCM_FORMAT_DSD_U8,  1, "dsd64"  },
+        { AOE_FMT_NATIVE_DSD128, 1, DSD128_BYTE_RATE, SND_PCM_FORMAT_DSD_U8,  1, "dsd128" },
+        { AOE_FMT_NATIVE_DSD256, 1, DSD256_BYTE_RATE, SND_PCM_FORMAT_DSD_U8,  1, "dsd256" },
+        { AOE_FMT_NATIVE_DSD512, 1, DSD512_BYTE_RATE, SND_PCM_FORMAT_DSD_U8,  1, "dsd512" },
+    };
+    for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); i++) {
+        if (strcmp(s, table[i].name) == 0) {
+            /* Re-assign the name pointer to the found table entry's literal
+             * so callers can keep using f->name safely. */
+            *f = table[i];
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static volatile sig_atomic_t g_stop;
 
 static void on_signal(int sig)
@@ -75,9 +114,12 @@ static void usage(const char *prog)
         "  --port N             UDP port (IP mode, default %d)\n"
         "  --group IP           multicast group to join (IP mode, optional;\n"
         "                       IPv4 in 224.0.0.0/4 or IPv6 in ff00::/8)\n"
+        "  --format FMT         pcm | dsd64 | dsd128 | dsd256 | dsd512\n"
+        "                       default pcm. AVTP transport is pcm-only.\n"
+        "                       DSD uses SND_PCM_FORMAT_DSD_U8 (per-DAC quirks apply).\n"
         "  --channels N         stream channel count (1..64, default %d)\n"
-        "  --rate HZ            44100 | 48000 | 88200 | 96000 | 176400 | 192000\n"
-        "                       (default %d)\n"
+        "  --rate HZ            PCM only: 44100|48000|88200|96000|176400|192000\n"
+        "                       (default %d; ignored for DSD — rate is implied by --format)\n"
         "  --latency-us N       ALSA period latency hint (default %d)\n"
         "  --no-feedback        do not emit Mode C FEEDBACK frames (diagnostic)\n",
         prog, DEFAULT_UDP_PORT, DEFAULT_CHANNELS, DEFAULT_RATE_HZ, DEFAULT_LATENCY_US);
@@ -112,6 +154,7 @@ int main(int argc, char **argv)
     const char *iface = NULL;
     const char *dac = NULL;
     const char *group_s = NULL;
+    const char *format_s = "pcm";
     int channels = DEFAULT_CHANNELS;
     int rate_hz = DEFAULT_RATE_HZ;
     int latency_us = DEFAULT_LATENCY_US;
@@ -127,13 +170,14 @@ int main(int argc, char **argv)
         { "group",       required_argument, 0, 'G' },
         { "channels",    required_argument, 0, 'C' },
         { "rate",        required_argument, 0, 'r' },
+        { "format",      required_argument, 0, 'F' },
         { "latency-us",  required_argument, 0, 'l' },
         { "no-feedback", no_argument,       0, 'n' },
         { "help",        no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "i:d:T:P:G:C:r:l:nh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:d:T:P:G:C:r:F:l:nh", opts, NULL)) != -1) {
         switch (c) {
         case 'i': iface = optarg; break;
         case 'd': dac = optarg; break;
@@ -147,6 +191,7 @@ int main(int argc, char **argv)
         case 'G': group_s = optarg; break;
         case 'C': channels = atoi(optarg); break;
         case 'r': rate_hz = atoi(optarg); break;
+        case 'F': format_s = optarg; break;
         case 'l': latency_us = atoi(optarg); break;
         case 'n': feedback_enabled = 0; break;
         case 'h': usage(argv[0]); return 0;
@@ -166,6 +211,27 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    if (channels < 1 || channels > 64) {
+        fprintf(stderr, "receiver: --channels must be 1..64 (got %d)\n", channels);
+        return 2;
+    }
+
+    struct stream_format fmt;
+    if (parse_format(format_s, &fmt) < 0) {
+        fprintf(stderr, "receiver: unknown --format %s\n", format_s);
+        return 2;
+    }
+    if (fmt.is_dsd) {
+        rate_hz = fmt.rate_override;
+    } else if (!rate_supported(rate_hz)) {
+        fprintf(stderr, "receiver: unsupported PCM --rate %d\n", rate_hz);
+        return 2;
+    }
+    if (transport == TRANSPORT_AVTP && fmt.is_dsd) {
+        fprintf(stderr, "receiver: AVTP AAF does not carry DSD; use --transport l2 or ip\n");
+        return 2;
+    }
+
     /* AVTP AAF only carries the standard NSR rates. */
     uint8_t avtp_nsr_code = 0;
     if (transport == TRANSPORT_AVTP) {
@@ -174,14 +240,8 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    if (channels < 1 || channels > 64) {
-        fprintf(stderr, "receiver: --channels must be 1..64 (got %d)\n", channels);
-        return 2;
-    }
-    if (!rate_supported(rate_hz)) {
-        fprintf(stderr, "receiver: unsupported --rate %d\n", rate_hz);
-        return 2;
-    }
+    const int bytes_per_sample = fmt.bytes_per_sample;
+    const uint8_t expected_format_code = fmt.wire_code;
 
     /* Socket setup per transport. L2 keeps two raw AF_PACKET sockets (one
      * per EtherType). IP uses one SOCK_DGRAM socket bound to udp_port —
@@ -310,7 +370,7 @@ int main(int argc, char **argv)
         return 1;
     }
     err = snd_pcm_set_params(pcm,
-                             SND_PCM_FORMAT_S24_3LE,
+                             fmt.alsa_format,
                              SND_PCM_ACCESS_RW_INTERLEAVED,
                              (unsigned int)channels,
                              (unsigned int)rate_hz,
@@ -318,10 +378,13 @@ int main(int argc, char **argv)
                              (unsigned int)latency_us);
     if (err < 0) {
         fprintf(stderr,
-                "snd_pcm_set_params (ch=%d rate=%d S24_3LE): %s\n"
+                "snd_pcm_set_params (ch=%d rate=%d fmt=%s): %s\n"
                 "  (DAC must natively support this configuration; "
-                "AOEther never resamples.)\n",
-                channels, rate_hz, snd_strerror(err));
+                "AOEther never resamples.  For DSD, check that the DAC's\n"
+                "  snd_usb_audio quirk exposes %s at this rate; some DACs\n"
+                "  require DSD_U32_BE instead, which is a follow-up.)\n",
+                channels, rate_hz, fmt.name, snd_strerror(err),
+                fmt.is_dsd ? "SND_PCM_FORMAT_DSD_U8" : "S24_3LE");
         return 1;
     }
 
@@ -333,19 +396,19 @@ int main(int argc, char **argv)
                 "receiver: transport=%s iface=%s dac=%s fmt=%s ch=%d rate=%d latency_us=%d feedback=%s\n",
                 transport == TRANSPORT_AVTP ? "avtp" : "l2",
                 iface, dac,
-                transport == TRANSPORT_AVTP ? "AAF_INT24(BE)→S24_3LE" : "S24_3LE",
+                transport == TRANSPORT_AVTP ? "AAF_INT24(BE)→S24_3LE" : fmt.name,
                 channels, rate_hz, latency_us,
                 feedback_enabled ? "on" : "off");
     } else {
         fprintf(stderr,
                 "receiver: transport=ip family=%s %s port=%d%s%s\n"
-                "          iface=%s dac=%s fmt=S24_3LE ch=%d rate=%d latency_us=%d feedback=%s\n",
+                "          iface=%s dac=%s fmt=%s ch=%d rate=%d latency_us=%d feedback=%s\n",
                 group_family == AF_INET6 ? "v6" : "v4",
                 use_multicast ? "multicast" : "unicast",
                 udp_port,
                 group_s ? " group=" : "",
                 group_s ? group_s : "",
-                iface, dac, channels, rate_hz, latency_us,
+                iface, dac, fmt.name, channels, rate_hz, latency_us,
                 feedback_enabled ? "on" : "off");
     }
 
@@ -449,7 +512,7 @@ int main(int argc, char **argv)
                 if ((size_t)n < hdr_off + AVTP_HDR_LEN + payload_bytes) {
                     dropped++; goto check_feedback;
                 }
-                size_t per_sample = (size_t)channels * BYTES_PER_SAMPLE;
+                size_t per_sample = (size_t)channels * bytes_per_sample;
                 if (per_sample == 0 || payload_bytes % per_sample != 0) {
                     dropped++; goto check_feedback;
                 }
@@ -464,12 +527,12 @@ int main(int argc, char **argv)
                 const struct aoe_hdr *hdr =
                     (const struct aoe_hdr *)(buf + hdr_off);
                 if (!aoe_hdr_valid(hdr) ||
-                    hdr->format != AOE_FMT_PCM_S24LE_3 ||
+                    hdr->format != expected_format_code ||
                     hdr->channel_count != channels) {
                     dropped++; goto check_feedback;
                 }
                 frames = hdr->payload_count;
-                payload_bytes = frames * (size_t)channels * BYTES_PER_SAMPLE;
+                payload_bytes = frames * (size_t)channels * bytes_per_sample;
                 if ((size_t)n < hdr_off + AOE_HDR_LEN + payload_bytes) {
                     dropped++; goto check_feedback;
                 }

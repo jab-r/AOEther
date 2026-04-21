@@ -72,7 +72,7 @@ You should hear a clean 1 kHz tone.
 | M3 | Docs ready | Tier 2 hardware (Linux SBC), hardware PTP (Phase A); hardware validation pending board |
 | M4 | In progress | IP/UDP transport, IPv4+IPv6, unicast+multicast, multi-receiver Mode C arbitration |
 | M5 | Code complete | AVTP AAF wire format for Milan interop (interop test pending listener hardware) |
-| M6 | Planned | Native DSD64 through DSD512 end-to-end |
+| M6 | Code complete | Native DSD64 through DSD512 end-to-end (silence smoke-test; DSD_U32_BE follow-up tracked) |
 | M7 | Planned | AVDECC, MCU receiver track kickoff |
 | M8 | Planned | Full Atmos scale, DSD1024/2048, packaging |
 | M9 | Planned | Ravenna / AES67 interop |
@@ -98,6 +98,7 @@ AOEther doesn't implement Roon, UPnP, or AirPlay natively — it bridges them vi
 - [`docs/recipe-upnp.md`](docs/recipe-upnp.md) — UPnP / DLNA controllers (via gmrender-resurrect)
 - [`docs/recipe-capture.md`](docs/recipe-capture.md) — desktop audio (browser, Tidal/Spotify apps, etc.) via PipeWire
 - [`docs/recipe-milan.md`](docs/recipe-milan.md) — Milan / AVTP interop: emit AAF to a Milan listener or receive from a Milan talker (M5)
+- [`docs/recipe-dsd.md`](docs/recipe-dsd.md) — native DSD64–DSD512 end-to-end (M6, silence smoke-test; real .dsf playback arrives in M8)
 
 The same talker and receiver binaries run under every recipe; only the source daemon changes. AirPlay (shairport-sync) and Spotify Connect (librespot) plug in with the same pattern.
 

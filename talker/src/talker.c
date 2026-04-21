@@ -22,16 +22,22 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Stream parameters. Channels and rate are runtime-configured from M2 on;
- * sample format is still locked to s24le-3. See docs/design.md §"M2". */
+/* Stream parameters. Channels, rate, and sample format are all runtime-
+ * configured from M6 on. The "rate" field generalizes to "samples or DSD-
+ * bytes per second per channel" so the per-microframe payload math (rate /
+ * 8000) works uniformly across PCM and native DSD. */
 #define STREAM_ID             0x0001
-#define BYTES_PER_SAMPLE      3
-#define FORMAT_CODE           AOE_FMT_PCM_S24LE_3
 #define PACKET_PERIOD_NS      125000L          /* 125 µs = 1 USB microframe */
 #define MICROFRAMES_PER_MS    8
 
 #define DEFAULT_CHANNELS      2
 #define DEFAULT_RATE_HZ       48000
+
+/* DSD byte rates per channel (DSD bit rate ÷ 8). */
+#define DSD64_BYTE_RATE       352800       /* 2.8224 MHz / 8 */
+#define DSD128_BYTE_RATE      705600
+#define DSD256_BYTE_RATE      1411200
+#define DSD512_BYTE_RATE      2822400
 
 /* Ethernet II data payload max (frame - eth header) for standard 1500 MTU. */
 #define ETH_MTU_PAYLOAD       1500
@@ -64,6 +70,37 @@ static int rate_supported(int hz)
     default:
         return 0;
     }
+}
+
+/* Map --format string to (AoE format code, bytes_per_sample, effective rate
+ * in samples-or-DSD-bytes per sec per channel). For PCM, the caller's
+ * --rate Hz is passed through; for DSD the rate is overridden to the DSD
+ * byte rate. Returns 0 on success, -1 if the name is unknown. */
+struct stream_format {
+    uint8_t  code;
+    int      bytes_per_sample;
+    int      rate_override;   /* >0 means override --rate; 0 means use --rate */
+    int      is_dsd;          /* native DSD path */
+    const char *name;
+};
+
+static int parse_format(const char *s, struct stream_format *f)
+{
+    if (!s) return -1;
+    static const struct stream_format table[] = {
+        { AOE_FMT_PCM_S24LE_3,    3, 0,                   0, "pcm"    },
+        { AOE_FMT_NATIVE_DSD64,   1, DSD64_BYTE_RATE,     1, "dsd64"  },
+        { AOE_FMT_NATIVE_DSD128,  1, DSD128_BYTE_RATE,    1, "dsd128" },
+        { AOE_FMT_NATIVE_DSD256,  1, DSD256_BYTE_RATE,    1, "dsd256" },
+        { AOE_FMT_NATIVE_DSD512,  1, DSD512_BYTE_RATE,    1, "dsd512" },
+    };
+    for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); i++) {
+        if (strcmp(s, table[i].name) == 0) {
+            *f = table[i];
+            return 0;
+        }
+    }
+    return -1;
 }
 
 static volatile sig_atomic_t g_stop;
@@ -127,16 +164,22 @@ static void usage(const char *prog)
         "    --dest-mac AA:BB:CC:DD:EE:FF    (required; unicast or AVTP multicast)\n"
         "\n"
         "Source:\n"
-        "  --source testtone|wav|alsa   default: testtone\n"
+        "  --source testtone|wav|alsa|dsdsilence   default: testtone (pcm) /\n"
+        "                                          dsdsilence when --format is DSD\n"
         "  --file   PATH                WAV file, required with --source wav\n"
         "  --capture hw:CARD=...        ALSA capture device, required with --source alsa\n"
         "\n"
         "Stream format:\n"
+        "  --format  FMT                pcm | dsd64 | dsd128 | dsd256 | dsd512\n"
+        "                               default pcm. DoP and DSD1024+ are deferred.\n"
+        "                               AVTP transport carries pcm only.\n"
         "  --channels N                 channel count (1..64, default %d)\n"
         "  --rate    HZ                 44100|48000|88200|96000|176400|192000 (default %d)\n"
+        "                               (ignored for native DSD — rate is implied by --format)\n"
         "\n"
-        "Sample format is s24le-3 (24-bit little-endian packed). Sources must match\n"
-        "channels, rate, and format exactly — AOEther never resamples.\n"
+        "PCM payload is s24le-3 (24-bit little-endian packed). Native DSD payload is\n"
+        "raw DSD bits, MSB-first within each byte, interleaved by channel. Sources\n"
+        "must match channels, rate, and format exactly — AOEther never resamples.\n"
         "For music playback, point --capture at one half of a snd-aloop pair\n"
         "and route Roon/UPnP/AirPlay/PipeWire at the other half; see\n"
         "docs/recipe-*.md.\n",
@@ -148,9 +191,10 @@ int main(int argc, char **argv)
     const char *iface = NULL;
     const char *dest_mac_s = NULL;
     const char *dest_ip_s = NULL;
-    const char *source = "testtone";
+    const char *source = NULL;         /* default resolved below from --format */
     const char *wav_path = NULL;
     const char *capture_pcm = NULL;
+    const char *format_s = "pcm";
     int channels = DEFAULT_CHANNELS;
     int rate_hz = DEFAULT_RATE_HZ;
     enum transport_mode transport = TRANSPORT_L2;
@@ -167,11 +211,12 @@ int main(int argc, char **argv)
         { "capture",   required_argument, 0, 'c' },
         { "channels",  required_argument, 0, 'C' },
         { "rate",      required_argument, 0, 'r' },
+        { "format",    required_argument, 0, 'F' },
         { "help",      no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "i:d:I:T:P:s:f:c:C:r:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:d:I:T:P:s:f:c:C:r:F:h", opts, NULL)) != -1) {
         switch (c) {
         case 'i': iface = optarg; break;
         case 'd': dest_mac_s = optarg; break;
@@ -188,6 +233,7 @@ int main(int argc, char **argv)
         case 'c': capture_pcm = optarg; break;
         case 'C': channels = atoi(optarg); break;
         case 'r': rate_hz = atoi(optarg); break;
+        case 'F': format_s = optarg; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -213,8 +259,37 @@ int main(int argc, char **argv)
         fprintf(stderr, "talker: --channels must be 1..64 (got %d)\n", channels);
         return 2;
     }
-    if (!rate_supported(rate_hz)) {
-        fprintf(stderr, "talker: unsupported --rate %d\n", rate_hz);
+
+    struct stream_format fmt;
+    if (parse_format(format_s, &fmt) < 0) {
+        fprintf(stderr, "talker: unknown --format %s\n", format_s);
+        return 2;
+    }
+    /* For PCM the user-supplied --rate applies; native DSD overrides. */
+    if (!fmt.is_dsd) {
+        if (!rate_supported(rate_hz)) {
+            fprintf(stderr, "talker: unsupported --rate %d for PCM\n", rate_hz);
+            return 2;
+        }
+    } else {
+        rate_hz = fmt.rate_override;
+    }
+    if (transport == TRANSPORT_AVTP && fmt.is_dsd) {
+        fprintf(stderr, "talker: AVTP AAF does not carry DSD; use --transport l2 or ip with --format dsd*\n");
+        return 2;
+    }
+    const uint8_t format_code = fmt.code;
+    const int bytes_per_sample = fmt.bytes_per_sample;
+    const int is_dsd = fmt.is_dsd;
+
+    /* Default source depends on format: testtone (PCM sine) or dsdsilence. */
+    if (!source) {
+        source = is_dsd ? "dsdsilence" : "testtone";
+    } else if (is_dsd && strcmp(source, "dsdsilence") != 0) {
+        fprintf(stderr, "talker: --source %s is PCM-only; native DSD requires --source dsdsilence (default)\n", source);
+        return 2;
+    } else if (!is_dsd && strcmp(source, "dsdsilence") == 0) {
+        fprintf(stderr, "talker: --source dsdsilence requires --format dsd64|128|256|512\n");
         return 2;
     }
 
@@ -225,7 +300,7 @@ int main(int argc, char **argv)
                                                                : AOE_HDR_LEN;
     const double nominal_spm = (double)rate_hz / 1000.0 / MICROFRAMES_PER_MS;
     const int max_samples_per_packet = (int)(nominal_spm + 0.5) + 4;
-    const size_t max_payload = (size_t)max_samples_per_packet * channels * BYTES_PER_SAMPLE;
+    const size_t max_payload = (size_t)max_samples_per_packet * channels * bytes_per_sample;
     const size_t max_frame = sizeof(struct ether_header) + proto_hdr_len + max_payload;
     if (max_payload + proto_hdr_len > ETH_MTU_PAYLOAD) {
         fprintf(stderr,
@@ -291,7 +366,7 @@ int main(int argc, char **argv)
 
     struct audio_source *src = NULL;
     if (strcmp(source, "testtone") == 0) {
-        src = audio_source_test_open(channels, rate_hz, BYTES_PER_SAMPLE);
+        src = audio_source_test_open(channels, rate_hz, bytes_per_sample);
     } else if (strcmp(source, "wav") == 0) {
         if (!wav_path) {
             fprintf(stderr, "talker: --file required with --source wav\n");
@@ -312,6 +387,8 @@ int main(int argc, char **argv)
             return 2;
         }
         src = audio_source_alsa_open(capture_pcm, channels, rate_hz);
+    } else if (strcmp(source, "dsdsilence") == 0) {
+        src = audio_source_dsd_silence_open(channels, rate_hz);
     } else {
         fprintf(stderr, "talker: unknown --source %s\n", source);
         return 2;
@@ -501,7 +578,7 @@ int main(int argc, char **argv)
                 label, iface, ifindex,
                 src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
                 dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3], dest_mac[4], dest_mac[5],
-                transport == TRANSPORT_AVTP ? "AAF_INT24(BE)" : "PCM_s24le-3",
+                transport == TRANSPORT_AVTP ? "AAF_INT24(BE)" : format_s,
                 channels, rate_hz, nominal_spm, max_samples_per_packet, max_frame);
     } else {
         char ip_str[INET6_ADDRSTRLEN] = {0};
@@ -517,11 +594,12 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "talker: transport=ip dest=%s:%d family=%s %s\n"
                 "        iface=%s ifindex=%d\n"
-                "        fmt=PCM_s24le-3 ch=%d rate=%d pps=8000 nominal_spp=%.2f max_spp=%d max_payload=%zuB feedback=on\n",
+                "        fmt=%s ch=%d rate=%d pps=8000 nominal_spp=%.2f max_spp=%d max_payload=%zuB feedback=on\n",
                 ip_str, udp_port,
                 dest_family == AF_INET ? "v4" : "v6",
                 dest_is_multicast ? "multicast" : "unicast",
-                iface, ifindex, channels, rate_hz,
+                iface, ifindex,
+                format_s, channels, rate_hz,
                 nominal_spm, max_samples_per_packet,
                 max_frame - sizeof(struct ether_header));
     }
@@ -696,7 +774,7 @@ int main(int argc, char **argv)
             }
 
             const size_t payload_bytes =
-                (size_t)pc * channels * BYTES_PER_SAMPLE;
+                (size_t)pc * channels * bytes_per_sample;
             size_t frame_len_total =
                 sizeof(struct ether_header) + proto_hdr_len + payload_bytes;
 
@@ -716,7 +794,7 @@ int main(int argc, char **argv)
                                    (uint16_t)payload_bytes);
             } else {
                 aoe_hdr_build(aoe_hdr_p, STREAM_ID, seq, 0,
-                              (uint8_t)channels, FORMAT_CODE, (uint8_t)pc,
+                              (uint8_t)channels, format_code, (uint8_t)pc,
                               AOE_FLAG_LAST_IN_GROUP);
             }
 

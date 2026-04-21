@@ -1,6 +1,6 @@
 # AOEther Wire Format Specification
 
-**Status:** v1.4 draft — aligned with [`design.md`](design.md) v1.4
+**Status:** v1.5 draft — aligned with [`design.md`](design.md) v1.5
 **Purpose:** Byte-level reference for implementers of talkers, receivers, and test tools.
 
 This document specifies the AOEther wire format at the level of detail needed to build an interoperable implementation. For architectural rationale, see [`design.md`](design.md).
@@ -150,7 +150,17 @@ For configurations outside these standards, a channel map is advertised via the 
 
 ### Native DSD
 
-Payload is the raw DSD bitstream, interleaved by channel, MSB-first within each byte. Total payload length:
+Payload is the raw DSD bitstream, interleaved by channel **at byte granularity**, MSB-first within each byte. For a 2-channel DSD stream with `payload_count = N` the payload is:
+
+```
+L[0] R[0] L[1] R[1] ... L[N-1] R[N-1]
+```
+
+For `C` channels and `N` bytes per channel the payload is `C × N` bytes total, with per-byte round-robin interleave across channels. This matches `SND_PCM_FORMAT_DSD_U8` exactly, so a receiver using that ALSA format can pass the payload to `snd_pcm_writei` with no reorder. Receivers using `SND_PCM_FORMAT_DSD_U16_*` or `DSD_U32_*` MUST transpose at the corresponding granularity (2 or 4 bytes per channel) before writing.
+
+Bit order within each byte is MSB-first: the high bit of the byte is the older DSD sample, the low bit is the newer. This is opposite of the Sony DSF file format (which stores DSD LSB-first) — implementations ingesting DSF files must bit-reverse each byte on read.
+
+Total payload length:
 
 ```
 length = channel_count × payload_count
