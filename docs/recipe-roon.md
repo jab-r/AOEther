@@ -63,11 +63,23 @@ sudo ./receiver/build/receiver \
 
 In the Roon app, select "AOEther Bridge" as the playback zone and hit play. Audio flows Roon Core → RoonBridge → snd-aloop → AOEther talker → Ethernet → AOEther receiver → USB DAC.
 
+## Hi-res stereo and multichannel (M2)
+
+To pass 192 kHz bit-exact, configure both the RoonBridge sink and the AOEther talker+receiver to 192 kHz:
+
+1. In Roon → Settings → Audio → (gear on the Loopback sink), set **Device Format** to **Custom** → `192000` / `24-bit`.
+2. Talker: `sudo ./talker/build/talker --source alsa --capture hw:Loopback,1,0 --channels 2 --rate 192000 ...`
+3. Receiver: `sudo ./receiver/build/receiver --dac hw:CARD=...,DEV=0 --channels 2 --rate 192000 ...`
+
+For multichannel (e.g., 5.1 Atmos bed or surround music), Roon can output multichannel to an ALSA device if the sink advertises it. Configure the Loopback device to match: the kernel's `snd-aloop` is format-agnostic so you just tell Roon to use e.g. `48000 / 24-bit / 6-channel` as the device format, then run talker+receiver with `--channels 6 --rate 48000`.
+
+Roon will auto-downconvert sources that exceed the sink's capability (e.g., a 192 kHz track into a 48 kHz sink does lossy SRC inside Roon). For bit-exact playback run the sink at the highest rate you'll actually send.
+
 ## Caveats
 
-- **48 kHz cap in M1**: M1 only carries 48 kHz 24-bit stereo. Roon will happily send a 192 kHz track and RoonBridge will downsample to match the configured 48 kHz / 24-bit sink — Roon does this natively with high-quality SRC. Bit-exact high-rate playback awaits M2's rate negotiation.
-- **DSD**: not carried in M1; arrives in M6. RoonBridge will convert DSD to PCM when the sink is PCM-only.
-- **Roon Ready certification**: we're not Roon Ready. We appear as a "Roon Bridge" endpoint, which is fully functional but not the marketed logo. Roon Ready requires NDA and a cert lab pass; that's a post-M8 question if at all.
+- **DSD**: not carried until M6. RoonBridge will convert DSD to PCM when the sink is PCM-only.
+- **Roon Ready certification**: we're not Roon Ready. We appear as a "Roon Bridge" endpoint, which is fully functional but not the marketed logo. Roon Ready requires NDA and a cert lab pass; post-M8 question if at all.
+- **MTU**: Roon can theoretically send 12 ch × 384 kHz, but AOEther's M2 rejects that at startup (exceeds 1500-byte MTU). 12 ch × 192 kHz fits; see `docs/design.md` §M2.
 
 ## Troubleshooting
 

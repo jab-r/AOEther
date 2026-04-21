@@ -32,8 +32,10 @@ sudo ./build/receiver --iface eth0 \
 Flags:
 
 - `--iface IF`, `--dac hw:...` (required) — as above.
-- `--latency-us N` — ALSA period latency hint (default 5000 µs). The M1 default is generous on purpose; the Mode C loop corrects ppm-scale drift slowly and the buffer also absorbs talker-side `timerfd` jitter.
-- `--no-feedback` — disable FEEDBACK emission. **Diagnostic only** — the positive control for the M1 soak test (design.md §M1 test 7): with feedback off, the stream is expected to drift and xrun within minutes, which is how you confirm Mode C is doing real work when it's on.
+- `--channels N` — channel count (1..64, default 2). Must match the talker.
+- `--rate HZ` — one of 44100, 48000, 88200, 96000, 176400, 192000 (default 48000). Must match the talker.
+- `--latency-us N` — ALSA period latency hint (default 5000 µs). Generous on purpose; the Mode C loop corrects ppm-scale drift slowly and the buffer also absorbs talker-side `timerfd` jitter.
+- `--no-feedback` — disable FEEDBACK emission. **Diagnostic only** — the positive control for the soak test (design.md §M1 test 7): with feedback off, the stream is expected to drift and xrun within minutes, confirming Mode C is doing real work when it's on.
 
 Needs `CAP_NET_RAW` for the raw sockets; easiest path is `sudo`.
 

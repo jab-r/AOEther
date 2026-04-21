@@ -19,25 +19,37 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Hardcoded M1 stream parameters (see docs/design.md §"M1 detailed plan"). */
+/* Stream parameters. Channels and rate are runtime-configured from M2 on;
+ * sample format is still locked to s24le-3. See docs/design.md §"M2". */
 #define STREAM_ID             0x0001
-#define SAMPLE_RATE_HZ        48000
-#define CHANNELS              2
 #define BYTES_PER_SAMPLE      3
 #define FORMAT_CODE           AOE_FMT_PCM_S24LE_3
 #define PACKET_PERIOD_NS      125000L          /* 125 µs = 1 USB microframe */
 #define MICROFRAMES_PER_MS    8
-#define NOMINAL_SPM           ((double)SAMPLE_RATE_HZ / 1000.0 / MICROFRAMES_PER_MS)  /* 6.0 */
+
+#define DEFAULT_CHANNELS      2
+#define DEFAULT_RATE_HZ       48000
+
+/* Ethernet II data payload max (frame - eth header) for standard 1500 MTU. */
+#define ETH_MTU_PAYLOAD       1500
 
 /* Safety clamp on feedback-derived rate: ±1000 ppm of nominal. */
 #define RATE_CLAMP_PPM        1000.0
 
-/* Max samples per packet (buffer sizing headroom; nominal 6, drift barely
- * changes it). */
-#define MAX_SAMPLES_PER_PACKET 16
-
 /* Talker reverts to nominal after this long without FEEDBACK. */
 #define FEEDBACK_STALE_MS     5000
+
+static int rate_supported(int hz)
+{
+    switch (hz) {
+    case 44100: case 48000:
+    case 88200: case 96000:
+    case 176400: case 192000:
+        return 1;
+    default:
+        return 0;
+    }
+}
 
 static volatile sig_atomic_t g_stop;
 
@@ -92,12 +104,15 @@ static void usage(const char *prog)
         "  --source testtone|wav|alsa   default: testtone\n"
         "  --file   PATH                WAV file, required with --source wav\n"
         "  --capture hw:CARD=...        ALSA capture device, required with --source alsa\n"
+        "  --channels N                 channel count (1..64, default %d)\n"
+        "  --rate    HZ                 44100|48000|88200|96000|176400|192000 (default %d)\n"
         "\n"
-        "M1 stream is hardcoded 48 kHz / 2ch / s24le-3. Sources must match.\n"
+        "Sample format is s24le-3 (24-bit little-endian packed). Sources must match\n"
+        "channels, rate, and format exactly — AOEther never resamples.\n"
         "For music playback, point --capture at one half of a snd-aloop pair\n"
         "and route Roon/UPnP/AirPlay/PipeWire at the other half; see\n"
         "docs/recipe-*.md.\n",
-        prog);
+        prog, DEFAULT_CHANNELS, DEFAULT_RATE_HZ);
 }
 
 int main(int argc, char **argv)
@@ -107,6 +122,8 @@ int main(int argc, char **argv)
     const char *source = "testtone";
     const char *wav_path = NULL;
     const char *capture_pcm = NULL;
+    int channels = DEFAULT_CHANNELS;
+    int rate_hz = DEFAULT_RATE_HZ;
 
     static const struct option opts[] = {
         { "iface",    required_argument, 0, 'i' },
@@ -114,23 +131,50 @@ int main(int argc, char **argv)
         { "source",   required_argument, 0, 's' },
         { "file",     required_argument, 0, 'f' },
         { "capture",  required_argument, 0, 'c' },
+        { "channels", required_argument, 0, 'C' },
+        { "rate",     required_argument, 0, 'r' },
         { "help",     no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "i:d:s:f:c:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:d:s:f:c:C:r:h", opts, NULL)) != -1) {
         switch (c) {
         case 'i': iface = optarg; break;
         case 'd': dest_s = optarg; break;
         case 's': source = optarg; break;
         case 'f': wav_path = optarg; break;
         case 'c': capture_pcm = optarg; break;
+        case 'C': channels = atoi(optarg); break;
+        case 'r': rate_hz = atoi(optarg); break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
     }
     if (!iface || !dest_s) {
         usage(argv[0]);
+        return 2;
+    }
+    if (channels < 1 || channels > 64) {
+        fprintf(stderr, "talker: --channels must be 1..64 (got %d)\n", channels);
+        return 2;
+    }
+    if (!rate_supported(rate_hz)) {
+        fprintf(stderr, "talker: unsupported --rate %d\n", rate_hz);
+        return 2;
+    }
+
+    /* MTU check: at worst we need nominal samples-per-microframe plus a
+     * small drift margin, times channels × bytes. Plus eth (14) + AoE (16). */
+    const double nominal_spm = (double)rate_hz / 1000.0 / MICROFRAMES_PER_MS;
+    const int max_samples_per_packet = (int)(nominal_spm + 0.5) + 4;
+    const size_t max_payload = (size_t)max_samples_per_packet * channels * BYTES_PER_SAMPLE;
+    const size_t max_frame = sizeof(struct ether_header) + AOE_HDR_LEN + max_payload;
+    if (max_payload + AOE_HDR_LEN > ETH_MTU_PAYLOAD) {
+        fprintf(stderr,
+                "talker: ch=%d rate=%d needs %zu-byte frames — exceeds 1500-byte MTU.\n"
+                "  (Packet splitting for very-high-rate multichannel is deferred; try\n"
+                "  fewer channels or a lower rate. Worst-case payload = %zu B.)\n",
+                channels, rate_hz, max_frame, max_payload);
         return 2;
     }
 
@@ -142,19 +186,27 @@ int main(int argc, char **argv)
 
     struct audio_source *src = NULL;
     if (strcmp(source, "testtone") == 0) {
-        src = audio_source_test_open(CHANNELS, SAMPLE_RATE_HZ, BYTES_PER_SAMPLE);
+        src = audio_source_test_open(channels, rate_hz, BYTES_PER_SAMPLE);
     } else if (strcmp(source, "wav") == 0) {
         if (!wav_path) {
             fprintf(stderr, "talker: --file required with --source wav\n");
             return 2;
         }
         src = audio_source_wav_open(wav_path);
+        if (src && (src->channels != channels || src->rate != rate_hz)) {
+            fprintf(stderr,
+                    "talker: WAV file is ch=%d rate=%d; talker configured ch=%d rate=%d. "
+                    "They must match (no resampling in AOEther).\n",
+                    src->channels, src->rate, channels, rate_hz);
+            src->close(src);
+            return 2;
+        }
     } else if (strcmp(source, "alsa") == 0) {
         if (!capture_pcm) {
             fprintf(stderr, "talker: --capture hw:... required with --source alsa\n");
             return 2;
         }
-        src = audio_source_alsa_open(capture_pcm, CHANNELS, SAMPLE_RATE_HZ);
+        src = audio_source_alsa_open(capture_pcm, channels, rate_hz);
     } else {
         fprintf(stderr, "talker: unknown --source %s\n", source);
         return 2;
@@ -213,9 +265,7 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    const size_t payload_cap = (size_t)CHANNELS * BYTES_PER_SAMPLE * MAX_SAMPLES_PER_PACKET;
-    const size_t frame_cap = sizeof(struct ether_header) + AOE_HDR_LEN + payload_cap;
-    uint8_t *frame = calloc(1, frame_cap);
+    uint8_t *frame = calloc(1, max_frame);
     if (!frame) return 1;
 
     struct ether_header *eth = (struct ether_header *)frame;
@@ -229,15 +279,15 @@ int main(int argc, char **argv)
     fprintf(stderr,
             "talker: iface=%s ifindex=%d\n"
             "        src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x\n"
-            "        fmt=PCM_s24le-3 ch=%d rate=%d pps=8000 nominal spp=%.1f feedback=on\n",
+            "        fmt=PCM_s24le-3 ch=%d rate=%d pps=8000 nominal_spp=%.2f max_spp=%d max_frame=%zuB feedback=on\n",
             iface, ifindex,
             src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
             dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3], dest_mac[4], dest_mac[5],
-            CHANNELS, SAMPLE_RATE_HZ, NOMINAL_SPM);
+            channels, rate_hz, nominal_spm, max_samples_per_packet, max_frame);
 
     /* Mode C talker state: current target samples-per-microframe, fractional
      * accumulator, and bookkeeping for stale-feedback fallback. */
-    double samples_per_microframe = NOMINAL_SPM;
+    double samples_per_microframe = nominal_spm;
     double sample_accum = 0.0;
     struct timespec last_fb_rx_ts = { 0, 0 };
     int have_fb = 0;
@@ -279,8 +329,8 @@ int main(int argc, char **argv)
             double spms = (double)q / 65536.0;
             double new_spm = spms / (double)MICROFRAMES_PER_MS;
 
-            double max_spm = NOMINAL_SPM * (1.0 + RATE_CLAMP_PPM * 1e-6);
-            double min_spm = NOMINAL_SPM * (1.0 - RATE_CLAMP_PPM * 1e-6);
+            double max_spm = nominal_spm * (1.0 + RATE_CLAMP_PPM * 1e-6);
+            double min_spm = nominal_spm * (1.0 - RATE_CLAMP_PPM * 1e-6);
             if (new_spm < min_spm || new_spm > max_spm) {
                 fb_ignored++;
                 continue;
@@ -297,7 +347,7 @@ int main(int argc, char **argv)
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             if (ts_diff_ms(now, last_fb_rx_ts) > FEEDBACK_STALE_MS) {
-                samples_per_microframe = NOMINAL_SPM;
+                samples_per_microframe = nominal_spm;
                 have_fb = 0;
             }
         }
@@ -318,7 +368,7 @@ int main(int argc, char **argv)
             sample_accum += samples_per_microframe;
             int pc = (int)sample_accum;
             if (pc < 1) pc = 1;
-            if (pc > MAX_SAMPLES_PER_PACKET) pc = MAX_SAMPLES_PER_PACKET;
+            if (pc > max_samples_per_packet) pc = max_samples_per_packet;
             sample_accum -= pc;
 
             if (src->read(src, payload, (size_t)pc) < 0) {
@@ -326,12 +376,12 @@ int main(int argc, char **argv)
                 break;
             }
             aoe_hdr_build(hdr, STREAM_ID, seq, 0,
-                          CHANNELS, FORMAT_CODE, (uint8_t)pc,
+                          (uint8_t)channels, FORMAT_CODE, (uint8_t)pc,
                           AOE_FLAG_LAST_IN_GROUP);
 
             size_t frame_len =
                 sizeof(struct ether_header) + AOE_HDR_LEN
-                + (size_t)pc * CHANNELS * BYTES_PER_SAMPLE;
+                + (size_t)pc * channels * BYTES_PER_SAMPLE;
 
             ssize_t sent = sendto(data_sock, frame, frame_len, 0,
                                   (struct sockaddr *)&data_to, sizeof(data_to));

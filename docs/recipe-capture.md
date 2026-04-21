@@ -84,9 +84,21 @@ sudo ./receiver/build/receiver \
 
 Play something. You should hear it through the remote DAC.
 
+## Hi-res stereo and multichannel (M2)
+
+To carry a different rate or channel count, change three things together:
+
+1. The PipeWire sink config in `99-aoether.conf`: `audio.rate = 192000`, `audio.channels = 6`, etc.
+2. The talker: `--rate 192000 --channels 6`.
+3. The receiver: `--rate 192000 --channels 6`.
+
+All three must match. Mismatches fail at startup with a clear error.
+
+For **bit-exact 44.1 kHz** (e.g., Red Book FLAC from a local player), set the sink to `audio.rate = 44100`. PipeWire will then avoid the 48 kHz resampling path for sources that can natively produce 44.1 kHz. Note that some apps (notably browsers) fix their output to 48 kHz regardless; for those you're already resampled upstream and switching the sink to 44.1 kHz just moves where that happens.
+
 ## Caveats
 
-- **Format lock**: the PipeWire sink is pinned to `S24_3LE @ 48000`. Apps running at 44.1 kHz (most non-hi-res streaming) will be resampled by PipeWire on its way into the sink. AOEther itself does no resampling; if you need bit-exact 44.1 kHz you'll need M2's rate negotiation.
+- **Format lock**: the PipeWire sink is pinned at exactly what's in `99-aoether.conf`. Apps at a different rate will be resampled by PipeWire on the way in. AOEther itself does no resampling.
 - **Volume knob**: PipeWire's volume control on the aoether sink is digital attenuation before the loopback. For audiophile use keep it at 0 dB and control volume on the DAC. Setting it below 0 dB throws away bits.
 - **Latency**: end-to-end is dominated by PipeWire's scheduling (~10–40 ms typical) plus the AOEther jitter buffer (5 ms default). Fine for music; not for video sync.
 

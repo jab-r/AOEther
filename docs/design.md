@@ -329,15 +329,20 @@ This also means the DAC clock propagates all the way up to the source daemon for
 
 See the detailed M1 plan below.
 
-### M2 — Multichannel PCM
+### M2 — Multichannel PCM, hi-res rates, per-DAC test matrix
 
-**Goal:** Scale to 6ch (5.1), 8ch (7.1), 12ch (7.1.4), and higher using multichannel USB DACs (MiniDSP MCHStreamer, Motu UltraLite, OKTO Research dac8 Stereo, etc.).
+**Goal:** Scale beyond stereo/48 kHz to the rest of the PCM space: 5.1 / 7.1 / 7.1.4 channel counts on multichannel USB DACs (MiniDSP MCHStreamer, Motu UltraLite, OKTO Research dac8, Exasound e38, etc.), and hi-res rates (88.2 / 96 / 176.4 / 192 kHz) for stereo audiophile use. Format lock stays at s24le-3 in M2; additional sample widths arrive later.
 
-**Deliverables:** Talker accepts multichannel source, receiver advertises multichannel capability, verified configurations documented with per-DAC test reports.
+**Deliverables:**
+- `--channels N` and `--rate HZ` on both talker and receiver (matching manually for M2; auto-negotiation arrives in M7 with mDNS-SD / AVDECC).
+- MTU check at talker startup; reject configurations whose worst-case packet exceeds 1500 bytes with a clear message. This caps 12ch at 192 kHz and below; stereo goes all the way to the format lock; 16ch fits at 192 kHz with tight margins.
+- Mode C constants (NOMINAL_SPM, Q16.16 reference, sanity band) derived from the configured rate rather than hardcoded to 48 kHz.
+- `docs/dacs.md` — growing matrix of tested multichannel / hi-res configurations per DAC model.
+- Updated recipe docs covering multichannel sources (Roon 5.1 output, UPnP DLNA multichannel content, PipeWire multichannel routes).
 
-**Key risks:** Multichannel USB DAC support on Linux is uneven; some require quirks or vendor-specific firmware. Document which DACs are known-good.
+**Key risks:** Multichannel USB DAC support on Linux is uneven; some require `snd_usb_audio` quirks or vendor firmware. The test matrix in `docs/dacs.md` is the deliverable that manages this risk — real per-DAC reports rather than vendor-claim parroting.
 
-**Time estimate:** 2 weekends.
+**Time estimate:** 2 weekends + calendar time to accumulate DAC test reports.
 
 ### M3 — Tier 2 hardware, hardware PTP
 

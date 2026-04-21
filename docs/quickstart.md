@@ -80,7 +80,9 @@ All three recipes share the same pattern: they install a daemon on the talker bo
 
 ## Format lock
 
-M1 hardcodes 48 kHz / 2 channels / 24-bit PCM on the wire. Configure every source daemon to output that format. Mismatches fail with a clear error on startup — AOEther never silently resamples. Higher rates, multichannel, and DSD arrive in M2/M6.
+From M2, the wire accepts any of 44.1 / 48 / 88.2 / 96 / 176.4 / 192 kHz and 1..64 channels at 24-bit PCM, but **the talker and receiver must be started with matching `--channels` and `--rate`**, and the source daemon must produce exactly that format. Mismatches fail with a clear error on startup — AOEther never silently resamples. DSD arrives in M6.
+
+Very-high-rate multichannel combinations (e.g., 12 ch × 384 kHz) exceed the 1500-byte MTU when packed at 8000 pps; the talker rejects such configurations at startup. Typical deployments (stereo up to 192 kHz, 5.1 / 7.1 / 7.1.4 up to 192 kHz, 16 ch at 48 kHz) fit comfortably.
 
 ## When it doesn't work
 

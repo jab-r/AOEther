@@ -73,9 +73,15 @@ sudo ./receiver/build/receiver \
 
 In your UPnP controller (BubbleUPnP, Kazoo, mconnect, etc.), select **AOEther UPnP** as the playback renderer. Pick tracks from a UPnP MediaServer (MinimServer, minidlna, Plex DLNA) and hit play.
 
+## Hi-res stereo and multichannel (M2)
+
+gmrender-resurrect itself is format-agnostic (it forwards whatever the controller sends to the configured ALSA device). To run a different rate / channel count, start the AOEther talker and receiver with matching `--rate` and `--channels` values. The UPnP controller's transcoding settings determine what actually reaches gmrender; configure it to not transcode so source bits pass through to AOEther.
+
+Multichannel UPnP content is less common in the wild than Roon multichannel; if your MediaServer has multichannel FLAC you can play it through with `--channels 6` (or whatever the source has) and an appropriate multichannel DAC on the receiver.
+
 ## Caveats
 
-- **Format lock**: gmrender-resurrect does not itself resample. The UPnP controller typically queries the renderer's supported formats and picks one the renderer advertises. With the `ALSA_DEVICE=hw:Loopback,0,0` config above, the kernel loopback will accept a range of formats but we've asked AOEther to capture 48 kHz 24-bit — other rates will fail to play cleanly. For 44.1 kHz sources, configure the controller to transcode or limit the library to 48 kHz content until M2.
+- **Format lock**: gmrender-resurrect does not itself resample, but the UPnP controller may. Disable transcoding in the controller for bit-exact playback. AOEther rejects any format mismatch at `snd_pcm_set_params()` on the capture side.
 - **Gapless playback**: gmrender-resurrect has known gaps at track boundaries on some versions. Not an AOEther problem; upgrade the package or consider rygel as an alternative.
 - **Album art / now-playing**: the UPnP controller handles all of that; AOEther is just transport.
 
