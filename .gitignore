@@ -1,0 +1,62 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.exe
+*.out
+
+# Linker artifacts
+*.map
+*.elf
+*.bin
+*.hex
+
+# Depfiles
+*.d
+
+# MCU firmware build outputs
+Debug/
+Release/
+.metadata/
+.settings/
+.cproject
+.project
+
+# Editor temp files
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+
+# IDE / editor config
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Python venv (for any tooling / test scripts)
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local run artifacts
+*.wav
+*.pcap
+*.pcapng
+logs/
+captures/
+
+# Local configs that shouldn't be committed
+*.local.*
+.env
+.env.local
