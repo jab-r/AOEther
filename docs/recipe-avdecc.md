@@ -4,7 +4,7 @@
 
 Pairs with [`docs/recipe-milan.md`](recipe-milan.md), which covers the AAF data path — this recipe is about the control plane.
 
-**Step 1 status:** scaffolding only. `--avdecc` builds, starts, and logs its role, but does not yet respond to ADP or ACMP. Steps 2 and 3 wire in the real entity descriptor tree and ACMP CONNECT handling. Use this recipe as bring-up for the build system; do not expect Hive discovery to work until step 2 lands.
+**Step 2 status:** ADP advertising works. Hive and other Milan controllers discover AOEther receivers and talkers and can browse their descriptors (entity name, group name, firmware version). The entity's single configuration is minimal — step 3 expands it with `STREAM_INPUT` / `STREAM_OUTPUT` / `AUDIO_UNIT` / `AVB_INTERFACE` descriptors and wires an ACMP delegate so Hive's "Connect" button actually drives the AOEther data path.
 
 ## One-time setup
 
@@ -48,8 +48,8 @@ sudo ./receiver/build/receiver --iface eth0 \
 Banner includes:
 
 ```
-avdecc: entity scaffold up (role=listener name=living-room-dac iface=eth0 ch=2 rate=48000 fmt=pcm)
-        [Phase B step 1 — ADP/AECP/ACMP handlers arrive in step 2]
+avdecc: entity up (role=listener name="living-room-dac" iface=eth0 EID=0x....)
+        [Phase B step 2 — streams + ACMP handler arrive in step 3]
 ```
 
 ### Talker side (talker entity)
@@ -87,6 +87,6 @@ Run both on the same receiver if you want — they answer different clients on d
 
 **`--avdecc` prints "not compiled in"** — you built the receiver or talker before `avdecc/build/libaoether_avdecc.a` existed. Rebuild after the `make -C avdecc` step; the Makefile detects the archive at configure time, not at link time, so a clean rebuild is needed.
 
-**Entity not visible in Hive** — expected through step 1. Step 1 only validates the build and flag plumbing; ADP advertising arrives in step 2. Once step 2 lands, check that both machines are on the same L2 segment (AVDECC is not routed), and that no firewall is dropping EtherType `0x22F0`.
+**Entity not visible in Hive** — both machines must be on the same L2 segment (AVDECC is not routed through IP gateways); no firewall may drop EtherType `0x22F0` or `0x88B5`; the receiver/talker must be running as root (CAP_NET_RAW) so PCap can open the interface. `enableEntityAdvertising failed (EntityID already in use?)` in the log means another entity on the network is using the same EID — currently AOEther synthesizes EIDs from MAC + role, so two AOEther listeners on the same box collide; use two different interfaces or run only one for now.
 
-**Entity visible but "Connect" has no effect** — expected through step 2. Step 2 delivers discovery; step 3 adds ACMP CONNECT handling that drives the AOEther data path.
+**Entity visible but "Connect" has no effect** — expected through step 2. Step 2 delivers discovery only; step 3 adds ACMP CONNECT handling that drives the AOEther data path. Hive will either show "Stream format not compatible" or simply do nothing when you drag-connect. Until step 3 lands, drive the data path manually with `--dest-mac` on the talker after noting the receiver's MAC from Hive's entity details pane.

@@ -455,9 +455,9 @@ Milan-controller path. Linux side ships an IEEE 1722.1 entity backed by [L-Acous
 
 Ships in three steps so reviews stay tractable:
 
-1. **Step 1 — scaffolding (shipped).** Submodule wired, CMake build glue produces the static archive, C wrapper in place, `--avdecc` flag on both binaries, recipe doc. Entity does not yet respond to ADP. Primary purpose: get the build integration right before touching descriptor trees.
-2. **Step 2 — ADP advertising + AECP READ_DESCRIPTOR.** Entity appears in Hive's controller pane with the name from `--name` and a minimal descriptor tree (ENTITY → CONFIGURATION → AUDIO_UNIT → STREAM_INPUT or STREAM_OUTPUT → AVB_INTERFACE → LOCALE/STRINGS). Hive can browse all descriptors; "Connect" is not yet handled.
-3. **Step 3 — ACMP CONNECT_TX/RX drives the AOEther data path.** Hive's Connect button binds talker and receiver: the talker learns the receiver's stream destination MAC, the receiver learns the talker's stream ID and source MAC, and audio starts flowing. Descriptor tree expands to express the full capability matrix (multiple supported formats per stream) so controllers can pick a compatible format automatically.
+1. **Step 1 — scaffolding (shipped).** Submodule wired, CMake build glue produces the static archive, C wrapper in place, `--avdecc` flag on both binaries, recipe doc.
+2. **Step 2 — ADP advertising + AECP READ_DESCRIPTOR (shipped).** `avdecc/src/entity.cpp` opens a PCap-backed `ProtocolInterface`, creates an `AggregateEntity` with entity name + group name + firmware version populated from CLI, and enables ADP advertising with `listenerStreamSinks=1` (listener) or `talkerStreamSources=1` (talker). Hive's controller pane renders the entity with the name from `--name`. The configuration tree carries only the ENTITY / CONFIGURATION descriptors so far; stream / audio-unit / avb-interface descriptors are step 3's job.
+3. **Step 3 — full descriptor tree + ACMP CONNECT_TX/RX drives the AOEther data path.** Configuration tree gains STREAM_INPUT (listener) or STREAM_OUTPUT (talker), AUDIO_UNIT, AVB_INTERFACE, CLOCK_SOURCE, CLOCK_DOMAIN, LOCALE, STRINGS. Hive's "Connect" button binds talker and receiver: the talker learns the receiver's stream destination MAC, the receiver learns the talker's stream ID and source MAC, and audio starts flowing. Descriptor tree also expresses the supported stream formats so controllers can pick a compatible format automatically.
 
 **Out of scope for Phase B (tracked as follow-ups):**
 - MSRP stream reservation. Deferred to the TSN hardening track.
