@@ -4,7 +4,9 @@
 
 Pairs with [`docs/recipe-milan.md`](recipe-milan.md), which covers the AAF data path — this recipe is about the control plane.
 
-**Step 4 status:** ACMP drives the data path.  Hive's Connect button now steers AOEther end-to-end:
+**Step 5 status:** capability matrix.  The stream advertises all three AAF-compatible rates — 48 kHz / 96 kHz / 192 kHz — at the `--channels` count, 24-bit.  Hive's Stream Format picker shows the full set; `currentSamplingRate` mirrors `--rate` when it matches (else 48 kHz is shown in the descriptor while CLI governs the data path).
+
+**Step 4 behavior (still applies):** ACMP drives the data path.  Hive's Connect button steers AOEther end-to-end:
 
 - The talker's ACMP observer watches for `CONNECT_TX_COMMAND` targeting its EID, extracts the listener's stream destination MAC, and the per-packet egress path uses that MAC instead of `--dest-mac` until `DISCONNECT_TX` arrives.  Start the talker *without* `--dest-mac` if `--avdecc` is set — it will be idle (emitting to `00:00:00:00:00:00`, which switches drop) until Hive binds it.
 - The listener's observer watches for `CONNECT_RX_RESPONSE`, extracts the talker's stream destination MAC, and prefers that MAC over the first-frame-learns fallback.  Strays from other talkers on the same segment no longer hijack the stream.
@@ -55,7 +57,7 @@ Banner includes:
 
 ```
 avdecc: entity up (role=listener name="living-room-dac" iface=eth0 EID=0x....)
-        [Phase B step 4 — ACMP wired to data path]
+        [Phase B step 5 — {48k,96k,192k} x 2-ch AAF advertised]
 ```
 
 When Hive binds the stream you'll see the ACMP trace in the entity's log:

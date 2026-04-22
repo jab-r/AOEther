@@ -224,18 +224,51 @@ static void buildEntityTree(model::EntityTree &tree,
     conf.dynamicModel.objectName            = AvdeccFixedString{ "AOEther Stream" };
     conf.dynamicModel.isActiveConfiguration = true;
 
-    const SamplingRate sr48k{ 48000u };
-    const std::uint16_t streamChannels = 2;
+    /* Build the supported-format matrix.  AAF rides an 8 kHz packet
+     * cadence on Milan, so samples-per-frame = rate/8000 must be an
+     * integer — the 48 kHz family (48/96/192 kHz) is the usable subset
+     * for advertised formats.  The 44.1 kHz family still works via CLI
+     * pinning and mDNS discovery; it just isn't offered to AVDECC
+     * controllers.  Channel count follows --channels exactly; we do
+     * not offer multiple channel configs in one stream (that needs
+     * the AAF isUpToChannelsCount trick plus AUDIO_MAP remapping,
+     * which is its own lift). */
+    const std::uint16_t streamChannels = static_cast<std::uint16_t>(cfg.channels > 0 ? cfg.channels : 2);
 
-    /* AAF-PCM 48k/24-bit/2ch/6-samples-per-frame. samplesPerFrame=6
-     * matches AAF's SDT 8 kHz packet cadence at 48 kHz (48000/8000=6). */
+    static constexpr std::uint32_t kAafRatesHz[] = { 48000u, 96000u, 192000u };
+    StreamFormats streamFormatSet;
+    for (std::uint32_t rate : kAafRatesHz) {
+        const SamplingRate sr{ rate };
+        const std::uint16_t spf = static_cast<std::uint16_t>(rate / 8000u);
+        streamFormatSet.insert(
+            StreamFormatInfo::buildFormat_AAF(streamChannels,
+                                              /*isUpToChannelsCount=*/false,
+                                              sr,
+                                              SampleFormat::Int24,
+                                              /*sampleBitDepth=*/24,
+                                              /*samplesPerFrame=*/spf));
+    }
+
+    /* Pick the current running format to mirror CLI state.  If --rate
+     * doesn't fall in the AAF-compatible set, use 48 kHz so the
+     * descriptor is at least self-consistent; the data path's own
+     * rate is governed by --rate regardless. */
+    std::uint32_t currentRate = static_cast<std::uint32_t>(cfg.rate_hz);
+    if (currentRate != 48000u && currentRate != 96000u && currentRate != 192000u) {
+        currentRate = 48000u;
+    }
+    const SamplingRate currentSr{ currentRate };
     const StreamFormat aafStreamFormat =
         StreamFormatInfo::buildFormat_AAF(streamChannels,
                                           /*isUpToChannelsCount=*/false,
-                                          sr48k,
+                                          currentSr,
                                           SampleFormat::Int24,
                                           /*sampleBitDepth=*/24,
-                                          /*samplesPerFrame=*/6);
+                                          static_cast<std::uint16_t>(currentRate / 8000u));
+
+    /* AUDIO_UNIT's samplingRates reflect the same set (48/96/192). */
+    SamplingRates samplingRateSet;
+    for (std::uint32_t rate : kAafRatesHz) samplingRateSet.insert(SamplingRate{ rate });
 
     /* -- AVB_INTERFACE[0] ------------------------------------------------- */
     AvbInterfaceNodeModels avb{};
@@ -269,9 +302,9 @@ static void buildEntityTree(model::EntityTree &tree,
     AudioUnitTree au{};
     au.audioUnitModels.staticModel.localizedDescription = LocalizedStringReference{};
     au.audioUnitModels.staticModel.clockDomainIndex     = ClockDomainIndex{ 0 };
-    au.audioUnitModels.staticModel.samplingRates        = SamplingRates{ sr48k };
+    au.audioUnitModels.staticModel.samplingRates        = samplingRateSet;
     au.audioUnitModels.dynamicModel.objectName          = AvdeccFixedString{ "Audio Unit" };
-    au.audioUnitModels.dynamicModel.currentSamplingRate = sr48k;
+    au.audioUnitModels.dynamicModel.currentSamplingRate = currentSr;
     if (cfg.role == AOETHER_AVDECC_LISTENER) {
         au.audioUnitModels.staticModel.numberOfStreamInputPorts = 1;
     } else {
@@ -307,7 +340,7 @@ static void buildEntityTree(model::EntityTree &tree,
     sm.streamFlags          = la::avdecc::entity::StreamFlags{};
     sm.avbInterfaceIndex    = AvbInterfaceIndex{ 0 };
     sm.bufferLength         = 0;
-    sm.formats              = StreamFormats{ aafStreamFormat };
+    sm.formats              = streamFormatSet;
     if (cfg.role == AOETHER_AVDECC_LISTENER) {
         StreamInputNodeModels s{};
         s.staticModel              = std::move(sm);
@@ -461,11 +494,12 @@ extern "C" void *aoether_avdecc_cpp_open(const struct aoether_avdecc_config *cfg
 
     std::fprintf(stderr,
                  "avdecc: entity up (role=%s name=\"%s\" iface=%s EID=0x%016llx)\n"
-                 "        [Phase B step 4 — ACMP wired to data path]\n",
+                 "        [Phase B step 5 — {48k,96k,192k} x %d-ch AAF advertised]\n",
                  cfg->role == AOETHER_AVDECC_LISTENER ? "listener" : "talker",
                  name.c_str(),
                  cfg->iface,
-                 static_cast<unsigned long long>(ci.entityID.getValue()));
+                 static_cast<unsigned long long>(ci.entityID.getValue()),
+                 cfg->channels > 0 ? cfg->channels : 2);
     return e;
 }
 
