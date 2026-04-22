@@ -18,7 +18,7 @@ For the wire-format byte layout see [`wire-format.md`](wire-format.md) §"Native
 ## What does NOT work yet
 
 - **DSD512 and higher.** DSD512 stereo needs ~353 bytes per channel per USB microframe, which overflows the wire format's `u8 payload_count` field (max 255). DSD1024 stereo at ~705 bytes per channel additionally breaks the 1500-byte MTU. Both land in M8 with the packet-splitting work and the `last-in-group` reassembly flag.
-- **Only synthesized silence.** The talker's built-in `--source dsdsilence` emits the DSD idle pattern (`0x69`) on every channel. On a real DAC this plays as silence, which is exactly what's needed to verify the wire path and ALSA format selection work. Playing a real DSD file requires a `.dsf` / `.dff` reader (deferred to M8 — per-DAC quirk testing concentrates there).
+- **DFF (.dff) file reading.** AOEther ships a DSF reader (Sony `.dsf`) but not a DSF-Interchange-File-Format reader. DFF is a straightforward follow-up — its bit order already matches the AOE wire format (MSB-first) — but is deferred alongside the per-DAC quirk matrix.
 - **DoP mode is not wired up.** The wire format reserves codes `0x20..0x23` for DoP (PCM s24le-3 with 0x05 / 0xFA marker bytes at inflated rates), and talker/receiver framework would accept them, but the talker has no DoP encoder source yet. If a DAC works only through DoP and not native DSD, use PCM mode for now and wait for the DoP encoder.
 
 ## Step 1 — smoke test: talker → receiver → DSD DAC
@@ -92,11 +92,26 @@ These are typical — trust `/proc/asound` over this table.
 
 ## Step 3 — playing real DSD content
 
-Not supported in M6. The bridge-via-snd-aloop pattern used for PCM (`docs/recipe-roon.md`, `docs/recipe-capture.md`) won't work for DSD directly either, because `snd-aloop` is PCM-only.
+The talker accepts Sony DSF (`.dsf`) files via `--source dsf --file PATH.dsf`. Point `--format` at the file's DSD rate and `--channels` at its channel count; the file is validated at startup and loops when it hits EOF (same semantics as the WAV source).
 
-For now, the test workflow is silence-in / silence-out to verify protocol correctness. Real DSD playback arrives in M8 together with DSD1024/2048, a DSF file reader, and the per-DAC quirk matrix in [`dacs.md`](dacs.md).
+```sh
+# DSD64 stereo .dsf, Mode 1 transport:
+sudo ./build/talker --iface eno1 --dest-mac <receiver-iface-MAC> \
+                    --source dsf --file track.dsf \
+                    --format dsd64 --channels 2
+```
 
-If you're impatient: HQPlayer's NAA remains the audiophile-grade path for DSD file playback today. AOEther's DSD differentiation is that it's open-source and the control plane can be extended (PTP, multichannel, AVDECC in M7).
+What the reader does internally:
+
+- Parses the DSF header, `fmt ` chunk, and `data` chunk per the Sony DSF 1.01 spec.
+- Deinterleaves the file's 4096-byte-per-channel blocks into AOE's byte-granular channel interleave on every `read()`.
+- Bit-reverses each byte when the file is stored LSB-first (`bits_per_sample=1`, the usual case) so the wire stream comes out MSB-first.
+- Validates the file's declared channels and sampling frequency against the configured `--format` / `--channels`. Mismatches abort at startup — AOEther never resamples.
+- Rejects DSD512+ DSF content with a clear error pointing at M8 (packet-splitting extension needed).
+
+The bridge-via-snd-aloop pattern used for PCM (`docs/recipe-roon.md`, `docs/recipe-capture.md`) still does not work for DSD streams because `snd-aloop` is PCM-only. The DSF reader is the intended path for local DSD file playback today.
+
+DFF (`.dff`) files are a tracked follow-up; HQPlayer's NAA remains a reasonable external option for DFF or for content above DSD256 until M8 lands.
 
 ## Step 4 — DSD + IP/UDP
 

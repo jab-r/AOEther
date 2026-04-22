@@ -11,6 +11,7 @@ SRCS      := \
     src/audio_source_wav.c \
     src/audio_source_alsa.c \
     src/audio_source_dsd.c \
+    src/audio_source_dsf.c \
     ../common/packet.c \
     ../common/avtp.c \
     ../common/avdecc.c

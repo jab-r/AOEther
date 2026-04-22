@@ -27,8 +27,8 @@ Flags:
 - `--dest-mac AA:BB:CC:DD:EE:FF` — receiver's MAC (required with `--transport l2` or `--transport avtp`; for AVTP this is typically the listener's stream destination MAC, often a Milan-range multicast like `91:E0:F0:00:01:00`).
 - `--dest-ip IP` — destination IPv4 or IPv6 literal (required with `--transport ip`). Multicast groups (224.0.0.0/4 or ff00::/8) are auto-detected.
 - `--port N` — UDP port (IP mode only, default 8805).
-- `--source testtone|wav|alsa|dsdsilence` — default `testtone` for PCM, `dsdsilence` for DSD. `testtone` is 1 kHz sine at −6 dBFS. `dsdsilence` emits the DSD idle pattern (`0x69`) — silent on a real DAC, used to verify the wire path.
-- `--file PATH` — WAV file when `--source wav`. Accepts PCM 24-bit at any of the supported channel counts and rates; the file loops.
+- `--source testtone|wav|alsa|dsdsilence|dsf` — default `testtone` for PCM, `dsdsilence` for DSD. `testtone` is 1 kHz sine at −6 dBFS. `dsdsilence` emits the DSD idle pattern (`0x69`) — silent on a real DAC, used to verify the wire path. `dsf` reads a Sony DSF file for real DSD playback.
+- `--file PATH` — WAV file when `--source wav`, or `.dsf` file when `--source dsf`. Files loop. DSF files are validated against `--format` / `--channels`; DSD512+ content is rejected pending the M8 packet-splitting extension.
 - `--capture hw:CARD=...` — ALSA PCM name when `--source alsa`. Point at one half of a `snd-aloop` pair to receive from Roon/UPnP/PipeWire; see `docs/recipe-*.md`.
 - `--channels N` — channel count (1..64, default 2). Receiver must match.
 - `--rate HZ` — PCM only: one of 44100, 48000, 88200, 96000, 176400, 192000 (default 48000). Ignored for DSD — rate is implied by `--format`.
