@@ -202,9 +202,8 @@ sudo systemctl enable --now ptp4l phc2sys
 
 ## What AOEther reads from this
 
-Eventually the talker will `clock_gettime(CLOCK_TAI, ...)` on each emission tick and stamp `presentation_time = low32(tai_ns + offset_ns)` into the AoE header. The receiver will do the same lookup and schedule playback around that target. Until that code lands, `phc2sys` against `CLOCK_TAI` is useful for:
+**M9 Phase C (shipped, talker side):** `./build/talker --transport rtp --ptp` reads `CLOCK_TAI` at startup and derives the RTP timestamp base from it. This is the AES67 expectation — RTP timestamps reflect seconds from the PTP epoch on the media clock. The emitted SDP also grows `a=ts-refclk:ptp=IEEE1588-2008:traceable` + `a=mediaclk:direct=0`, so AES67 controllers see a PTP-traceable stream. Once `phc2sys -c CLOCK_TAI` is running, `--ptp` is safe to enable on the talker.
 
-- Observation: cross-host `date +%s%N` or scoped PPS signals tell you whether PTP is actually working.
-- Preparation: once the code lands, the time source is already disciplined; no additional bring-up needed.
+**AOE / AVTP paths:** eventually the talker will also stamp `presentation_time = low32(tai_ns + offset_ns)` into the AoE header for Mode B (phase-aligned multi-receiver). That code has not landed yet; the receiver side will use the same lookup and schedule playback around that target.
 
-If you don't run PTP at all, AOEther continues to work per M1/M2 semantics — Mode C clock discipline handles single-receiver rate matching on its own.
+If you don't run PTP at all, AOEther continues to work per M1/M2 semantics — Mode C clock discipline handles single-receiver rate matching on its own. RTP/AES67 without `--ptp` will drift against a PTP-locked listener, but short sessions and free-run-capable listeners are unaffected.
