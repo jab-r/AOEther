@@ -2,6 +2,7 @@
 #include "avtp.h"
 #include "mdns.h"
 #include "packet.h"
+#include "rtp.h"
 
 #include <pthread.h>
 
@@ -57,6 +58,7 @@ enum transport_mode {
     TRANSPORT_L2 = 0,
     TRANSPORT_IP = 1,
     TRANSPORT_AVTP = 2,
+    TRANSPORT_RTP = 3,   /* RTP/AES67 (Mode 4, M9 Phase A) */
 };
 
 static int rate_supported(int hz)
@@ -174,10 +176,11 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "usage: %s --iface IF --dac hw:CARD=NAME,DEV=0 [options]\n"
-        "  --transport l2|ip|avtp  transport mode, default l2\n"
-        "                       (avtp = IEEE 1722 AAF, EtherType 0x22F0, Milan interop)\n"
-        "  --port N             UDP port (IP mode, default %d)\n"
-        "  --group IP           multicast group to join (IP mode, optional;\n"
+        "  --transport l2|ip|avtp|rtp   transport mode, default l2\n"
+        "                       (avtp = IEEE 1722 AAF, Milan interop;\n"
+        "                        rtp  = RTP/AES67 per M9 Phase A)\n"
+        "  --port N             UDP port (ip mode default %d; rtp default 5004)\n"
+        "  --group IP           multicast group to join (ip/rtp modes, optional;\n"
         "                       IPv4 in 224.0.0.0/4 or IPv6 in ff00::/8)\n"
         "  --format FMT         pcm | dsd64 | dsd128 | dsd256\n"
         "                       | dsd512 | dsd1024 | dsd2048\n"
@@ -271,7 +274,8 @@ int main(int argc, char **argv)
             if      (strcmp(optarg, "l2") == 0)   transport = TRANSPORT_L2;
             else if (strcmp(optarg, "ip") == 0)   transport = TRANSPORT_IP;
             else if (strcmp(optarg, "avtp") == 0) transport = TRANSPORT_AVTP;
-            else { fprintf(stderr, "receiver: --transport must be l2, ip, or avtp\n"); return 2; }
+            else if (strcmp(optarg, "rtp") == 0)  transport = TRANSPORT_RTP;
+            else { fprintf(stderr, "receiver: --transport must be l2, ip, avtp, or rtp\n"); return 2; }
             break;
         case 'P': udp_port = atoi(optarg); break;
         case 'G': group_s = optarg; break;
@@ -296,9 +300,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "receiver: --port out of range\n");
         return 2;
     }
-    if (transport != TRANSPORT_IP && group_s) {
-        fprintf(stderr, "receiver: --group only makes sense with --transport ip\n");
+    if (transport != TRANSPORT_IP && transport != TRANSPORT_RTP && group_s) {
+        fprintf(stderr, "receiver: --group only makes sense with --transport ip or rtp\n");
         return 2;
+    }
+    if (transport == TRANSPORT_RTP && udp_port == DEFAULT_UDP_PORT) {
+        /* AES67 registered RTP port is 5004. */
+        udp_port = RTP_DEFAULT_PORT;
     }
 
     if (channels < 1 || channels > 64) {
@@ -319,6 +327,10 @@ int main(int argc, char **argv)
     }
     if (transport == TRANSPORT_AVTP && fmt.is_dsd) {
         fprintf(stderr, "receiver: AVTP AAF does not carry DSD; use --transport l2 or ip\n");
+        return 2;
+    }
+    if (transport == TRANSPORT_RTP && fmt.is_dsd) {
+        fprintf(stderr, "receiver: AES67 RTP is PCM-only; use --transport l2 or ip with --format dsd*\n");
         return 2;
     }
 
@@ -503,7 +515,9 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    if (transport != TRANSPORT_IP) {
+    const int feedback_effective =
+        feedback_enabled && transport != TRANSPORT_RTP;
+    if (transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) {
         fprintf(stderr,
                 "receiver: transport=%s iface=%s dac=%s fmt=%s alsa=%s ch=%d rate=%d alsa_rate=%u latency_us=%d feedback=%s\n",
                 transport == TRANSPORT_AVTP ? "avtp" : "l2",
@@ -511,19 +525,24 @@ int main(int argc, char **argv)
                 transport == TRANSPORT_AVTP ? "AAF_INT24(BE)" : fmt.name,
                 av.name,
                 channels, rate_hz, alsa_rate, latency_us,
-                feedback_enabled ? "on" : "off");
+                feedback_effective ? "on" : "off");
     } else {
+        const char *label = (transport == TRANSPORT_RTP) ? "rtp" : "ip";
+        const char *wire_fmt =
+            (transport == TRANSPORT_RTP) ? "L24(BE)" : fmt.name;
         fprintf(stderr,
-                "receiver: transport=ip family=%s %s port=%d%s%s\n"
-                "          iface=%s dac=%s fmt=%s alsa=%s ch=%d rate=%d alsa_rate=%u latency_us=%d feedback=%s\n",
+                "receiver: transport=%s family=%s %s port=%d%s%s\n"
+                "          iface=%s dac=%s fmt=%s alsa=%s ch=%d rate=%d alsa_rate=%u latency_us=%d feedback=%s%s\n",
+                label,
                 group_family == AF_INET6 ? "v6" : "v4",
                 use_multicast ? "multicast" : "unicast",
                 udp_port,
                 group_s ? " group=" : "",
                 group_s ? group_s : "",
-                iface, dac, fmt.name, av.name,
+                iface, dac, wire_fmt, av.name,
                 channels, rate_hz, alsa_rate, latency_us,
-                feedback_enabled ? "on" : "off");
+                feedback_effective ? "on" : "off",
+                transport == TRANSPORT_RTP ? " (AES67: relies on PTPv2)" : "");
     }
 
     /* mDNS-SD: announce this receiver and its DAC capabilities so talkers
@@ -574,6 +593,12 @@ int main(int argc, char **argv)
      * AOEther listeners through this entity and use ACMP CONNECT_RX to
      * bind a peer talker at runtime. Currently scaffolding only — the
      * descriptor tree and ACMP handler are filled in by step 2. */
+    if (avdecc_enabled && transport == TRANSPORT_RTP) {
+        fprintf(stderr,
+                "receiver: --avdecc has no effect under --transport rtp "
+                "(AES67 uses SAP/SDP for discovery; AVDECC is Milan-only)\n");
+        avdecc_enabled = 0;
+    }
     struct aoether_avdecc *avdecc = NULL;
     if (avdecc_enabled) {
         struct aoether_avdecc_config cfg = {
@@ -656,7 +681,7 @@ int main(int argc, char **argv)
             struct sockaddr_storage src_addr;
             socklen_t src_addrlen = sizeof(src_addr);
             ssize_t n;
-            if (transport == TRANSPORT_IP) {
+            if (transport == TRANSPORT_IP || transport == TRANSPORT_RTP) {
                 n = recvfrom(data_sock, buf, sizeof(buf), 0,
                              (struct sockaddr *)&src_addr, &src_addrlen);
             } else {
@@ -671,13 +696,44 @@ int main(int argc, char **argv)
             /* Parse the protocol header into a uniform (frames, payload_ptr,
              * sequence) tuple, then fall through to the common ALSA-write
              * and talker-learning path. */
-            size_t hdr_off = (transport == TRANSPORT_IP) ? 0 : sizeof(struct ether_header);
+            size_t hdr_off = (transport == TRANSPORT_IP || transport == TRANSPORT_RTP)
+                                 ? 0 : sizeof(struct ether_header);
             size_t frames = 0;
             size_t payload_bytes = 0;
             uint8_t *payload_p = NULL;
             uint32_t seq = 0;
 
-            if (transport == TRANSPORT_AVTP) {
+            if (transport == TRANSPORT_RTP) {
+                /* RTP/AES67 path: 12-byte RTP header then L24 big-endian
+                 * PCM. No AoE header, no magic byte — the receiver decides
+                 * this is RTP from --transport rtp. Format / channel
+                 * validation comes from SDP in a future milestone;
+                 * for M9 Phase A we trust --rate / --channels / L24. */
+                if ((size_t)n < hdr_off + RTP_HDR_LEN) { dropped++; goto check_feedback; }
+                const struct rtp_hdr *rh =
+                    (const struct rtp_hdr *)(buf + hdr_off);
+                uint8_t  rpt;
+                uint16_t rseq;
+                uint32_t rts, rssrc;
+                if (rtp_hdr_parse(rh, &rpt, &rseq, &rts, &rssrc) < 0) {
+                    dropped++; goto check_feedback;
+                }
+                (void)rts; (void)rssrc;
+                payload_bytes = (size_t)n - hdr_off - RTP_HDR_LEN;
+                size_t per_sample = (size_t)channels * bytes_per_sample;
+                if (per_sample == 0 || payload_bytes == 0 ||
+                    payload_bytes % per_sample != 0) {
+                    dropped++; goto check_feedback;
+                }
+                frames = payload_bytes / per_sample;
+                payload_p = buf + hdr_off + RTP_HDR_LEN;
+                /* L24 samples are big-endian; swap to ALSA LE in place. */
+                rtp_swap24_inplace(payload_p, frames * (size_t)channels);
+                /* RTP sequence is 16-bit; widen against last using the
+                 * AVTP-style 8-bit handling doesn't apply. Treat it as a
+                 * 32-bit value; the delta compare below handles wrap. */
+                seq = (uint32_t)rseq;
+            } else if (transport == TRANSPORT_AVTP) {
                 if ((size_t)n < hdr_off + AVTP_HDR_LEN) { dropped++; goto check_feedback; }
                 const struct avtp_aaf_hdr *ah =
                     (const struct avtp_aaf_hdr *)(buf + hdr_off);
@@ -728,12 +784,14 @@ int main(int argc, char **argv)
             }
 
             if (have_seq) {
-                /* AVTP wraps every 256 packets; AOE every 2^32. Both work
-                 * with a signed-difference compare against the appropriate
-                 * width — for AVTP we treat seq as 8-bit. */
+                /* AVTP wraps every 256 packets, RTP every 65536, AOE every
+                 * 2^32. Use a width-appropriate signed-difference compare. */
                 if (transport == TRANSPORT_AVTP) {
                     int8_t d8 = (int8_t)((uint8_t)seq - (uint8_t)last_seq);
                     if (d8 > 1) lost += (uint64_t)(d8 - 1);
+                } else if (transport == TRANSPORT_RTP) {
+                    int16_t d16 = (int16_t)((uint16_t)seq - (uint16_t)last_seq);
+                    if (d16 > 1) lost += (uint64_t)(d16 - 1);
                 } else {
                     int32_t delta = (int32_t)(seq - last_seq);
                     if (delta > 1) lost += (uint64_t)(delta - 1);
@@ -746,10 +804,10 @@ int main(int argc, char **argv)
                 /* Prefer the ACMP-announced talker MAC over learning from
                  * the first frame: Hive's Connect should steer us, not the
                  * first arriving packet (which might be a stray from
-                 * another talker on the same segment). IP mode still
-                 * learns from src_addr because AVDECC is L2-only. */
+                 * another talker on the same segment). IP / RTP modes
+                 * learn from src_addr because AVDECC is L2/AVTP-only. */
                 int used_avdecc = 0;
-                if (transport != TRANSPORT_IP) {
+                if (transport != TRANSPORT_IP && transport != TRANSPORT_RTP) {
                     pthread_mutex_lock(&g_avdecc_mu);
                     if (g_avdecc_peer_valid) {
                         memcpy(talker_mac, g_avdecc_peer_mac, 6);
@@ -757,14 +815,14 @@ int main(int argc, char **argv)
                     }
                     pthread_mutex_unlock(&g_avdecc_mu);
                 }
-                if (transport == TRANSPORT_IP) {
+                if (transport == TRANSPORT_IP || transport == TRANSPORT_RTP) {
                     memcpy(&talker_addr, &src_addr, src_addrlen);
                     talker_addr_len = src_addrlen;
                 } else if (!used_avdecc) {
                     const struct ether_header *eth = (const struct ether_header *)buf;
                     memcpy(talker_mac, eth->ether_shost, 6);
                 }
-                if (transport != TRANSPORT_IP) {
+                if (transport != TRANSPORT_IP && transport != TRANSPORT_RTP) {
                     memcpy(fb_eth->ether_dhost, talker_mac, 6);
                     memcpy(fb_to_ll.sll_addr, talker_mac, 6);
                 }
@@ -854,7 +912,10 @@ int main(int argc, char **argv)
         }
 
 check_feedback:
-        if (!feedback_enabled || !have_talker) {
+        /* RTP/AES67 doesn't use AOEther's Mode C feedback — AES67 devices
+         * expect PTPv2 for clocking and will discard our 0x88B6 frames.
+         * Skip emission entirely to avoid spraying unsolicited packets. */
+        if (!feedback_enabled || !have_talker || transport == TRANSPORT_RTP) {
             continue;
         }
 

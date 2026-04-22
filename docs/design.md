@@ -505,21 +505,27 @@ Ships in pieces as sub-features land rather than as one atomic milestone. Items 
 
 **Goal:** First-class interop with the Ravenna / AES67 ecosystem via Mode 4 (RTP over UDP). Opens the project to a much larger adjacent market: any AES67 device (Merging Anubis, Neumann MT 48, any Ravenna-native gear, any Dante-with-AES67-mode device, any `aes67-linux-daemon` deployment) becomes a valid talker or listener alongside AOEther-native endpoints.
 
-**Deliverables:**
-- **RTP/AES67 encapsulation** for PCM streams: L16 and L24 payload types, 1 ms packet time (PTIME=1 by default, 125 µs optional for low-latency), 48 kHz baseline with optional higher rates.
-- **SDP session description** per AES67 conventions, carrying stream format, packet time, channel count, source, destination, and PTP domain info.
-- **SAP (Session Announcement Protocol)** for stream discovery, interoperable with AES67 discovery implementations.
-- **PTPv2 default profile** support (separate from gPTP which is 802.1AS) for sync with AES67 infrastructure. Linuxptp's `ptp4l` supports both profiles; configuration is per-deployment.
-- **Interop test plan:** confirmed playback with at least `aes67-linux-daemon` (open-source reference), and aspirationally one commercial device per ecosystem (a Dante-with-AES67 device, a Ravenna-native device, a Merging or Neumann endpoint).
-- **Documented constraints:** AES67 is PCM only, so DSD streams remain on Mode 3 (IP/UDP with AoE header). AES67 channel counts typically cap at 8 per stream; higher counts split across streams.
-- **User-facing config** for Mode 4 is kept simple: "I want to send this stream as AES67" / "I want to receive AES67 streams" as first-class options alongside the AOEther-native modes.
+Ships in phases:
+
+**Phase A — [shipped] RTP/AES67 wire encoding.** `--transport rtp` on both talker and receiver, 12-byte RTP header (RFC 3550) followed by L24 big-endian PCM payload (RFC 3190 / AES67 §7). PTIME is 1 ms by default (AES67 standard) and 125 µs optionally (the AES67 low-latency profile, matching AOEther's native microframe cadence). Destination typically IPv4 multicast `239.X.X.X` on UDP port 5004. Mode C feedback is disabled under RTP — AES67 devices expect PTPv2 for clocking and will discard our 0x88B6 frames. Fragmentation is disabled (strict AES67 listeners won't reassemble); configs that exceed MTU are rejected at startup. Only the default dynamic payload type (96 for L24) is emitted/accepted today; SDP-negotiated PTs arrive in Phase B.
+
+**Phase B — [open] SDP / SAP discovery.** SDP session description per AES67 conventions; SAP (RFC 2974) announcement on `239.255.255.255:9875`. User-facing: `--announce-sap` on the talker, passive listen on the receiver, or static SDP files for hostile networks. Enables auto-discovery of AES67 streams from Merging ANEMAN, Dante Controller, etc.
+
+**Phase C — [open] PTPv2 default-profile integration.** PTPv2 default profile is separate from gPTP (802.1AS) that Milan uses. `ptp4l` supports both. AOEther needs: a documented `ptp4l` config recipe, RTP timestamp derivation from `CLOCK_TAI`, and `tv=1`-equivalent indication that the RTP timestamp is PTP-disciplined. Landing this requires M3 Phase B (hardware PTP) to have been validated first.
+
+**Phase D — [hardware-blocked] Interop validation.** Confirmed playback with `aes67-linux-daemon` (open-source reference), Merging ANEMAN / Anubis, a Dante-with-AES67-mode device, and a Neumann or similar Ravenna endpoint.
+
+**Documented constraints:**
+- AES67 is PCM only, so DSD streams remain on Modes 1 / 3 (with AoE header). The talker / receiver reject `--transport rtp --format dsd*` at startup.
+- AES67 channel counts typically cap at 8 per stream; higher counts split across multiple streams at the SDP level (Phase B).
+- L16 payload is wire-format-ready (`rtp_swap16_inplace` exists) but not yet plumbed as a `--format` option — s24 is AOEther's PCM lock.
 
 **Key risks:**
 - AES67 has enough ambiguity in practice that interop edge cases are expected. Approach: start with `aes67-linux-daemon` as a known-good reference, then expand to commercial gear with iteration.
 - SAP multicast is sometimes blocked by consumer routers; document workarounds (static SDP files, manual stream addition).
 - PTP domain coexistence with gPTP deployments (Milan uses domain 0 typically; AES67 setups often use other domains). Ensure AOEther can participate in both simultaneously if needed.
 
-**Time estimate:** 4–6 weekends.
+**Time estimate:** 4–6 weekends total; Phase A is the first weekend's worth.
 
 ### Future work — Topology A (gadget mode), redundancy
 

@@ -2,6 +2,7 @@
 #include "avdecc.h"
 #include "avtp.h"
 #include "packet.h"
+#include "rtp.h"
 
 #include <pthread.h>
 
@@ -27,11 +28,17 @@
 
 /* Stream parameters. Channels, rate, and sample format are all runtime-
  * configured from M6 on. The "rate" field generalizes to "samples or DSD-
- * bytes per second per channel" so the per-microframe payload math (rate /
- * 8000) works uniformly across PCM and native DSD. */
-#define STREAM_ID             0x0001
-#define PACKET_PERIOD_NS      125000L          /* 125 µs = 1 USB microframe */
-#define MICROFRAMES_PER_MS    8
+ * bytes per second per channel" so the per-packet payload math works
+ * uniformly across PCM and native DSD.
+ *
+ * Modes 1/2/3 run at 8000 pps (125 µs per packet, one USB microframe);
+ * Mode 4 (RTP/AES67) runs at PTIME — default 1 ms (1000 pps) per AES67,
+ * optional 125 µs via --ptime. PACKET_PERIOD_DEFAULT_NS captures the
+ * Modes-1-3 default; the runtime-resolved `packet_period_ns` below is
+ * used everywhere else. */
+#define STREAM_ID                    0x0001
+#define PACKET_PERIOD_DEFAULT_NS     125000L
+#define PACKET_PERIOD_AES67_1MS_NS   1000000L
 
 #define DEFAULT_CHANNELS      2
 #define DEFAULT_RATE_HZ       48000
@@ -57,6 +64,7 @@ enum transport_mode {
     TRANSPORT_L2 = 0,    /* raw Ethernet, AF_PACKET, EtherType 0x88B5/0x88B6 */
     TRANSPORT_IP = 1,    /* UDP over IPv4/v6, magic-byte disambiguation */
     TRANSPORT_AVTP = 2,  /* IEEE 1722 AVTP AAF, EtherType 0x22F0 (Milan) */
+    TRANSPORT_RTP = 3,   /* RTP/AES67 over UDP (Mode 4, M9 Phase A) */
 };
 
 /* Safety clamp on feedback-derived rate: ±1000 ppm of nominal. */
@@ -194,6 +202,11 @@ static void usage(const char *prog)
         "    --port N                        UDP port, default %d\n"
         "  --transport avtp             IEEE 1722 AAF, Milan interop (Mode 2, M5)\n"
         "    --dest-mac AA:BB:CC:DD:EE:FF    (required; unicast or AVTP multicast)\n"
+        "  --transport rtp              RTP/AES67 over UDP (Mode 4, M9 Phase A)\n"
+        "    --dest-ip X.Y.Z.W | v6:literal  (required; 239.X.X.X typical)\n"
+        "    --port N                        UDP port, default 5004 (AES67)\n"
+        "    --ptime US                      packet time: 1000 (AES67 default)\n"
+        "                                    or 125 (low-latency profile)\n"
         "\n"
         "Source:\n"
         "  --source testtone|wav|alsa|dsdsilence|dsf\n"
@@ -242,6 +255,7 @@ int main(int argc, char **argv)
     int rate_hz = DEFAULT_RATE_HZ;
     enum transport_mode transport = TRANSPORT_L2;
     int udp_port = DEFAULT_UDP_PORT;
+    int ptime_us = 0;                 /* 0 = transport-default; user may set 125 or 1000 */
     int avdecc_enabled = 0;
     const char *entity_name = NULL;
 
@@ -251,6 +265,7 @@ int main(int argc, char **argv)
         { "dest-ip",   required_argument, 0, 'I' },
         { "transport", required_argument, 0, 'T' },
         { "port",      required_argument, 0, 'P' },
+        { "ptime",     required_argument, 0, 1001 },
         { "source",    required_argument, 0, 's' },
         { "file",      required_argument, 0, 'f' },
         { "capture",   required_argument, 0, 'c' },
@@ -272,9 +287,11 @@ int main(int argc, char **argv)
             if      (strcmp(optarg, "l2") == 0)   transport = TRANSPORT_L2;
             else if (strcmp(optarg, "ip") == 0)   transport = TRANSPORT_IP;
             else if (strcmp(optarg, "avtp") == 0) transport = TRANSPORT_AVTP;
-            else { fprintf(stderr, "talker: --transport must be l2, ip, or avtp\n"); return 2; }
+            else if (strcmp(optarg, "rtp") == 0)  transport = TRANSPORT_RTP;
+            else { fprintf(stderr, "talker: --transport must be l2, ip, avtp, or rtp\n"); return 2; }
             break;
         case 'P': udp_port = atoi(optarg); break;
+        case 1001: ptime_us = atoi(optarg); break;
         case 's': source = optarg; break;
         case 'f': wav_path = optarg; break;
         case 'c': capture_pcm = optarg; break;
@@ -299,13 +316,45 @@ int main(int argc, char **argv)
                 transport == TRANSPORT_L2 ? "l2" : "avtp");
         return 2;
     }
-    if (transport == TRANSPORT_IP && !dest_ip_s) {
-        fprintf(stderr, "talker: --dest-ip required for --transport ip\n");
+    if ((transport == TRANSPORT_IP || transport == TRANSPORT_RTP) && !dest_ip_s) {
+        fprintf(stderr, "talker: --dest-ip required for --transport %s\n",
+                transport == TRANSPORT_IP ? "ip" : "rtp");
         return 2;
+    }
+    if (transport == TRANSPORT_RTP && udp_port == DEFAULT_UDP_PORT) {
+        /* AES67's registered RTP port is 5004; retarget the default when
+         * the user hasn't set --port explicitly. */
+        udp_port = RTP_DEFAULT_PORT;
     }
     if (udp_port < 1 || udp_port > 65535) {
         fprintf(stderr, "talker: --port out of range\n");
         return 2;
+    }
+
+    /* Packet cadence. Modes 1/2/3 run at USB-microframe cadence (125 µs).
+     * Mode 4 (RTP/AES67) uses PTIME — default 1 ms, optional 125 µs for
+     * the low-latency AES67 profile. Other PTIME values (250 µs, 333 µs)
+     * exist in the spec but aren't supported here yet. */
+    long packet_period_ns;
+    if (transport == TRANSPORT_RTP) {
+        if (ptime_us == 0)                         ptime_us = RTP_PTIME_US_1MS;
+        if (ptime_us != RTP_PTIME_US_1MS &&
+            ptime_us != RTP_PTIME_US_125US) {
+            fprintf(stderr,
+                    "talker: --ptime %d unsupported for RTP "
+                    "(use 1000 for AES67 default or 125 for low-latency)\n",
+                    ptime_us);
+            return 2;
+        }
+        packet_period_ns = (long)ptime_us * 1000L;
+    } else {
+        if (ptime_us != 0 && ptime_us != 125) {
+            fprintf(stderr,
+                    "talker: --ptime only applies to --transport rtp "
+                    "(modes 1/2/3 are locked to 125 µs microframe cadence)\n");
+            return 2;
+        }
+        packet_period_ns = PACKET_PERIOD_DEFAULT_NS;
     }
     if (channels < 1 || channels > 64) {
         fprintf(stderr, "talker: --channels must be 1..64 (got %d)\n", channels);
@@ -328,6 +377,10 @@ int main(int argc, char **argv)
     }
     if (transport == TRANSPORT_AVTP && fmt.is_dsd) {
         fprintf(stderr, "talker: AVTP AAF does not carry DSD; use --transport l2 or ip with --format dsd*\n");
+        return 2;
+    }
+    if (transport == TRANSPORT_RTP && fmt.is_dsd) {
+        fprintf(stderr, "talker: AES67 RTP is PCM-only; use --transport l2 or ip with --format dsd*\n");
         return 2;
     }
     const uint8_t format_code = fmt.code;
@@ -359,21 +412,27 @@ int main(int argc, char **argv)
      * (u8) or the MTU would otherwise overflow. See docs/wire-format.md
      * §"Cadence and fragmentation".
      *
-     * AVTP AAF does not fragment — splitting an AAF stream across multiple
-     * 1722 frames per microframe breaks interop with strict Milan listeners.
-     * AAF configs that overflow MTU are rejected at startup. */
-    const size_t proto_hdr_len = (transport == TRANSPORT_AVTP) ? AVTP_HDR_LEN
-                                                               : AOE_HDR_LEN;
-    const double nominal_spm = (double)rate_hz / 1000.0 / MICROFRAMES_PER_MS;
+     * AVTP AAF (Mode 2) and RTP/AES67 (Mode 4) do not fragment — splitting
+     * across multiple frames per packet interval breaks interop with strict
+     * Milan / AES67 listeners respectively. Those modes reject MTU-
+     * overflowing configurations at startup. */
+    const size_t proto_hdr_len =
+        (transport == TRANSPORT_AVTP) ? AVTP_HDR_LEN :
+        (transport == TRANSPORT_RTP)  ? RTP_HDR_LEN  :
+                                        AOE_HDR_LEN;
+    /* nominal_spm is now "samples per packet" in whatever cadence the
+     * transport uses. Legacy name kept to minimize diff churn. */
+    const double nominal_spm =
+        (double)rate_hz * (double)packet_period_ns / 1e9;
     const int max_samples_per_microframe = (int)(nominal_spm + 0.5) + 4;
     const size_t max_microframe_payload =
         (size_t)max_samples_per_microframe * channels * bytes_per_sample;
 
     /* Per-fragment upper bound on payload_count: clamped by the u8 field
      * and by the worst-case per-fragment MTU budget. Fragmentation is an
-     * AOE-only path, so we compute this for L2/IP only. */
+     * AOE-only path (Modes 1 / 3). */
     int max_frag_pc = 0;
-    if (transport != TRANSPORT_AVTP) {
+    if (transport != TRANSPORT_AVTP && transport != TRANSPORT_RTP) {
         const size_t per_ch_unit = (size_t)channels * bytes_per_sample;
         if (per_ch_unit == 0) {
             fprintf(stderr, "talker: invalid per-channel unit\n");
@@ -392,30 +451,32 @@ int main(int argc, char **argv)
         max_frag_pc = (int)mtu_budget_pc;
     }
 
-    /* Startup MTU check. AVTP always rejects overflow; AOE only rejects the
-     * pathological "one sample doesn't fit" case handled above. */
-    if (transport == TRANSPORT_AVTP &&
+    /* Startup MTU check for non-fragmenting transports. */
+    if ((transport == TRANSPORT_AVTP || transport == TRANSPORT_RTP) &&
         max_microframe_payload + proto_hdr_len > ETH_MTU_PAYLOAD) {
+        const char *mode_name =
+            transport == TRANSPORT_AVTP ? "AVTP AAF" : "RTP/AES67";
         fprintf(stderr,
-                "talker: ch=%d rate=%d under AVTP AAF needs %zu-byte payload "
+                "talker: ch=%d rate=%d under %s needs %zu-byte payload "
                 "— exceeds 1500-byte MTU.\n"
-                "  AAF does not support per-microframe fragmentation (would "
-                "break Milan interop). Try --transport l2 or --transport ip, "
-                "or reduce channels / rate.\n",
-                channels, rate_hz,
+                "  This transport does not support per-packet fragmentation "
+                "(would break listener interop). Try --transport l2 or "
+                "--transport ip, or reduce channels / rate.\n",
+                channels, rate_hz, mode_name,
                 max_microframe_payload + proto_hdr_len);
         return 2;
     }
 
     /* Per-frame buffer sizing:
      *   - `frame` holds one transmission unit = Ethernet header + proto
-     *     header + one fragment's payload (for AOE) or one full microframe
-     *     (for AVTP).
-     *   - `audio_buf` holds one full microframe's audio bytes, read from
-     *     the source in one `read()` call and then sliced into fragments.
-     *     AVTP reads into this too and copies once into `frame`. */
+     *     header + one fragment's payload (for AOE) or one full packet
+     *     (for AVTP / RTP).
+     *   - `audio_buf` holds one full packet-interval's audio bytes, read
+     *     from the source in one `read()` call and then sliced into
+     *     fragments for AOE. AVTP / RTP read into this too and copy once
+     *     into `frame`. */
     const size_t max_frag_payload =
-        (transport == TRANSPORT_AVTP)
+        (transport == TRANSPORT_AVTP || transport == TRANSPORT_RTP)
             ? max_microframe_payload
             : ((size_t)max_frag_pc * channels * bytes_per_sample);
     const size_t max_frame = sizeof(struct ether_header) + proto_hdr_len + max_frag_payload;
@@ -452,6 +513,7 @@ int main(int argc, char **argv)
          * The per-packet egress path swaps in the ACMP MAC before each
          * send, so the zero placeholder never reaches the wire. */
     } else {
+        /* IP (Mode 3) and RTP (Mode 4) both take a dest IP. */
         struct in_addr v4;
         struct in6_addr v6;
         if (inet_pton(AF_INET, dest_ip_s, &v4) == 1) {
@@ -657,8 +719,8 @@ int main(int argc, char **argv)
     int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
     if (tfd < 0) { perror("timerfd_create"); return 1; }
     struct itimerspec its = {
-        .it_interval = { 0, PACKET_PERIOD_NS },
-        .it_value    = { 0, PACKET_PERIOD_NS },
+        .it_interval = { 0, packet_period_ns },
+        .it_value    = { 0, packet_period_ns },
     };
     if (timerfd_settime(tfd, 0, &its, NULL) < 0) {
         perror("timerfd_settime");
@@ -669,9 +731,14 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_signal);
 
     /* AVDECC entity (M7 Phase B). Talker publishes a STREAM_OUTPUT so
-     * Milan controllers can discover and bind it. Scaffolding only
-     * in step 1 — descriptor tree and ACMP CONNECT_TX handling arrive
-     * in step 2. */
+     * Milan controllers can discover and bind it. AVDECC is L2/AVTP-only;
+     * it has no meaning under RTP/AES67 (Ravenna uses SAP, not AVDECC). */
+    if (avdecc_enabled && transport == TRANSPORT_RTP) {
+        fprintf(stderr,
+                "talker: --avdecc has no effect under --transport rtp "
+                "(AES67 uses SAP/SDP for discovery; AVDECC is Milan-only)\n");
+        avdecc_enabled = 0;
+    }
     struct aoether_avdecc *avdecc = NULL;
     if (avdecc_enabled) {
         struct aoether_avdecc_config cfg = {
@@ -696,7 +763,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* L2 / AVTP have an Ethernet header prefix; IP mode does not. */
+    /* L2 / AVTP have an Ethernet header prefix; IP and RTP do not
+     * (kernel adds IP/UDP when sendto'ing on a DGRAM socket). */
     if (transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) {
         struct ether_header *eth = (struct ether_header *)frame;
         memcpy(eth->ether_dhost, dest_mac, 6);
@@ -708,9 +776,13 @@ int main(int argc, char **argv)
         (frame + sizeof(struct ether_header));
     struct avtp_aaf_hdr *avtp_hdr_p = (struct avtp_aaf_hdr *)
         (frame + sizeof(struct ether_header));
+    struct rtp_hdr      *rtp_hdr_p  = (struct rtp_hdr *)
+        (frame + sizeof(struct ether_header));
     uint8_t *payload = frame + sizeof(struct ether_header) + proto_hdr_len;
-    /* IP mode skips the 14-byte Ethernet-header prefix on the wire. */
-    const size_t tx_offset = (transport == TRANSPORT_IP) ? sizeof(struct ether_header) : 0;
+    /* IP and RTP skip the 14-byte Ethernet-header prefix on the wire. */
+    const size_t tx_offset =
+        (transport == TRANSPORT_IP || transport == TRANSPORT_RTP)
+            ? sizeof(struct ether_header) : 0;
 
     /* AVTP stream_id convention: source MAC in high 6 bytes, our 16-bit
      * STREAM_ID in the low 2. Milan AVDECC normally allocates these via
@@ -725,27 +797,56 @@ int main(int argc, char **argv)
         | (uint64_t)STREAM_ID;
     uint8_t avtp_seq8 = 0;
 
+    /* RTP/AES67 state: SSRC is a stable 32-bit random-ish identifier.
+     * Mint it from the low 4 bytes of our MAC XOR with our STREAM_ID so
+     * it survives talker restarts with the same config. Controllers use
+     * SSRC to dedupe sources on the same (mcast, port) tuple. */
+    const uint32_t rtp_ssrc =
+        (((uint32_t)src_mac[2] << 24) |
+         ((uint32_t)src_mac[3] << 16) |
+         ((uint32_t)src_mac[4] <<  8) |
+          (uint32_t)src_mac[5])
+        ^ (uint32_t)STREAM_ID;
+    /* RTP timestamp advances by samples-per-packet in the stream's media
+     * clock ticks. Starts at a random-ish value to avoid collisions and
+     * to match AES67's expectation that timestamps reflect media-clock
+     * state rather than wall-clock zero. We derive from a local monotonic
+     * timestamp at start; once PTPv2 lands (M9 Phase C) this becomes the
+     * PTP-disciplined timestamp. */
+    struct timespec rtp_start_ts;
+    clock_gettime(CLOCK_MONOTONIC, &rtp_start_ts);
+    uint32_t rtp_timestamp = (uint32_t)(
+        (uint64_t)rtp_start_ts.tv_sec * (uint64_t)rate_hz +
+        ((uint64_t)rtp_start_ts.tv_nsec * (uint64_t)rate_hz) / 1000000000ull);
+    uint16_t rtp_seq16 = 0;
+
     /* Predicted fragment count for the nominal microframe. K=1 is the
      * common case; larger values report the split that will be applied
-     * to DSD512+ and high-rate multichannel PCM. AVTP reports "no-frag". */
+     * to DSD512+ and high-rate multichannel PCM. AVTP/RTP report 0
+     * (they never fragment). */
     int nominal_K = 1;
-    if (transport != TRANSPORT_AVTP && max_frag_pc > 0) {
+    if (transport != TRANSPORT_AVTP && transport != TRANSPORT_RTP &&
+        max_frag_pc > 0) {
         int nominal_pc = (int)(nominal_spm + 0.5);
         if (nominal_pc < 1) nominal_pc = 1;
         nominal_K = (nominal_pc + max_frag_pc - 1) / max_frag_pc;
     }
+
+    const double pps = 1e9 / (double)packet_period_ns;
+    const int feedback_enabled_for_transport =
+        (transport != TRANSPORT_RTP);
 
     if (transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) {
         const char *label = (transport == TRANSPORT_AVTP) ? "avtp" : "l2";
         fprintf(stderr,
                 "talker: transport=%s iface=%s ifindex=%d\n"
                 "        src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x\n"
-                "        fmt=%s ch=%d rate=%d pps=8000 nominal_spp=%.2f max_frag_pc=%d frags/microframe=%d max_frame=%zuB feedback=on\n",
+                "        fmt=%s ch=%d rate=%d pps=%.0f nominal_spp=%.2f max_frag_pc=%d frags/packet=%d max_frame=%zuB feedback=on\n",
                 label, iface, ifindex,
                 src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
                 dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3], dest_mac[4], dest_mac[5],
                 transport == TRANSPORT_AVTP ? "AAF_INT24(BE)" : format_s,
-                channels, rate_hz, nominal_spm,
+                channels, rate_hz, pps, nominal_spm,
                 transport == TRANSPORT_AVTP ? 0 : max_frag_pc,
                 nominal_K, max_frame);
     } else {
@@ -759,17 +860,21 @@ int main(int argc, char **argv)
                       &((struct sockaddr_in6 *)&dest_ss)->sin6_addr,
                       ip_str, sizeof(ip_str));
         }
+        const char *label = (transport == TRANSPORT_RTP) ? "rtp" : "ip";
         fprintf(stderr,
-                "talker: transport=ip dest=%s:%d family=%s %s\n"
+                "talker: transport=%s dest=%s:%d family=%s %s\n"
                 "        iface=%s ifindex=%d\n"
-                "        fmt=%s ch=%d rate=%d pps=8000 nominal_spp=%.2f max_frag_pc=%d frags/microframe=%d max_payload=%zuB feedback=on\n",
-                ip_str, udp_port,
+                "        fmt=%s ch=%d rate=%d pps=%.0f nominal_spp=%.2f max_frag_pc=%d frags/packet=%d max_payload=%zuB feedback=%s%s\n",
+                label, ip_str, udp_port,
                 dest_family == AF_INET ? "v4" : "v6",
                 dest_is_multicast ? "multicast" : "unicast",
                 iface, ifindex,
-                format_s, channels, rate_hz,
-                nominal_spm, max_frag_pc, nominal_K,
-                max_frame - sizeof(struct ether_header));
+                transport == TRANSPORT_RTP ? "L24(BE)" : format_s,
+                channels, rate_hz,
+                pps, nominal_spm, max_frag_pc, nominal_K,
+                max_frame - sizeof(struct ether_header),
+                feedback_enabled_for_transport ? "on" : "off",
+                transport == TRANSPORT_RTP ? " (AES67 relies on PTPv2)" : "");
     }
 
     /* Mode C talker state: current target samples-per-microframe, fractional
@@ -797,7 +902,11 @@ int main(int argc, char **argv)
     uint64_t fb_rx = 0, fb_ignored = 0;
 
     while (!g_stop) {
-        /* 1. Drain any pending feedback frames (non-blocking). */
+        /* 1. Drain any pending feedback frames (non-blocking). RTP/AES67
+         * doesn't use AOEther's UAC2-shape feedback (AES67 devices rely
+         * on PTPv2 for clocking), so we skip the drain and the
+         * rate-recompute for that transport. */
+        if (transport == TRANSPORT_RTP) goto skip_feedback;
         for (;;) {
             uint8_t fb_buf[128];
             struct sockaddr_storage src_addr;
@@ -828,7 +937,7 @@ int main(int argc, char **argv)
 
             uint32_t q = ntohl(fh->value);
             double spms = (double)q / 65536.0;
-            double new_spm = spms / (double)MICROFRAMES_PER_MS;
+            double new_spm = spms * ((double)packet_period_ns / 1e6);
 
             double max_spm = nominal_spm * (1.0 + RATE_CLAMP_PPM * 1e-6);
             double min_spm = nominal_spm * (1.0 - RATE_CLAMP_PPM * 1e-6);
@@ -912,11 +1021,13 @@ int main(int argc, char **argv)
         }
         if (have_any) {
             double spms = (double)min_q / 65536.0;
-            samples_per_microframe = spms / (double)MICROFRAMES_PER_MS;
+            samples_per_microframe = spms * ((double)packet_period_ns / 1e6);
         } else {
             samples_per_microframe = nominal_spm;
         }
 
+skip_feedback:
+        (void)0;   /* null statement so a C compiler accepts the label. */
         /* 3. Wait for timer tick(s). */
         uint64_t ticks;
         ssize_t r = read(tfd, &ticks, sizeof(ticks));
@@ -952,11 +1063,11 @@ int main(int argc, char **argv)
                 break;
             }
 
-            /* Fragment count and per-fragment pc distribution. AVTP is
-             * always K=1; AOE uses max_frag_pc computed at startup. */
+            /* Fragment count and per-fragment pc distribution. AVTP / RTP
+             * are always K=1; AOE uses max_frag_pc computed at startup. */
             int K;
             int base, rem;
-            if (transport == TRANSPORT_AVTP) {
+            if (transport == TRANSPORT_AVTP || transport == TRANSPORT_RTP) {
                 K = 1;
                 base = pc;
                 rem  = 0;
@@ -968,12 +1079,11 @@ int main(int argc, char **argv)
             }
 
             /* If AVDECC bound us this tick, steer the destination for all
-             * fragments of this microframe together. Taking the snapshot
-             * once per microframe (not per fragment) keeps a group's
-             * fragments on the same peer even if an unbind races a send. */
+             * fragments of this microframe together. AVDECC is an L2 / AVTP
+             * thing; IP and RTP modes keep their static --dest-ip. */
             int steer_avdecc = 0;
             uint8_t avdecc_mac_snap[6];
-            if (transport != TRANSPORT_IP) {
+            if (transport != TRANSPORT_IP && transport != TRANSPORT_RTP) {
                 pthread_mutex_lock(&g_avdecc_mu);
                 if (g_avdecc_dest_valid) {
                     memcpy(avdecc_mac_snap, g_avdecc_dest_mac, 6);
@@ -1014,6 +1124,19 @@ int main(int argc, char **argv)
                                        (uint16_t)channels,
                                        24,                   /* bit_depth */
                                        (uint16_t)frag_payload_bytes);
+                } else if (transport == TRANSPORT_RTP) {
+                    /* AES67 L24 samples are big-endian on the wire; ALSA
+                     * is LE. Swap in place, same as AVTP. */
+                    rtp_swap24_inplace(payload,
+                                       (size_t)frag_pc * (size_t)channels);
+                    rtp_hdr_build(rtp_hdr_p,
+                                  RTP_DEFAULT_PT_L24,
+                                  rtp_seq16++,
+                                  rtp_timestamp,
+                                  rtp_ssrc);
+                    /* Advance the media clock by one packet's samples for
+                     * the next emission. */
+                    rtp_timestamp += (uint32_t)frag_pc;
                 } else {
                     const uint8_t flags =
                         (k == K - 1) ? AOE_FLAG_LAST_IN_GROUP : 0;
@@ -1026,7 +1149,8 @@ int main(int argc, char **argv)
                     sizeof(struct ether_header) + proto_hdr_len + frag_payload_bytes;
 
                 ssize_t sent;
-                if (transport == TRANSPORT_IP) {
+                if (transport == TRANSPORT_IP ||
+                    transport == TRANSPORT_RTP) {
                     sent = sendto(data_sock, frame + tx_offset,
                                   frame_len_total - tx_offset, 0,
                                   (struct sockaddr *)&dest_ss, dest_ss_len);

@@ -310,6 +310,51 @@ AOEther's Mode C clock-discipline FEEDBACK frames continue to flow on EtherType 
 
 Milan typically uses multicast destination MACs in the AVTP-reserved range `91:E0:F0:00:00:00/40`. AOEther's talker accepts any unicast or multicast MAC via `--dest-mac`; it does not register addresses with a switch via MSRP (that's Avnu/Milan controller territory and arrives no earlier than M7 alongside AVDECC).
 
+## Mode 4 (RTP / AES67)
+
+When `--transport rtp` is selected (M9 Phase A), PCM streams are emitted as plain RFC 3550 RTP over UDP with an RFC 3190 L24 payload, matching the AES67 data-plane profile. There is no AOEther-specific framing on top — a strict AES67 listener sees a standard RTP audio stream.
+
+### RTP header (12 bytes)
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|V=2|P|X|  CC   |M|     PT      |       sequence number         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                           timestamp                           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                             SSRC                              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+AOEther's emitter sets V=2, P=0, X=0, CC=0, M=0, PT=96 (dynamic, default). SSRC is a stable 32-bit identifier derived from the talker's MAC XOR'd with the stream ID — survives restarts at the same iface. RTP timestamp advances by `payload_count` samples per packet at the stream's sample rate.
+
+### Payload
+
+L24: signed 24-bit PCM, big-endian on the wire, channel-interleaved. Total payload bytes = `channels × payload_count × 3`. The talker byte-swaps on egress from ALSA's `S24_3LE`; the receiver byte-swaps on ingress. This is the same direction and mechanism as Mode 2 AAF.
+
+L16 is wire-format-supported (helpers provided in `common/rtp.c`) but not yet exposed as a `--format` option — AOEther's PCM lock is s24 today.
+
+### Packet cadence (PTIME)
+
+| PTIME | Packets/second | AES67 profile | AOEther `--ptime` |
+|---|---|---|---|
+| 1 ms | 1000 | default | 1000 (default for Mode 4) |
+| 125 µs | 8000 | low-latency | 125 |
+
+Mode 4 does **not** use fragmentation. Configs whose per-packet payload would exceed 1500-byte MTU are rejected at talker startup. The fragmentation path is AoE-only (Modes 1/3).
+
+### Addressing
+
+AES67 typically uses IPv4 multicast in `239.X.X.X` on UDP port 5004. AOEther accepts any unicast or multicast IPv4/IPv6 destination via `--dest-ip`. Receivers optionally join a group via `--group`; for unicast deployments `--group` is omitted and receivers bind to the UDP port.
+
+### What is not in Mode 4 today
+
+- **SDP / SAP** — M9 Phase B. Without SDP, the talker and receiver must agree on format / channels / rate / destination out of band. No dynamic payload-type negotiation.
+- **PTPv2 timestamp discipline** — M9 Phase C. The RTP timestamp advances from a local monotonic clock; it is not PTP-locked. Strict AES67 listeners may tolerate this or may not, depending on their sync policy.
+- **Mode C clock feedback** — disabled entirely under `--transport rtp`. AES67 expects PTP, not UAC2-style feedback. Receivers do not emit 0x88B6 frames when running in RTP mode.
+
 ## Control frames
 
 Control frames carry out-of-band signaling between endpoints. They share the Ethernet wire with data frames but use a distinct EtherType (`0x88B6`) and a distinct header magic byte (`0xA1` vs. `0xA0`), so the two classes are trivially separable by any receiver. Implementations that do not understand a given control frame type MUST discard it without affecting the audio path.
