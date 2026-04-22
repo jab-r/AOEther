@@ -3,6 +3,8 @@
 #include "avtp.h"
 #include "packet.h"
 
+#include <pthread.h>
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -107,6 +109,31 @@ static int parse_format(const char *s, struct stream_format *f)
 }
 
 static volatile sig_atomic_t g_stop;
+
+/* AVDECC bind state. An AVDECC controller (Hive) issuing CONNECT_TX on
+ * this talker fires on_bind from la_avdecc's executor thread; the
+ * main send loop picks up the announced destination MAC on each
+ * packet and overrides the CLI --dest-mac until DISCONNECT_TX arrives. */
+static pthread_mutex_t g_avdecc_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t         g_avdecc_dest_mac[6];
+static int             g_avdecc_dest_valid;
+
+static void avdecc_on_bind(const uint8_t mac[6], uint64_t stream_id, void *user)
+{
+    (void)stream_id; (void)user;
+    pthread_mutex_lock(&g_avdecc_mu);
+    memcpy(g_avdecc_dest_mac, mac, 6);
+    g_avdecc_dest_valid = 1;
+    pthread_mutex_unlock(&g_avdecc_mu);
+}
+
+static void avdecc_on_unbind(void *user)
+{
+    (void)user;
+    pthread_mutex_lock(&g_avdecc_mu);
+    g_avdecc_dest_valid = 0;
+    pthread_mutex_unlock(&g_avdecc_mu);
+}
 
 static void on_signal(int sig)
 {
@@ -258,8 +285,11 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return 2;
     }
-    if ((transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) && !dest_mac_s) {
-        fprintf(stderr, "talker: --dest-mac required for --transport %s\n",
+    if ((transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) &&
+        !dest_mac_s && !avdecc_enabled) {
+        fprintf(stderr,
+                "talker: --dest-mac required for --transport %s "
+                "(or use --avdecc and let Hive CONNECT_TX bind at runtime)\n",
                 transport == TRANSPORT_L2 ? "l2" : "avtp");
         return 2;
     }
@@ -348,10 +378,16 @@ int main(int argc, char **argv)
     memset(&dest_ss, 0, sizeof(dest_ss));
 
     if (transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) {
-        if (parse_mac(dest_mac_s, dest_mac) < 0) {
-            fprintf(stderr, "talker: bad --dest-mac\n");
-            return 2;
+        if (dest_mac_s) {
+            if (parse_mac(dest_mac_s, dest_mac) < 0) {
+                fprintf(stderr, "talker: bad --dest-mac\n");
+                return 2;
+            }
         }
+        /* else: --avdecc is set; dest_mac stays 00:00:00:00:00:00 until
+         * Hive CONNECT_TX binds us via the avdecc_on_bind callback.
+         * The per-packet egress path swaps in the ACMP MAC before each
+         * send, so the zero placeholder never reaches the wire. */
     } else {
         struct in_addr v4;
         struct in6_addr v6;
@@ -567,7 +603,7 @@ int main(int argc, char **argv)
             .rate_hz     = rate_hz,
             .format_name = fmt.name,
         };
-        avdecc = aoether_avdecc_open(&cfg, NULL, NULL, NULL);
+        avdecc = aoether_avdecc_open(&cfg, avdecc_on_bind, avdecc_on_unbind, NULL);
         if (!avdecc) {
             fprintf(stderr,
                     "talker: AVDECC entity open failed (continuing without --avdecc)\n");
@@ -833,6 +869,19 @@ int main(int argc, char **argv)
                 aoe_hdr_build(aoe_hdr_p, STREAM_ID, seq, 0,
                               (uint8_t)channels, format_code, (uint8_t)pc,
                               AOE_FLAG_LAST_IN_GROUP);
+            }
+
+            /* If Hive has bound us via ACMP CONNECT_TX, override the CLI
+             * --dest-mac on egress. AVDECC is L2-only; the IP path keeps
+             * its static --dest-ip. */
+            if (transport != TRANSPORT_IP) {
+                pthread_mutex_lock(&g_avdecc_mu);
+                if (g_avdecc_dest_valid) {
+                    struct ether_header *eth = (struct ether_header *)frame;
+                    memcpy(eth->ether_dhost, g_avdecc_dest_mac, 6);
+                    memcpy(data_to_ll.sll_addr, g_avdecc_dest_mac, 6);
+                }
+                pthread_mutex_unlock(&g_avdecc_mu);
             }
 
             ssize_t sent;

@@ -4,7 +4,15 @@
 
 Pairs with [`docs/recipe-milan.md`](recipe-milan.md), which covers the AAF data path — this recipe is about the control plane.
 
-**Step 3 status:** full descriptor tree.  The entity now advertises one `STREAM_INPUT` (listener) or `STREAM_OUTPUT` (talker) at 48 kHz / 24-bit / stereo AAF, parented under `AUDIO_UNIT` / `CLOCK_DOMAIN` / `CLOCK_SOURCE` with an `AVB_INTERFACE` carrying the iface's real MAC.  Hive renders a complete entity and the Connect button is enabled.  Clicking Connect updates la_avdecc's internal stream state, which is visible in Hive's inspector — but AOEther's data path still uses CLI `--dest-mac` / learned-first-frame until step 4 wires ACMP state changes through to the receiver's talker-MAC learning and the talker's dest-MAC override.
+**Step 5 status:** capability matrix.  The stream advertises all three AAF-compatible rates — 48 kHz / 96 kHz / 192 kHz — at the `--channels` count, 24-bit.  Hive's Stream Format picker shows the full set; `currentSamplingRate` mirrors `--rate` when it matches (else 48 kHz is shown in the descriptor while CLI governs the data path).
+
+**Step 4 behavior (still applies):** ACMP drives the data path.  Hive's Connect button steers AOEther end-to-end:
+
+- The talker's ACMP observer watches for `CONNECT_TX_COMMAND` targeting its EID, extracts the listener's stream destination MAC, and the per-packet egress path uses that MAC instead of `--dest-mac` until `DISCONNECT_TX` arrives.  Start the talker *without* `--dest-mac` if `--avdecc` is set — it will be idle (emitting to `00:00:00:00:00:00`, which switches drop) until Hive binds it.
+- The listener's observer watches for `CONNECT_RX_RESPONSE`, extracts the talker's stream destination MAC, and prefers that MAC over the first-frame-learns fallback.  Strays from other talkers on the same segment no longer hijack the stream.
+- `DISCONNECT_TX` / `DISCONNECT_RX` unbind; the next bind fires `on_bind` again.
+
+The C-side glue uses a small mutex-guarded struct so la_avdecc's worker thread can update peer MAC safely while the 8000-pps main loop reads it.
 
 ## One-time setup
 
@@ -49,7 +57,13 @@ Banner includes:
 
 ```
 avdecc: entity up (role=listener name="living-room-dac" iface=eth0 EID=0x....)
-        [Phase B step 3 — stream visible in Hive; ACMP→data-path is step 4]
+        [Phase B step 5 — {48k,96k,192k} x 2-ch AAF advertised]
+```
+
+When Hive binds the stream you'll see the ACMP trace in the entity's log:
+
+```
+avdecc: ACMP CONNECT_RX_RESPONSE → bind peer=91:e0:f0:00:01:00 stream_id=0x0001...
 ```
 
 ### Talker side (talker entity)
@@ -89,4 +103,4 @@ Run both on the same receiver if you want — they answer different clients on d
 
 **Entity not visible in Hive** — both machines must be on the same L2 segment (AVDECC is not routed through IP gateways); no firewall may drop EtherType `0x22F0` or `0x88B5`; the receiver/talker must be running as root (CAP_NET_RAW) so PCap can open the interface. `enableEntityAdvertising failed (EntityID already in use?)` in the log means another entity on the network is using the same EID — currently AOEther synthesizes EIDs from MAC + role, so two AOEther listeners on the same box collide; use two different interfaces or run only one for now.
 
-**Connect succeeds in Hive but no audio flows** — expected through step 3.  Step 3 delivers the descriptor tree and protocol-level Connect; Hive will mark the stream as `Connected` and its inspector will show the bound talker/listener.  Step 4 wires that state through to the data path so the receiver learns the talker's MAC from ACMP and the talker emits to the listener's stream-destination MAC.  Until step 4 lands, drive the data path manually: note the peer's MAC from Hive's entity details pane, then pass `--dest-mac` on the talker and let the receiver learn the talker from the first data frame as before.
+**Connect succeeds in Hive but no audio flows** — check that both sides logged an `avdecc: ACMP ... → bind` line.  If the receiver sees the bind but no data frames arrive, the talker might be sending to a MAC the switch can't reach (e.g., a Milan stream-destination multicast on a switch that drops unknown multicasts); try a different stream-destination MAC from Hive's stream-format dialog.  If the talker binds but gets no reply frames, confirm the listener's CONNECT_RX_RESPONSE reached the talker (Wireshark filter `eth.type == 0x22f0 && acmp.message_type == 0x03`).

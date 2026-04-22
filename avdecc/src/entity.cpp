@@ -46,7 +46,10 @@
 #include <la/avdecc/internals/entityEnums.hpp>
 #include <la/avdecc/internals/entityModelTree.hpp>
 #include <la/avdecc/internals/entityModelTypes.hpp>
+#include <la/avdecc/internals/protocolAcmpdu.hpp>
+#include <la/avdecc/internals/protocolDefines.hpp>
 #include <la/avdecc/internals/protocolInterface.hpp>
+#include <la/avdecc/internals/streamFormatInfo.hpp>
 #include <la/avdecc/internals/uniqueIdentifier.hpp>
 
 /* Vendor IDs for the EntityModelID.  AOEther does not yet own an IEEE
@@ -96,6 +99,36 @@ static void setFixedString(model::AvdeccFixedString &dst, const std::string &s)
     dst = model::AvdeccFixedString{ s };
 }
 
+struct AoetherEntity;
+
+/* Observer on the ProtocolInterface that watches ACMP traffic and fires
+ * on_bind / on_unbind when our entity becomes the target of a Connect or
+ * Disconnect command.  Runs on la_avdecc's executor thread — callbacks
+ * invoked here must be reentrancy-safe relative to the C main loops
+ * that consume them.  The C-side wrappers in receiver.c / talker.c use
+ * a small mutex-guarded struct for exactly that. */
+class AcmpObserver final : public ProtocolInterface::Observer {
+public:
+    AcmpObserver(AoetherEntity *parent, aoether_avdecc_role role, UniqueIdentifier ourEID) noexcept
+        : _parent{ parent }, _role{ role }, _ourEID{ ourEID } {}
+
+    void onAcmpCommand(ProtocolInterface* const, la::avdecc::protocol::Acmpdu const &pdu) noexcept override
+    {
+        handle(pdu);
+    }
+    void onAcmpResponse(ProtocolInterface* const, la::avdecc::protocol::Acmpdu const &pdu) noexcept override
+    {
+        handle(pdu);
+    }
+
+private:
+    void handle(la::avdecc::protocol::Acmpdu const &pdu) noexcept;
+
+    AoetherEntity          *_parent;
+    aoether_avdecc_role     _role;
+    UniqueIdentifier        _ourEID;
+};
+
 struct AoetherEntity {
     aoether_avdecc_bind_cb   on_bind   { nullptr };
     aoether_avdecc_unbind_cb on_unbind { nullptr };
@@ -104,7 +137,66 @@ struct AoetherEntity {
     EndStation::UniquePointer endStation { nullptr, nullptr };
     AggregateEntity          *aggEntity  { nullptr }; // owned by endStation
     model::EntityTree         entityTree {};
+
+    std::unique_ptr<AcmpObserver> observer;
+    bool                          bound { false };
 };
+
+void AcmpObserver::handle(la::avdecc::protocol::Acmpdu const &pdu) noexcept
+{
+    using Msg = la::avdecc::protocol::AcmpMessageType;
+    const Msg msg = pdu.getMessageType();
+
+    /* Does this PDU pertain to us?  For listeners we watch RX-side
+     * messages whose listener_entity_id matches our EID; for talkers
+     * we watch TX-side messages whose talker_entity_id matches us. */
+    const UniqueIdentifier tgt = (_role == AOETHER_AVDECC_LISTENER)
+                                 ? pdu.getListenerEntityID()
+                                 : pdu.getTalkerEntityID();
+    if (tgt != _ourEID) return;
+
+    const bool isListenerConnect    = (_role == AOETHER_AVDECC_LISTENER) &&
+                                      (msg == Msg::ConnectRxResponse);
+    const bool isListenerDisconnect = (_role == AOETHER_AVDECC_LISTENER) &&
+                                      (msg == Msg::DisconnectRxResponse);
+    const bool isTalkerConnect      = (_role == AOETHER_AVDECC_TALKER) &&
+                                      (msg == Msg::ConnectTxCommand);
+    const bool isTalkerDisconnect   = (_role == AOETHER_AVDECC_TALKER) &&
+                                      (msg == Msg::DisconnectTxCommand);
+
+    if (isListenerConnect || isTalkerConnect) {
+        const auto mac = pdu.getStreamDestAddress();
+        std::uint64_t streamID = 0;
+        if (_role == AOETHER_AVDECC_LISTENER) {
+            /* Listener: identifying a specific talker by its EID +
+             * unique ID is more precise than the multicast MAC. For
+             * now we surface the dest MAC (what AOEther's listener
+             * actually filters on) and pack the talker's stream
+             * identifier into the 64-bit stream_id field. */
+            streamID = (static_cast<std::uint64_t>(pdu.getTalkerEntityID().getValue()) & 0xFFFFFFFFFFFFull) |
+                       (static_cast<std::uint64_t>(pdu.getTalkerUniqueID()) << 48);
+        } else {
+            streamID = (static_cast<std::uint64_t>(pdu.getListenerEntityID().getValue()) & 0xFFFFFFFFFFFFull) |
+                       (static_cast<std::uint64_t>(pdu.getListenerUniqueID()) << 48);
+        }
+
+        uint8_t peerMac[6];
+        std::memcpy(peerMac, mac.data(), 6);
+
+        std::fprintf(stderr,
+                     "avdecc: ACMP %s → bind peer=%02x:%02x:%02x:%02x:%02x:%02x stream_id=0x%016llx\n",
+                     isListenerConnect ? "CONNECT_RX_RESPONSE" : "CONNECT_TX_COMMAND",
+                     peerMac[0], peerMac[1], peerMac[2], peerMac[3], peerMac[4], peerMac[5],
+                     static_cast<unsigned long long>(streamID));
+
+        _parent->bound = true;
+        if (_parent->on_bind) _parent->on_bind(peerMac, streamID, _parent->user);
+    } else if ((isListenerDisconnect || isTalkerDisconnect) && _parent->bound) {
+        std::fprintf(stderr, "avdecc: ACMP DISCONNECT → unbind\n");
+        _parent->bound = false;
+        if (_parent->on_unbind) _parent->on_unbind(_parent->user);
+    }
+}
 
 /* Build a full EntityTree Hive can render + offer Connect on.
  *
@@ -133,18 +225,51 @@ static void buildEntityTree(model::EntityTree &tree,
     conf.dynamicModel.objectName            = AvdeccFixedString{ "AOEther Stream" };
     conf.dynamicModel.isActiveConfiguration = true;
 
-    const SamplingRate sr48k{ 48000u };
-    const std::uint16_t streamChannels = 2;
+    /* Build the supported-format matrix.  AAF rides an 8 kHz packet
+     * cadence on Milan, so samples-per-frame = rate/8000 must be an
+     * integer — the 48 kHz family (48/96/192 kHz) is the usable subset
+     * for advertised formats.  The 44.1 kHz family still works via CLI
+     * pinning and mDNS discovery; it just isn't offered to AVDECC
+     * controllers.  Channel count follows --channels exactly; we do
+     * not offer multiple channel configs in one stream (that needs
+     * the AAF isUpToChannelsCount trick plus AUDIO_MAP remapping,
+     * which is its own lift). */
+    const std::uint16_t streamChannels = static_cast<std::uint16_t>(cfg.channels > 0 ? cfg.channels : 2);
 
-    /* AAF-PCM 48k/24-bit/2ch/6-samples-per-frame. samplesPerFrame=6
-     * matches AAF's SDT 8 kHz packet cadence at 48 kHz (48000/8000=6). */
+    static constexpr std::uint32_t kAafRatesHz[] = { 48000u, 96000u, 192000u };
+    StreamFormats streamFormatSet;
+    for (std::uint32_t rate : kAafRatesHz) {
+        const SamplingRate sr{ rate };
+        const std::uint16_t spf = static_cast<std::uint16_t>(rate / 8000u);
+        streamFormatSet.insert(
+            StreamFormatInfo::buildFormat_AAF(streamChannels,
+                                              /*isUpToChannelsCount=*/false,
+                                              sr,
+                                              StreamFormatInfo::SampleFormat::Int24,
+                                              /*sampleBitDepth=*/24,
+                                              /*samplesPerFrame=*/spf));
+    }
+
+    /* Pick the current running format to mirror CLI state.  If --rate
+     * doesn't fall in the AAF-compatible set, use 48 kHz so the
+     * descriptor is at least self-consistent; the data path's own
+     * rate is governed by --rate regardless. */
+    std::uint32_t currentRate = static_cast<std::uint32_t>(cfg.rate_hz);
+    if (currentRate != 48000u && currentRate != 96000u && currentRate != 192000u) {
+        currentRate = 48000u;
+    }
+    const SamplingRate currentSr{ currentRate };
     const StreamFormat aafStreamFormat =
         StreamFormatInfo::buildFormat_AAF(streamChannels,
                                           /*isUpToChannelsCount=*/false,
-                                          sr48k,
-                                          SampleFormat::Int24,
+                                          currentSr,
+                                          StreamFormatInfo::SampleFormat::Int24,
                                           /*sampleBitDepth=*/24,
-                                          /*samplesPerFrame=*/6);
+                                          static_cast<std::uint16_t>(currentRate / 8000u));
+
+    /* AUDIO_UNIT's samplingRates reflect the same set (48/96/192). */
+    SamplingRates samplingRateSet;
+    for (std::uint32_t rate : kAafRatesHz) samplingRateSet.insert(SamplingRate{ rate });
 
     /* -- AVB_INTERFACE[0] ------------------------------------------------- */
     AvbInterfaceNodeModels avb{};
@@ -176,15 +301,15 @@ static void buildEntityTree(model::EntityTree &tree,
 
     /* -- AUDIO_UNIT[0] ---------------------------------------------------- */
     AudioUnitTree au{};
-    au.audioUnitModels.staticModel.localizedDescription = LocalizedStringReference{};
-    au.audioUnitModels.staticModel.clockDomainIndex     = ClockDomainIndex{ 0 };
-    au.audioUnitModels.staticModel.samplingRates        = SamplingRates{ sr48k };
-    au.audioUnitModels.dynamicModel.objectName          = AvdeccFixedString{ "Audio Unit" };
-    au.audioUnitModels.dynamicModel.currentSamplingRate = sr48k;
+    au.staticModel.localizedDescription = LocalizedStringReference{};
+    au.staticModel.clockDomainIndex     = ClockDomainIndex{ 0 };
+    au.staticModel.samplingRates        = samplingRateSet;
+    au.dynamicModel.objectName          = AvdeccFixedString{ "Audio Unit" };
+    au.dynamicModel.currentSamplingRate = currentSr;
     if (cfg.role == AOETHER_AVDECC_LISTENER) {
-        au.audioUnitModels.staticModel.numberOfStreamInputPorts = 1;
+        au.staticModel.numberOfStreamInputPorts = 1;
     } else {
-        au.audioUnitModels.staticModel.numberOfStreamOutputPorts = 1;
+        au.staticModel.numberOfStreamOutputPorts = 1;
     }
     /* One STREAM_PORT_INPUT or STREAM_PORT_OUTPUT with a single
      * AUDIO_CLUSTER (the stereo pair).  No AUDIO_MAP entries — Hive
@@ -216,7 +341,7 @@ static void buildEntityTree(model::EntityTree &tree,
     sm.streamFlags          = la::avdecc::entity::StreamFlags{};
     sm.avbInterfaceIndex    = AvbInterfaceIndex{ 0 };
     sm.bufferLength         = 0;
-    sm.formats              = StreamFormats{ aafStreamFormat };
+    sm.formats              = streamFormatSet;
     if (cfg.role == AOETHER_AVDECC_LISTENER) {
         StreamInputNodeModels s{};
         s.staticModel              = std::move(sm);
@@ -234,25 +359,47 @@ static void buildEntityTree(model::EntityTree &tree,
     tree.configurationTrees[AOETHER_CONF_INDEX] = std::move(conf);
 }
 
-/* Read the iface MAC via SIOCGIFHWADDR and patch it into the
- * AVB_INTERFACE descriptor's dynamic model. la_avdecc also fills this
- * in internally from the ProtocolInterface for ADPDU emission, but
- * the AEM descriptor needs a matching value so Hive's interface pane
- * renders the expected MAC. */
-#include <sys/ioctl.h>
+/* Read the iface MAC and patch it into the AVB_INTERFACE descriptor's
+ * dynamic model.  la_avdecc fills this in internally from the
+ * ProtocolInterface for ADPDU emission, but the AEM descriptor needs
+ * a matching value so Hive's interface pane renders the expected MAC.
+ *
+ * getifaddrs(3) is portable across Linux and macOS; Linux returns the
+ * MAC in an AF_PACKET sockaddr_ll, macOS / BSD in an AF_LINK
+ * sockaddr_dl.  We handle both so the build works on dev workstations
+ * without Linux-specific ioctl headers. */
+#include <ifaddrs.h>
 #include <sys/socket.h>
 #include <net/if.h>
+#if defined(__linux__)
+#  include <netpacket/packet.h>
+#else
+#  include <net/if_dl.h>
+#endif
 static bool readIfaceMac(const char *iface, std::uint8_t mac[6])
 {
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) return false;
-    struct ifreq ifr{};
-    std::strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
-    const bool ok = ioctl(s, SIOCGIFHWADDR, &ifr) == 0;
-    ::close(s);
-    if (!ok) return false;
-    std::memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
-    return true;
+    struct ifaddrs *head = nullptr;
+    if (getifaddrs(&head) != 0) return false;
+    bool ok = false;
+    for (auto *p = head; p; p = p->ifa_next) {
+        if (!p->ifa_name || std::strcmp(p->ifa_name, iface) != 0) continue;
+        if (!p->ifa_addr) continue;
+#if defined(__linux__)
+        if (p->ifa_addr->sa_family != AF_PACKET) continue;
+        auto *sll = reinterpret_cast<struct sockaddr_ll *>(p->ifa_addr);
+        if (sll->sll_halen != 6) continue;
+        std::memcpy(mac, sll->sll_addr, 6);
+#else
+        if (p->ifa_addr->sa_family != AF_LINK) continue;
+        auto *sdl = reinterpret_cast<struct sockaddr_dl *>(p->ifa_addr);
+        if (sdl->sdl_alen != 6) continue;
+        std::memcpy(mac, LLADDR(sdl), 6);
+#endif
+        ok = true;
+        break;
+    }
+    freeifaddrs(head);
+    return ok;
 }
 
 static std::string defaultEntityName(const aoether_avdecc_config &cfg)
@@ -356,13 +503,26 @@ extern "C" void *aoether_avdecc_cpp_open(const struct aoether_avdecc_config *cfg
         /* Not fatal — entity exists, just not advertising. */
     }
 
+    /* Register our ACMP observer on the ProtocolInterface so Hive's
+     * Connect / Disconnect actions reach the AOEther data path. */
+    if (auto *pi = e->endStation->getProtocolInterface()) {
+        e->observer = std::make_unique<AcmpObserver>(e, cfg->role, ci.entityID);
+        try {
+            pi->registerObserver(e->observer.get());
+        } catch (const std::exception &ex) {
+            std::fprintf(stderr, "avdecc: registerObserver failed: %s\n", ex.what());
+            e->observer.reset();
+        }
+    }
+
     std::fprintf(stderr,
                  "avdecc: entity up (role=%s name=\"%s\" iface=%s EID=0x%016llx)\n"
-                 "        [Phase B step 3 — stream visible in Hive; ACMP→data-path is step 4]\n",
+                 "        [Phase B step 5 — {48k,96k,192k} x %d-ch AAF advertised]\n",
                  cfg->role == AOETHER_AVDECC_LISTENER ? "listener" : "talker",
                  name.c_str(),
                  cfg->iface,
-                 static_cast<unsigned long long>(ci.entityID.getValue()));
+                 static_cast<unsigned long long>(ci.entityID.getValue()),
+                 cfg->channels > 0 ? cfg->channels : 2);
     return e;
 }
 
@@ -370,6 +530,14 @@ extern "C" void aoether_avdecc_cpp_close(void *impl)
 {
     if (!impl) return;
     auto *e = static_cast<AoetherEntity *>(impl);
+    if (e->observer && e->endStation) {
+        if (auto *pi = e->endStation->getProtocolInterface()) {
+            try {
+                pi->unregisterObserver(e->observer.get());
+            } catch (...) { /* best-effort on shutdown */ }
+        }
+    }
+    e->observer.reset();
     if (e->aggEntity) {
         e->aggEntity->disableEntityAdvertising(std::nullopt);
         e->aggEntity = nullptr; /* owned by endStation */

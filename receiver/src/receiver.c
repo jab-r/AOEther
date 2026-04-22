@@ -3,6 +3,8 @@
 #include "mdns.h"
 #include "packet.h"
 
+#include <pthread.h>
+
 #include <alsa/asoundlib.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -132,6 +134,31 @@ static int parse_alsa_variant(const char *s, struct alsa_variant *v)
 }
 
 static volatile sig_atomic_t g_stop;
+
+/* AVDECC bind state. An AVDECC controller (Hive) issuing CONNECT_RX on
+ * this listener fires on_bind from la_avdecc's executor thread; the
+ * main data-path loop reads this under the mutex and prefers the
+ * announced talker MAC over the first-frame-learned one. */
+static pthread_mutex_t g_avdecc_mu  = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t         g_avdecc_peer_mac[6];
+static int             g_avdecc_peer_valid;
+
+static void avdecc_on_bind(const uint8_t mac[6], uint64_t stream_id, void *user)
+{
+    (void)stream_id; (void)user;
+    pthread_mutex_lock(&g_avdecc_mu);
+    memcpy(g_avdecc_peer_mac, mac, 6);
+    g_avdecc_peer_valid = 1;
+    pthread_mutex_unlock(&g_avdecc_mu);
+}
+
+static void avdecc_on_unbind(void *user)
+{
+    (void)user;
+    pthread_mutex_lock(&g_avdecc_mu);
+    g_avdecc_peer_valid = 0;
+    pthread_mutex_unlock(&g_avdecc_mu);
+}
 
 static void on_signal(int sig)
 {
@@ -551,7 +578,7 @@ int main(int argc, char **argv)
             .rate_hz     = rate_hz,
             .format_name = fmt.name,
         };
-        avdecc = aoether_avdecc_open(&cfg, NULL, NULL, NULL);
+        avdecc = aoether_avdecc_open(&cfg, avdecc_on_bind, avdecc_on_unbind, NULL);
         if (!avdecc) {
             fprintf(stderr,
                     "receiver: AVDECC entity open failed (continuing without --avdecc)\n");
@@ -710,13 +737,28 @@ int main(int argc, char **argv)
             have_seq = 1;
 
             if (!have_talker) {
+                /* Prefer the ACMP-announced talker MAC over learning from
+                 * the first frame: Hive's Connect should steer us, not the
+                 * first arriving packet (which might be a stray from
+                 * another talker on the same segment). IP mode still
+                 * learns from src_addr because AVDECC is L2-only. */
+                int used_avdecc = 0;
+                if (transport != TRANSPORT_IP) {
+                    pthread_mutex_lock(&g_avdecc_mu);
+                    if (g_avdecc_peer_valid) {
+                        memcpy(talker_mac, g_avdecc_peer_mac, 6);
+                        used_avdecc = 1;
+                    }
+                    pthread_mutex_unlock(&g_avdecc_mu);
+                }
                 if (transport == TRANSPORT_IP) {
                     memcpy(&talker_addr, &src_addr, src_addrlen);
                     talker_addr_len = src_addrlen;
-                } else {
-                    /* L2 / AVTP both have an Ethernet header in front. */
+                } else if (!used_avdecc) {
                     const struct ether_header *eth = (const struct ether_header *)buf;
                     memcpy(talker_mac, eth->ether_shost, 6);
+                }
+                if (transport != TRANSPORT_IP) {
                     memcpy(fb_eth->ether_dhost, talker_mac, 6);
                     memcpy(fb_to_ll.sll_addr, talker_mac, 6);
                 }

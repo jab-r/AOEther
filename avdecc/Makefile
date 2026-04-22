@@ -25,7 +25,16 @@ LA_STATIC  := $(LA_BUILD)/src/libla_avdecc_static.a
 
 CXX        ?= g++
 CXXFLAGS   ?= -O2 -Wall -Wextra -std=c++17 -fPIC
-INCLUDES   := -I$(LA_AVDECC)/include -I../common
+# la_avdecc's public headers transitively include the network interface
+# helper submodule (nih) and the json library.  CMake handles this
+# when building la_avdecc itself; we need to expose the same include
+# roots to entity.cpp manually so our glue compiles against the same
+# ABI la_avdecc_static exposes.
+INCLUDES   := \
+    -I$(LA_AVDECC)/include \
+    -I$(LA_AVDECC)/externals/nih/include \
+    -I$(LA_AVDECC)/externals/3rdparty/json/include \
+    -I../common
 
 OBJS       := $(BUILD)/entity.o
 TARGET     := $(BUILD)/libaoether_avdecc.a
