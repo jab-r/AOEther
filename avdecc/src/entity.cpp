@@ -49,6 +49,7 @@
 #include <la/avdecc/internals/protocolAcmpdu.hpp>
 #include <la/avdecc/internals/protocolDefines.hpp>
 #include <la/avdecc/internals/protocolInterface.hpp>
+#include <la/avdecc/internals/streamFormatInfo.hpp>
 #include <la/avdecc/internals/uniqueIdentifier.hpp>
 
 /* Vendor IDs for the EntityModelID.  AOEther does not yet own an IEEE
@@ -244,7 +245,7 @@ static void buildEntityTree(model::EntityTree &tree,
             StreamFormatInfo::buildFormat_AAF(streamChannels,
                                               /*isUpToChannelsCount=*/false,
                                               sr,
-                                              SampleFormat::Int24,
+                                              StreamFormatInfo::SampleFormat::Int24,
                                               /*sampleBitDepth=*/24,
                                               /*samplesPerFrame=*/spf));
     }
@@ -262,7 +263,7 @@ static void buildEntityTree(model::EntityTree &tree,
         StreamFormatInfo::buildFormat_AAF(streamChannels,
                                           /*isUpToChannelsCount=*/false,
                                           currentSr,
-                                          SampleFormat::Int24,
+                                          StreamFormatInfo::SampleFormat::Int24,
                                           /*sampleBitDepth=*/24,
                                           static_cast<std::uint16_t>(currentRate / 8000u));
 
@@ -300,15 +301,15 @@ static void buildEntityTree(model::EntityTree &tree,
 
     /* -- AUDIO_UNIT[0] ---------------------------------------------------- */
     AudioUnitTree au{};
-    au.audioUnitModels.staticModel.localizedDescription = LocalizedStringReference{};
-    au.audioUnitModels.staticModel.clockDomainIndex     = ClockDomainIndex{ 0 };
-    au.audioUnitModels.staticModel.samplingRates        = samplingRateSet;
-    au.audioUnitModels.dynamicModel.objectName          = AvdeccFixedString{ "Audio Unit" };
-    au.audioUnitModels.dynamicModel.currentSamplingRate = currentSr;
+    au.staticModel.localizedDescription = LocalizedStringReference{};
+    au.staticModel.clockDomainIndex     = ClockDomainIndex{ 0 };
+    au.staticModel.samplingRates        = samplingRateSet;
+    au.dynamicModel.objectName          = AvdeccFixedString{ "Audio Unit" };
+    au.dynamicModel.currentSamplingRate = currentSr;
     if (cfg.role == AOETHER_AVDECC_LISTENER) {
-        au.audioUnitModels.staticModel.numberOfStreamInputPorts = 1;
+        au.staticModel.numberOfStreamInputPorts = 1;
     } else {
-        au.audioUnitModels.staticModel.numberOfStreamOutputPorts = 1;
+        au.staticModel.numberOfStreamOutputPorts = 1;
     }
     /* One STREAM_PORT_INPUT or STREAM_PORT_OUTPUT with a single
      * AUDIO_CLUSTER (the stereo pair).  No AUDIO_MAP entries — Hive
@@ -358,25 +359,47 @@ static void buildEntityTree(model::EntityTree &tree,
     tree.configurationTrees[AOETHER_CONF_INDEX] = std::move(conf);
 }
 
-/* Read the iface MAC via SIOCGIFHWADDR and patch it into the
- * AVB_INTERFACE descriptor's dynamic model. la_avdecc also fills this
- * in internally from the ProtocolInterface for ADPDU emission, but
- * the AEM descriptor needs a matching value so Hive's interface pane
- * renders the expected MAC. */
-#include <sys/ioctl.h>
+/* Read the iface MAC and patch it into the AVB_INTERFACE descriptor's
+ * dynamic model.  la_avdecc fills this in internally from the
+ * ProtocolInterface for ADPDU emission, but the AEM descriptor needs
+ * a matching value so Hive's interface pane renders the expected MAC.
+ *
+ * getifaddrs(3) is portable across Linux and macOS; Linux returns the
+ * MAC in an AF_PACKET sockaddr_ll, macOS / BSD in an AF_LINK
+ * sockaddr_dl.  We handle both so the build works on dev workstations
+ * without Linux-specific ioctl headers. */
+#include <ifaddrs.h>
 #include <sys/socket.h>
 #include <net/if.h>
+#if defined(__linux__)
+#  include <netpacket/packet.h>
+#else
+#  include <net/if_dl.h>
+#endif
 static bool readIfaceMac(const char *iface, std::uint8_t mac[6])
 {
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) return false;
-    struct ifreq ifr{};
-    std::strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
-    const bool ok = ioctl(s, SIOCGIFHWADDR, &ifr) == 0;
-    ::close(s);
-    if (!ok) return false;
-    std::memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
-    return true;
+    struct ifaddrs *head = nullptr;
+    if (getifaddrs(&head) != 0) return false;
+    bool ok = false;
+    for (auto *p = head; p; p = p->ifa_next) {
+        if (!p->ifa_name || std::strcmp(p->ifa_name, iface) != 0) continue;
+        if (!p->ifa_addr) continue;
+#if defined(__linux__)
+        if (p->ifa_addr->sa_family != AF_PACKET) continue;
+        auto *sll = reinterpret_cast<struct sockaddr_ll *>(p->ifa_addr);
+        if (sll->sll_halen != 6) continue;
+        std::memcpy(mac, sll->sll_addr, 6);
+#else
+        if (p->ifa_addr->sa_family != AF_LINK) continue;
+        auto *sdl = reinterpret_cast<struct sockaddr_dl *>(p->ifa_addr);
+        if (sdl->sdl_alen != 6) continue;
+        std::memcpy(mac, LLADDR(sdl), 6);
+#endif
+        ok = true;
+        break;
+    }
+    freeifaddrs(head);
+    return ok;
 }
 
 static std::string defaultEntityName(const aoether_avdecc_config &cfg)
