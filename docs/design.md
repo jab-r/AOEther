@@ -431,15 +431,43 @@ M3 is split into two sub-phases because it's mostly hardware work:
 
 **Time estimate:** 2 weekends for wire-format plumbing + silence-path smoke test (done). DAC-matrix build-out (M8 overlap) and U32_BE follow-up add incrementally.
 
-### M7 — AVDECC, discovery, and MCU receiver track kickoff
+### M7 — Discovery, AVDECC, and MCU receiver track kickoff
 
-**Goal:** Discovery and control plane across all transport modes. Start the Tier 3 MCU receiver track in parallel.
+**Goal:** Discovery and control plane across all transport modes. Start the Tier 3 MCU receiver track in parallel. Large milestone, split into three phases that ship independently.
+
+#### Phase A — mDNS-SD discovery (in progress)
+
+Simple-home-network path: receivers publish themselves as `_aoether._udp` with TXT records describing their DAC capabilities (channels, rate, format, transport, port). Talkers and operators discover receivers without static MAC/IP configuration.
+
+- `common/mdns.c` wraps Avahi's `avahi_threaded_poll` API. Graceful no-op fallback when libavahi-client isn't present at build time, so the data path keeps working on minimal systems.
+- Receiver: `--announce [--name NAME]` flags publish on startup.
+- `tools/aoether-browse` is a small helper that resolves the service type and prints a one-line summary per receiver; `avahi-browse -r _aoether._udp` works as a manual alternative.
+- TXT schema and recipe live in [`docs/recipe-discovery.md`](recipe-discovery.md).
+
+**Out of scope for Phase A:**
+- Talker-side auto-select (picking a receiver from the discovered set). A `--dest=mdns:NAME` shorthand is a follow-up; for now browse output is piped into the talker invocation manually.
+- Expressing full capability matrices in TXT records (e.g. "PCM up to 192 kHz **and** DSD256"). Each run publishes one concrete configuration; capability matrices are Phase B's job.
+
+#### Phase B — AVDECC entity model
+
+Milan-controller path. Linux side implements an IEEE 1722.1 entity model (ADP advertising, ACMP CONNECT_TX/RX, AECP AEM READ_DESCRIPTOR) sufficient for Hive and other Milan controllers to discover AOEther endpoints and establish streams. Capability descriptors are populated from DAC-level discovery (supported rates, channel counts, whether the DAC supports Milan-compatible formats). Interop target is Hive's "Connect" workflow working end-to-end against AOEther listeners and talkers without manual stream ID / MAC entry.
 
 **Deliverables:**
-- Linux side: AVDECC entity model for L2/AVTP deployments (Hive-compatible). mDNS-SD for IP deployments. Capability records populated from DAC discovery. Stream setup negotiates format + transport end-to-end.
-- MCU side: RT1170 USB host stack enumerates a target DAC and streams stereo PCM from Ethernet. L2 mode first; IP mode added opportunistically.
+- `common/avdecc.{h,c}` — ADP / ACMP / AECP PDU encode/decode, descriptor tables, state machine for the listener and talker roles.
+- Receiver: `--avdecc` flag starts the entity responder. `READ_DESCRIPTOR(ENTITY, CONFIGURATION, STREAM_INPUT, AUDIO_UNIT, LOCALE, STRINGS)` gets Hive to render the entity correctly.
+- Talker: matching responder on the talker side so streams advertised in AOEther show up in Hive's talker list.
+- `docs/recipe-avdecc.md` with Hive bring-up, screenshots, and troubleshooting.
 
-**Time estimate:** 6–8 weekends across tracks.
+**Out of scope for Phase B (tracked as follow-ups):**
+- MSRP stream reservation. Deferred to the TSN hardening track.
+- gPTP-disciplined `avtp_timestamp`. Requires M3 Phase B hardware PTP; drops in once both are merged.
+- AECP AEM checksums beyond what Hive requires for basic display.
+
+#### Phase C — MCU receiver track kickoff
+
+RT1170 USB host stack enumerates a target DAC and streams stereo PCM from Ethernet. L2 mode first; IP mode added opportunistically. Shares `common/` with the Linux binaries (packet framing, AAF header, mDNS stub). Needs real NXP MIMXRT1170-EVKB hardware; deliverable is a blinking-LED-plus-stereo-PCM firmware image and a bring-up doc, not a polished streamer — that arrives in M8.
+
+**Time estimate:** Phase A: 1 weekend (shipped). Phase B: 3–4 weekends. Phase C: 2–3 weekends once EVKB arrives.
 
 ### M8 — Scale, soak, DSD1024/2048, packaging
 

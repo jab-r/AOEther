@@ -411,3 +411,9 @@ A1 01 01 00 00 01 03 E8 00 30 00 00 00 00 00 00
 ```
 
 On the wire: 14-byte Ethernet header + these 16 bytes + 30 bytes of MAC padding + 4-byte FCS = 64 bytes total.
+
+## mDNS-SD discovery (M7 Phase A)
+
+Out-of-band to the wire protocol but part of the control surface. Receivers publish themselves on the local network with the service type `_aoether._udp`, a port (meaningful for Mode 3; informational for Mode 1 / Mode 2), and TXT records describing one concrete configuration.
+
+TXT schema is documented in [`recipe-discovery.md`](recipe-discovery.md) — `ver`, `role`, `transport`, `format`, `channels`, `rate`, `iface`, `dac`, `port`. Schema-breaking changes bump `ver`. Multiple capabilities per receiver are expressed via AVDECC (M7 Phase B), not mDNS.

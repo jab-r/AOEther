@@ -1,4 +1,5 @@
 #include "avtp.h"
+#include "mdns.h"
 #include "packet.h"
 
 #include <alsa/asoundlib.h>
@@ -121,7 +122,10 @@ static void usage(const char *prog)
         "  --rate HZ            PCM only: 44100|48000|88200|96000|176400|192000\n"
         "                       (default %d; ignored for DSD — rate is implied by --format)\n"
         "  --latency-us N       ALSA period latency hint (default %d)\n"
-        "  --no-feedback        do not emit Mode C FEEDBACK frames (diagnostic)\n",
+        "  --no-feedback        do not emit Mode C FEEDBACK frames (diagnostic)\n"
+        "  --announce           publish this receiver via mDNS-SD (_aoether._udp)\n"
+        "                       so talkers and avahi-browse can discover it\n"
+        "  --name NAME          instance name to publish (default: hostname)\n",
         prog, DEFAULT_UDP_PORT, DEFAULT_CHANNELS, DEFAULT_RATE_HZ, DEFAULT_LATENCY_US);
 }
 
@@ -161,6 +165,8 @@ int main(int argc, char **argv)
     int feedback_enabled = 1;
     enum transport_mode transport = TRANSPORT_L2;
     int udp_port = DEFAULT_UDP_PORT;
+    int announce = 0;
+    const char *announce_name = NULL;
 
     static const struct option opts[] = {
         { "iface",       required_argument, 0, 'i' },
@@ -173,11 +179,13 @@ int main(int argc, char **argv)
         { "format",      required_argument, 0, 'F' },
         { "latency-us",  required_argument, 0, 'l' },
         { "no-feedback", no_argument,       0, 'n' },
+        { "announce",    no_argument,       0, 'A' },
+        { "name",        required_argument, 0, 'N' },
         { "help",        no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "i:d:T:P:G:C:r:F:l:nh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:d:T:P:G:C:r:F:l:nAN:h", opts, NULL)) != -1) {
         switch (c) {
         case 'i': iface = optarg; break;
         case 'd': dac = optarg; break;
@@ -194,6 +202,8 @@ int main(int argc, char **argv)
         case 'F': format_s = optarg; break;
         case 'l': latency_us = atoi(optarg); break;
         case 'n': feedback_enabled = 0; break;
+        case 'A': announce = 1; break;
+        case 'N': announce_name = optarg; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -410,6 +420,50 @@ int main(int argc, char **argv)
                 group_s ? group_s : "",
                 iface, dac, fmt.name, channels, rate_hz, latency_us,
                 feedback_enabled ? "on" : "off");
+    }
+
+    /* mDNS-SD: announce this receiver and its DAC capabilities so talkers
+     * (and avahi-browse) can discover it without static configuration.
+     * See docs/recipe-discovery.md. Publication is best-effort; if avahi
+     * isn't present we log and carry on. */
+    struct aoether_mdns *mdns = NULL;
+    if (announce) {
+        char hostname[128];
+        if (!announce_name) {
+            if (gethostname(hostname, sizeof(hostname)) == 0) {
+                hostname[sizeof(hostname) - 1] = 0;
+                announce_name = hostname;
+            } else {
+                announce_name = "aoether-receiver";
+            }
+        }
+        char ch_s[8], rate_s[16], port_s[8];
+        snprintf(ch_s,   sizeof(ch_s),   "%d", channels);
+        snprintf(rate_s, sizeof(rate_s), "%d", rate_hz);
+        snprintf(port_s, sizeof(port_s), "%d", udp_port);
+        const char *transport_s =
+            transport == TRANSPORT_L2   ? "l2"   :
+            transport == TRANSPORT_AVTP ? "avtp" : "ip";
+        struct aoether_mdns_txt txt[] = {
+            { "ver",       "1" },
+            { "role",      "receiver" },
+            { "transport", transport_s },
+            { "format",    fmt.name },
+            { "channels",  ch_s },
+            { "rate",      rate_s },
+            { "iface",     iface },
+            { "dac",       dac },
+            { "port",      port_s },
+        };
+        mdns = aoether_mdns_publish("_aoether._udp",
+                                    announce_name,
+                                    (uint16_t)udp_port,
+                                    txt,
+                                    sizeof(txt) / sizeof(txt[0]));
+        if (!mdns) {
+            fprintf(stderr,
+                    "receiver: mDNS-SD publication failed (continuing without announce)\n");
+        }
     }
 
     /* Data-path buffer and counters. */
@@ -660,5 +714,6 @@ check_feedback:
     snd_pcm_close(pcm);
     if (ctl_sock != data_sock) close(ctl_sock);
     close(data_sock);
+    aoether_mdns_close(mdns);
     return 0;
 }
