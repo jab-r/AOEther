@@ -16,7 +16,7 @@ struct audio_source *audio_source_wav_open(const char *path);
 struct audio_source *audio_source_alsa_open(const char *pcm_name, int channels, int rate);
 
 /* DSD silence source (M6). `dsd_byte_rate` is bits/sec/channel ÷ 8; for
- * DSD64 it's 352800, for DSD512 it's 2822400. `read()` returns the idle
+ * DSD64 it's 352800, for DSD256 it's 1411200. `read()` returns the idle
  * pattern (`AOE_DSD_IDLE_BYTE`) interleaved across channels — acoustically
  * silent on a real DAC, but exercises the full wire-format and ALSA
  * native-DSD path. A real DSF/DFF file reader is deferred to M8 alongside
