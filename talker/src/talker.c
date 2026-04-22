@@ -5,6 +5,7 @@
 #include "rtp.h"
 #include "sap.h"
 #include "sdp.h"
+#include "ptp_pmc.h"
 
 #include <pthread.h>
 
@@ -237,10 +238,15 @@ static void usage(const char *prog)
         "    --session-name NAME             session name surfaced in SDP / SAP\n"
         "                                    (default: hostname + stream id)\n"
         "    --ptp                           use CLOCK_TAI for the RTP timestamp\n"
-        "                                    base and advertise PTPv2 traceable\n"
-        "                                    in SDP (M9 Phase C). Requires\n"
-        "                                    ptp4l + phc2sys running — see\n"
-        "                                    docs/ptp-setup.md.\n"
+        "                                    base and advertise the PTPv2\n"
+        "                                    grandmaster in SDP (M9 Phase C).\n"
+        "                                    Requires ptp4l + phc2sys running —\n"
+        "                                    see docs/ptp-setup.md. Reads the\n"
+        "                                    current gmid via `pmc` every 30s;\n"
+        "                                    falls back to :traceable if pmc\n"
+        "                                    isn't installed or ptp4l is down.\n"
+        "    --ptp-domain N                  PTP domain number (0..127, default 0)\n"
+        "                                    advertised in the ts-refclk line\n"
         "    --sdp-only                      print the generated SDP to stdout\n"
         "                                    and exit; use when a controller\n"
         "                                    wants a static session file\n"
@@ -298,6 +304,7 @@ int main(int argc, char **argv)
     int announce_sap = 0;
     int ptp_enabled = 0;
     int sdp_only = 0;
+    int ptp_domain = 0;
     const char *session_name = NULL;
 
     static const struct option opts[] = {
@@ -319,6 +326,7 @@ int main(int argc, char **argv)
         { "session-name",  required_argument, 0, 1003 },
         { "ptp",           no_argument,       0, 1004 },
         { "sdp-only",      no_argument,       0, 1005 },
+        { "ptp-domain",    required_argument, 0, 1006 },
         { "help",      no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
@@ -349,6 +357,13 @@ int main(int argc, char **argv)
         case 1003: session_name = optarg; break;
         case 1004: ptp_enabled = 1; break;
         case 1005: sdp_only = 1; break;
+        case 1006:
+            ptp_domain = atoi(optarg);
+            if (ptp_domain < 0 || ptp_domain > 127) {
+                fprintf(stderr, "talker: --ptp-domain must be 0..127\n");
+                return 2;
+            }
+            break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -474,6 +489,15 @@ int main(int argc, char **argv)
         sdp.ptime_us      = (uint32_t)ptime_us;
         sdp.refclk        = ptp_enabled ? SDP_REFCLK_PTP_TRACEABLE
                                         : SDP_REFCLK_NONE;
+        sdp.ptp_domain    = (uint8_t)ptp_domain;
+        if (ptp_enabled) {
+            uint8_t gmid_bytes[8];
+            if (ptp_pmc_read_gmid(gmid_bytes) == 0) {
+                ptp_gmid_to_str(gmid_bytes, sdp.gmid_str,
+                                sizeof sdp.gmid_str);
+                sdp.refclk = SDP_REFCLK_PTP_GMID;
+            }
+        }
         if (session_name) {
             strncpy(sdp.session_name, session_name, SDP_MAX_SESSION_NAME - 1);
             sdp.session_name[SDP_MAX_SESSION_NAME - 1] = '\0';
@@ -1059,12 +1083,46 @@ int main(int argc, char **argv)
 
     while (!g_stop) {
         /* 0. Re-emit SAP announcement every SAP_ANNOUNCE_INTERVAL_S
-         *    seconds. Cheap — one sendto() per 30 s against monotonic. */
+         *    seconds. If --ptp is on, re-read the PTP grandmaster each
+         *    refresh — BMCA can re-elect a different master at any time,
+         *    and we need to reflect that in the SDP so controllers
+         *    re-evaluate. Changed gmid → bump session_version + rebuild
+         *    the SAP packet; identical gmid → just re-send what we have. */
         if (sap_fd >= 0 && sap_pkt_len > 0) {
             struct timespec mono_now;
             clock_gettime(CLOCK_MONOTONIC, &mono_now);
             if (mono_now.tv_sec - last_sap_ts.tv_sec >=
                 (time_t)SAP_ANNOUNCE_INTERVAL_S) {
+
+                if (ptp_enabled) {
+                    uint8_t gmid_bytes[8];
+                    char new_gmid[32] = "";
+                    enum sdp_refclk new_refclk =
+                        (ptp_pmc_read_gmid(gmid_bytes) == 0)
+                            ? SDP_REFCLK_PTP_GMID
+                            : SDP_REFCLK_PTP_TRACEABLE;
+                    if (new_refclk == SDP_REFCLK_PTP_GMID) {
+                        ptp_gmid_to_str(gmid_bytes, new_gmid,
+                                        sizeof new_gmid);
+                    }
+                    if (new_refclk != sdp.refclk ||
+                        strcmp(new_gmid, sdp.gmid_str) != 0) {
+                        sdp.refclk = new_refclk;
+                        strncpy(sdp.gmid_str, new_gmid,
+                                sizeof sdp.gmid_str - 1);
+                        sdp.gmid_str[sizeof sdp.gmid_str - 1] = '\0';
+                        sdp.session_version++;
+                        sdp_len = sdp_build(sdp_text, sizeof sdp_text, &sdp);
+                        if (sdp_len > 0) {
+                            sap_pkt_len = sap_build(
+                                sap_pkt, sizeof sap_pkt,
+                                SAP_ANNOUNCE,
+                                origin_ipv4_be, sap_msg_id,
+                                sdp_text, (size_t)sdp_len);
+                        }
+                    }
+                }
+
                 ssize_t n = sendto(sap_fd, sap_pkt, (size_t)sap_pkt_len, 0,
                                    (struct sockaddr *)&sap_to, sizeof sap_to);
                 if (n < 0 && errno != EINTR) perror("sendto(SAP refresh)");

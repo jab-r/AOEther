@@ -42,6 +42,29 @@ What the talker does in Mode 4:
 - Does not emit Mode C feedback frames — AES67 devices expect PTPv2 for clocking and would drop our 0x88B6 frames anyway.
 - Does not start an AVDECC entity even if `--avdecc` is passed — AVDECC is a Milan concept; AES67 uses SAP / SDP.
 
+## Discovering existing streams (`--list-sap`)
+
+Before setting up a receiver, see what's already on the wire. `--list-sap` on the receiver joins the SAP group, prints every unique session it sees in a short window, then exits:
+
+```sh
+sudo ./build/receiver --iface eno1 --list-sap        # default 5 s window
+sudo ./build/receiver --iface eno1 --list-sap=10     # longer window
+```
+
+Each entry comes with a ready-to-run receiver command, so you can copy-paste it and fill in the `--dac` yourself:
+
+```
+  [1] session="AOEther / Kitchen DAC"
+      origin=192.168.1.100  dest=239.69.1.10:5004
+      fmt=L24 rate=48000 ch=2 pt=96 ptime=1.000ms refclk=ptp
+      cmd:
+        sudo receiver --iface eno1 --dac hw:CARD=...,DEV=0 \
+                      --transport rtp --group 239.69.1.10 --port 5004 \
+                      --channels 2 --rate 48000
+```
+
+`--list-sap` doesn't open the DAC, doesn't require `--dac`, and doesn't interfere with any running receivers on the same host.
+
 ## Phase B: SAP announcement + SDP
 
 Pass `--announce-sap` to have the talker periodically multicast an SDP describing this session on `239.255.255.255:9875`:
@@ -86,10 +109,14 @@ sudo ./build/talker --iface eno1 --transport rtp \
 What changes:
 
 - The RTP timestamp base comes from `CLOCK_TAI` instead of `CLOCK_MONOTONIC`. AES67 listeners that align their own RTP timestamps to PTP will now agree with this talker on the media-clock epoch.
-- The emitted SDP grows two lines:
+- The emitted SDP grows two lines. If `pmc` (linuxptp) is installed and `ptp4l` has elected a grandmaster, we advertise the specific GM identity:
+  - `a=ts-refclk:ptp=IEEE1588-2008:90-E2-BA-FF-FE-2E-56-78:0`
+  - `a=mediaclk:direct=0`
+  Otherwise (pmc missing, ptp4l not running, no master elected yet) we fall back to the permissive form:
   - `a=ts-refclk:ptp=IEEE1588-2008:traceable`
   - `a=mediaclk:direct=0`
-  telling controllers the stream is PTP-traceable.
+- The grandmaster is re-read every 30 s. If BMCA re-elects a different master, the talker bumps `session_version` in the SDP and re-announces so controllers pick up the change.
+- `--ptp-domain N` selects which PTP domain is advertised in the refclk line (default 0, the AES67 convention).
 
 Drift between talker and listener is no longer bounded by the two crystals — it is bounded by the PTP sync accuracy (typically sub-microsecond on hardware-PTP-capable gear, low milliseconds on software PTP over WiFi).
 
@@ -138,10 +165,10 @@ Substitute your talker's host IP for `192.168.1.100`. For the low-latency profil
 
 ## Known limitations
 
-- Receiver-side SAP passive listen is not wired yet — AOEther receivers still take `--group` / `--dest-ip` explicitly. Auto-bind semantics are TBD.
+- Receiver-side auto-bind on SAP discovery is not wired yet — `--list-sap` prints what's on the wire, but binding still means re-running with `--group` / `--port`. Auto-bind semantics (filter by session name, handle format mismatch, honor deletions) need a design pass.
 - No payload-type negotiation — talker emits PT=96 unconditionally, receiver accepts any PT. Controllers negotiate PT through SDP in practice, so this rarely matters.
 - L16 encoding path exists in the common module but isn't exposed as a `--format` option yet.
 - 44.1 kHz / 88.2 kHz / 176.4 kHz work at the wire level but AES67 deployments overwhelmingly use 48 kHz / 96 kHz / 192 kHz.
 - `--transport rtp --format dsd*` is rejected; AES67 is PCM-only. DSD streams remain on Modes 1 / 3.
 - Multichannel beyond stereo works but AES67 conventions cap per-stream channel count at 8; higher counts should be split into multiple sessions.
-- `--ptp` advertises `:traceable` rather than pinning a specific grandmaster identity (gmid), because extracting gmid from `ptp4l` across processes is fiddly. Controllers that require gmid agreement will need the field filled in; tracked as a follow-up.
+- `--ptp` re-reads gmid via `pmc` every 30 s (not on every BMCA change). In the worst case a fresh master takes ≤30 s to propagate into SDP. If you need tighter tracking, reduce `SAP_ANNOUNCE_INTERVAL_S`.
