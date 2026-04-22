@@ -38,7 +38,8 @@
 #define DSD64_BYTE_RATE       352800       /* 2.8224 MHz / 8 */
 #define DSD128_BYTE_RATE      705600
 #define DSD256_BYTE_RATE      1411200
-#define DSD512_BYTE_RATE      2822400
+/* DSD512 (2.8224 MB/s/ch) exceeds the wire format's u8 payload_count (255)
+ * and needs packet splitting — deferred to M8. */
 
 /* Ethernet II data payload max (frame - eth header) for standard 1500 MTU. */
 #define ETH_MTU_PAYLOAD       1500
@@ -93,7 +94,8 @@ static int parse_format(const char *s, struct stream_format *f)
         { AOE_FMT_NATIVE_DSD64,   1, DSD64_BYTE_RATE,     1, "dsd64"  },
         { AOE_FMT_NATIVE_DSD128,  1, DSD128_BYTE_RATE,    1, "dsd128" },
         { AOE_FMT_NATIVE_DSD256,  1, DSD256_BYTE_RATE,    1, "dsd256" },
-        { AOE_FMT_NATIVE_DSD512,  1, DSD512_BYTE_RATE,    1, "dsd512" },
+        /* DSD512+ overflows the wire format's u8 payload_count field; it
+         * lands in M8 alongside the packet-splitting work. */
     };
     for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); i++) {
         if (strcmp(s, table[i].name) == 0) {
@@ -171,8 +173,9 @@ static void usage(const char *prog)
         "  --capture hw:CARD=...        ALSA capture device, required with --source alsa\n"
         "\n"
         "Stream format:\n"
-        "  --format  FMT                pcm | dsd64 | dsd128 | dsd256 | dsd512\n"
-        "                               default pcm. DoP and DSD1024+ are deferred.\n"
+        "  --format  FMT                pcm | dsd64 | dsd128 | dsd256\n"
+        "                               default pcm. DoP and DSD512+ are deferred\n"
+        "                               (DSD512+ needs packet splitting → M8).\n"
         "                               AVTP transport carries pcm only.\n"
         "  --channels N                 channel count (1..64, default %d)\n"
         "  --rate    HZ                 44100|48000|88200|96000|176400|192000 (default %d)\n"

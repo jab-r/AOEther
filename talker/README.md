@@ -40,7 +40,7 @@ Needs `CAP_NET_RAW` to open `AF_PACKET` in L2 mode; easiest path is `sudo`. IP m
 
 ## What it does, exactly
 
-- Stream ID `0x0001`. Format code is chosen by `--format`: `0x11` (PCM s24le-3, default), or `0x30..0x33` (native DSD64..DSD512, M6). Channels and rate are runtime-configured via `--channels` and `--rate`; defaults match M1 (2 channels, 48 kHz PCM).
+- Stream ID `0x0001`. Format code is chosen by `--format`: `0x11` (PCM s24le-3, default), or `0x30..0x32` (native DSD64..DSD256, M6). Channels and rate are runtime-configured via `--channels` and `--rate`; defaults match M1 (2 channels, 48 kHz PCM).
 - Emits 1 packet per 125 µs tick from `timerfd`. The timer never retunes.
 - Ethernet II frame, EtherType `0x88B5`, AoE header per [`docs/wire-format.md`](../docs/wire-format.md). With `--transport avtp` the wrapper switches to IEEE 1722 AAF (24-byte header, samples big-endian on the wire) at EtherType `0x22F0`; Mode C feedback continues on `0x88B6` regardless.
 - `payload_count` is **nominally `rate_hz / 8000` samples per packet but varies under Mode C feedback** — the talker keeps a fractional sample accumulator driven by the latest FEEDBACK value and writes the integer part into each packet. This is how USB hosts drive async DACs; we extend the same scheme across Ethernet.

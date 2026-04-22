@@ -31,7 +31,7 @@
 #define DSD64_BYTE_RATE   352800
 #define DSD128_BYTE_RATE  705600
 #define DSD256_BYTE_RATE  1411200
-#define DSD512_BYTE_RATE  2822400
+/* DSD512 exceeds the u8 payload_count limit — needs packet splitting (M8). */
 
 /* Defaults match M1's previous hardcoded values. */
 #define DEFAULT_CHANNELS      2
@@ -69,30 +69,62 @@ struct stream_format {
     uint8_t              wire_code;
     int                  bytes_per_sample;
     int                  rate_override;   /* >0 overrides --rate (DSD) */
-    snd_pcm_format_t     alsa_format;
     int                  is_dsd;
     const char          *name;
 };
 
-/* M6 ships DSD via SND_PCM_FORMAT_DSD_U8 only, which matches the wire-format
- * byte order 1:1 (per-byte channel interleaving, MSB-first within each
- * byte). DACs that require DSD_U16/U32 formats arrive in a follow-up with
- * a reorder step. */
 static int parse_format(const char *s, struct stream_format *f)
 {
     if (!s) return -1;
     static const struct stream_format table[] = {
-        { AOE_FMT_PCM_S24LE_3,   3, 0,                SND_PCM_FORMAT_S24_3LE, 0, "pcm"    },
-        { AOE_FMT_NATIVE_DSD64,  1, DSD64_BYTE_RATE,  SND_PCM_FORMAT_DSD_U8,  1, "dsd64"  },
-        { AOE_FMT_NATIVE_DSD128, 1, DSD128_BYTE_RATE, SND_PCM_FORMAT_DSD_U8,  1, "dsd128" },
-        { AOE_FMT_NATIVE_DSD256, 1, DSD256_BYTE_RATE, SND_PCM_FORMAT_DSD_U8,  1, "dsd256" },
-        { AOE_FMT_NATIVE_DSD512, 1, DSD512_BYTE_RATE, SND_PCM_FORMAT_DSD_U8,  1, "dsd512" },
+        { AOE_FMT_PCM_S24LE_3,   3, 0,                0, "pcm"    },
+        { AOE_FMT_NATIVE_DSD64,  1, DSD64_BYTE_RATE,  1, "dsd64"  },
+        { AOE_FMT_NATIVE_DSD128, 1, DSD128_BYTE_RATE, 1, "dsd128" },
+        { AOE_FMT_NATIVE_DSD256, 1, DSD256_BYTE_RATE, 1, "dsd256" },
+        /* DSD512 and higher need packet splitting: nominal bytes/ch per
+         * microframe exceeds the wire format's u8 payload_count field (255).
+         * Lifting that is M8 scope. */
     };
     for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); i++) {
         if (strcmp(s, table[i].name) == 0) {
-            /* Re-assign the name pointer to the found table entry's literal
-             * so callers can keep using f->name safely. */
             *f = table[i];
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* ALSA DSD format selection. The AOE wire format is always per-byte channel-
+ * interleaved MSB-first within each byte; that matches DSD_U8 exactly. For
+ * the wider DSD_U16_* / DSD_U32_* formats the receiver deinterleaves wire
+ * bytes into per-channel linear streams (buffering up to N-1 bytes per
+ * channel across packet boundaries) and repacks into ALSA's N-byte-per-
+ * channel frames, byte-reversing within each group for the LE variants.
+ *
+ * PCM uses SND_PCM_FORMAT_S24_3LE with n_bytes=3 and no group reversal —
+ * the wire format already delivers those bytes in ALSA's expected order. */
+struct alsa_variant {
+    const char       *name;
+    snd_pcm_format_t  alsa_format;
+    int               n_bytes;   /* bytes per channel per ALSA frame */
+    int               reverse;   /* 1 → byte-reverse within each N-byte group */
+    int               is_dsd;
+};
+
+static int parse_alsa_variant(const char *s, struct alsa_variant *v)
+{
+    if (!s) return -1;
+    static const struct alsa_variant table[] = {
+        { "pcm_s24_3le", SND_PCM_FORMAT_S24_3LE,    3, 0, 0 },
+        { "dsd_u8",      SND_PCM_FORMAT_DSD_U8,     1, 0, 1 },
+        { "dsd_u16_be",  SND_PCM_FORMAT_DSD_U16_BE, 2, 0, 1 },
+        { "dsd_u16_le",  SND_PCM_FORMAT_DSD_U16_LE, 2, 1, 1 },
+        { "dsd_u32_be",  SND_PCM_FORMAT_DSD_U32_BE, 4, 0, 1 },
+        { "dsd_u32_le",  SND_PCM_FORMAT_DSD_U32_LE, 4, 1, 1 },
+    };
+    for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); i++) {
+        if (strcmp(s, table[i].name) == 0) {
+            *v = table[i];
             return 0;
         }
     }
@@ -116,9 +148,15 @@ static void usage(const char *prog)
         "  --port N             UDP port (IP mode, default %d)\n"
         "  --group IP           multicast group to join (IP mode, optional;\n"
         "                       IPv4 in 224.0.0.0/4 or IPv6 in ff00::/8)\n"
-        "  --format FMT         pcm | dsd64 | dsd128 | dsd256 | dsd512\n"
+        "  --format FMT         pcm | dsd64 | dsd128 | dsd256\n"
         "                       default pcm. AVTP transport is pcm-only.\n"
-        "                       DSD uses SND_PCM_FORMAT_DSD_U8 (per-DAC quirks apply).\n"
+        "                       DSD512+ needs packet splitting, deferred to M8.\n"
+        "  --alsa-format FMT    ALSA sample format. Default picks from --format:\n"
+        "                         pcm → pcm_s24_3le; dsd* → dsd_u8.\n"
+        "                       DSD override: dsd_u8 | dsd_u16_le | dsd_u16_be |\n"
+        "                                     dsd_u32_le | dsd_u32_be.\n"
+        "                       Match whatever your DAC's snd_usb_audio quirk exposes;\n"
+        "                       the receiver handles the transpose + endian conversion.\n"
         "  --channels N         stream channel count (1..64, default %d)\n"
         "  --rate HZ            PCM only: 44100|48000|88200|96000|176400|192000\n"
         "                       (default %d; ignored for DSD — rate is implied by --format)\n"
@@ -162,6 +200,7 @@ int main(int argc, char **argv)
     const char *dac = NULL;
     const char *group_s = NULL;
     const char *format_s = "pcm";
+    const char *alsa_format_s = NULL;   /* resolved below from --format if NULL */
     int channels = DEFAULT_CHANNELS;
     int rate_hz = DEFAULT_RATE_HZ;
     int latency_us = DEFAULT_LATENCY_US;
@@ -181,6 +220,7 @@ int main(int argc, char **argv)
         { "channels",    required_argument, 0, 'C' },
         { "rate",        required_argument, 0, 'r' },
         { "format",      required_argument, 0, 'F' },
+        { "alsa-format", required_argument, 0, 'A' },
         { "latency-us",  required_argument, 0, 'l' },
         { "no-feedback", no_argument,       0, 'n' },
         { "announce",    no_argument,       0, 'A' },
@@ -205,6 +245,7 @@ int main(int argc, char **argv)
         case 'C': channels = atoi(optarg); break;
         case 'r': rate_hz = atoi(optarg); break;
         case 'F': format_s = optarg; break;
+        case 'A': alsa_format_s = optarg; break;
         case 'l': latency_us = atoi(optarg); break;
         case 'n': feedback_enabled = 0; break;
         case 'A': announce = 1; break;
@@ -258,6 +299,22 @@ int main(int argc, char **argv)
     }
     const int bytes_per_sample = fmt.bytes_per_sample;
     const uint8_t expected_format_code = fmt.wire_code;
+
+    /* Resolve ALSA variant. Default derives from --format; user can override
+     * for DSD when the DAC's snd_usb_audio quirk exposes only DSD_U16 / U32. */
+    struct alsa_variant av;
+    if (!alsa_format_s) alsa_format_s = fmt.is_dsd ? "dsd_u8" : "pcm_s24_3le";
+    if (parse_alsa_variant(alsa_format_s, &av) < 0) {
+        fprintf(stderr, "receiver: unknown --alsa-format %s\n", alsa_format_s);
+        return 2;
+    }
+    if (av.is_dsd != fmt.is_dsd) {
+        fprintf(stderr,
+                "receiver: --alsa-format %s is %s but --format %s is %s\n",
+                alsa_format_s, av.is_dsd ? "DSD" : "PCM",
+                fmt.name, fmt.is_dsd ? "DSD" : "PCM");
+        return 2;
+    }
 
     /* Socket setup per transport. L2 keeps two raw AF_PACKET sockets (one
      * per EtherType). IP uses one SOCK_DGRAM socket bound to udp_port —
@@ -385,22 +442,28 @@ int main(int argc, char **argv)
         fprintf(stderr, "snd_pcm_open(%s): %s\n", dac, snd_strerror(err));
         return 1;
     }
+    /* ALSA's "frame rate" differs from wire rate_hz for wider DSD formats:
+     * each ALSA frame consumes av.n_bytes bytes per channel, so
+     *   ALSA rate = (wire DSD byte rate per channel) / av.n_bytes.
+     * For PCM S24_3LE the two concepts coincide. */
+    const unsigned alsa_rate = fmt.is_dsd
+        ? (unsigned)rate_hz / (unsigned)av.n_bytes
+        : (unsigned)rate_hz;
     err = snd_pcm_set_params(pcm,
-                             fmt.alsa_format,
+                             av.alsa_format,
                              SND_PCM_ACCESS_RW_INTERLEAVED,
                              (unsigned int)channels,
-                             (unsigned int)rate_hz,
+                             alsa_rate,
                              0,              /* disable ALSA soft-resample */
                              (unsigned int)latency_us);
     if (err < 0) {
         fprintf(stderr,
-                "snd_pcm_set_params (ch=%d rate=%d fmt=%s): %s\n"
+                "snd_pcm_set_params (ch=%d alsa_rate=%u fmt=%s alsa=%s): %s\n"
                 "  (DAC must natively support this configuration; "
-                "AOEther never resamples.  For DSD, check that the DAC's\n"
-                "  snd_usb_audio quirk exposes %s at this rate; some DACs\n"
-                "  require DSD_U32_BE instead, which is a follow-up.)\n",
-                channels, rate_hz, fmt.name, snd_strerror(err),
-                fmt.is_dsd ? "SND_PCM_FORMAT_DSD_U8" : "S24_3LE");
+                "AOEther never resamples.  For DSD, try a different\n"
+                "  --alsa-format matching your DAC's snd_usb_audio quirk\n"
+                "  — common variants are dsd_u8, dsd_u16_le, dsd_u32_be.)\n",
+                channels, alsa_rate, fmt.name, alsa_format_s, snd_strerror(err));
         return 1;
     }
 
@@ -409,22 +472,24 @@ int main(int argc, char **argv)
 
     if (transport != TRANSPORT_IP) {
         fprintf(stderr,
-                "receiver: transport=%s iface=%s dac=%s fmt=%s ch=%d rate=%d latency_us=%d feedback=%s\n",
+                "receiver: transport=%s iface=%s dac=%s fmt=%s alsa=%s ch=%d rate=%d alsa_rate=%u latency_us=%d feedback=%s\n",
                 transport == TRANSPORT_AVTP ? "avtp" : "l2",
                 iface, dac,
-                transport == TRANSPORT_AVTP ? "AAF_INT24(BE)→S24_3LE" : fmt.name,
-                channels, rate_hz, latency_us,
+                transport == TRANSPORT_AVTP ? "AAF_INT24(BE)" : fmt.name,
+                av.name,
+                channels, rate_hz, alsa_rate, latency_us,
                 feedback_enabled ? "on" : "off");
     } else {
         fprintf(stderr,
                 "receiver: transport=ip family=%s %s port=%d%s%s\n"
-                "          iface=%s dac=%s fmt=%s ch=%d rate=%d latency_us=%d feedback=%s\n",
+                "          iface=%s dac=%s fmt=%s alsa=%s ch=%d rate=%d alsa_rate=%u latency_us=%d feedback=%s\n",
                 group_family == AF_INET6 ? "v6" : "v4",
                 use_multicast ? "multicast" : "unicast",
                 udp_port,
                 group_s ? " group=" : "",
                 group_s ? group_s : "",
-                iface, dac, fmt.name, channels, rate_hz, latency_us,
+                iface, dac, fmt.name, av.name,
+                channels, rate_hz, alsa_rate, latency_us,
                 feedback_enabled ? "on" : "off");
     }
 
@@ -498,6 +563,14 @@ int main(int argc, char **argv)
     uint32_t last_seq = 0;
     int have_seq = 0;
     uint64_t rx = 0, dropped = 0, lost = 0, underruns = 0;
+
+    /* DSD repack scratch for the DSD_U16 / DSD_U32 paths. Worst case is
+     * channels=64 × (n_bytes-1=3 leftover + max payload_count=255) = 16512
+     * bytes per channel view; round up. For DSD_U8 / PCM these are unused. */
+    uint8_t dsd_per_ch[64 * (3 + 256)];
+    uint8_t dsd_out[RX_BUF_BYTES];
+    uint8_t dsd_leftover[64 * 3];
+    int     dsd_leftover_per_ch = 0;
 
     /* Mode C state. */
     uint64_t frames_written_total = 0;
@@ -650,11 +723,74 @@ int main(int argc, char **argv)
                 have_talker = 1;
             }
 
-            snd_pcm_sframes_t w = snd_pcm_writei(pcm, payload_p, frames);
+            /* For DSD formats wider than U8, deinterleave wire bytes into
+             * per-channel streams (carrying up to N-1 bytes per channel
+             * across packet boundaries), then repack into ALSA's N-byte-per-
+             * channel frames, byte-reversing within each group for LE
+             * variants. For DSD_U8 and PCM the wire layout already matches
+             * what ALSA expects and payload_p is passed through unchanged. */
+            const uint8_t *alsa_p = payload_p;
+            size_t alsa_frames = frames;
+            if (fmt.is_dsd && av.n_bytes > 1) {
+                const int wire_per_ch = (int)frames;
+                const int total_per_ch = dsd_leftover_per_ch + wire_per_ch;
+                const int af = total_per_ch / av.n_bytes;
+                const int consumed_per_ch = af * av.n_bytes;
+                const int new_leftover = total_per_ch - consumed_per_ch;
+
+                /* Build per-channel linear streams: leftover bytes first,
+                 * then deinterleaved wire bytes. */
+                for (int c = 0; c < channels; c++) {
+                    uint8_t *dst = dsd_per_ch + c * total_per_ch;
+                    memcpy(dst,
+                           dsd_leftover + c * dsd_leftover_per_ch,
+                           (size_t)dsd_leftover_per_ch);
+                    for (int i = 0; i < wire_per_ch; i++) {
+                        dst[dsd_leftover_per_ch + i] =
+                            payload_p[i * channels + c];
+                    }
+                }
+
+                /* Save the new leftover (bytes beyond the last whole ALSA
+                 * frame boundary) for the next packet. */
+                for (int c = 0; c < channels; c++) {
+                    memcpy(dsd_leftover + c * new_leftover,
+                           dsd_per_ch + c * total_per_ch + consumed_per_ch,
+                           (size_t)new_leftover);
+                }
+                dsd_leftover_per_ch = new_leftover;
+
+                /* Pack ALSA output: for each ALSA frame f, for each channel
+                 * c, copy av.n_bytes bytes from the per-channel stream,
+                 * optionally byte-reversing within the group for _LE. */
+                for (int f = 0; f < af; f++) {
+                    for (int c = 0; c < channels; c++) {
+                        const uint8_t *src =
+                            dsd_per_ch + c * total_per_ch + f * av.n_bytes;
+                        uint8_t *dst =
+                            dsd_out + f * channels * av.n_bytes + c * av.n_bytes;
+                        if (av.reverse) {
+                            for (int i = 0; i < av.n_bytes; i++) {
+                                dst[av.n_bytes - 1 - i] = src[i];
+                            }
+                        } else {
+                            memcpy(dst, src, (size_t)av.n_bytes);
+                        }
+                    }
+                }
+                alsa_p = dsd_out;
+                alsa_frames = (size_t)af;
+            }
+
+            snd_pcm_sframes_t w = 0;
+            if (alsa_frames > 0) {
+                w = snd_pcm_writei(pcm, alsa_p, alsa_frames);
+            }
             if (w == -EPIPE) {
                 underruns++;
                 snd_pcm_prepare(pcm);
                 rate_bootstrapped = 0;
+                dsd_leftover_per_ch = 0;  /* drop pending on xrun */
             } else if (w < 0) {
                 int r = snd_pcm_recover(pcm, (int)w, 1);
                 if (r < 0) {
@@ -662,6 +798,7 @@ int main(int argc, char **argv)
                     break;
                 }
                 rate_bootstrapped = 0;
+                dsd_leftover_per_ch = 0;
             } else {
                 rx++;
                 frames_written_total += (uint64_t)w;

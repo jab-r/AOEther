@@ -6,21 +6,24 @@ For the wire-format byte layout see [`wire-format.md`](wire-format.md) §"Native
 
 ## What works in M6
 
-- Talker accepts `--format dsd64 | dsd128 | dsd256 | dsd512` and emits raw DSD bits on the wire with format codes `0x30..0x33`.
-- Receiver accepts the same `--format` values and opens ALSA at `SND_PCM_FORMAT_DSD_U8`, which is a 1:1 match for the wire format's per-byte channel interleaving and MSB-first bit order.
+- Talker accepts `--format dsd64 | dsd128 | dsd256` and emits raw DSD bits on the wire with format codes `0x30..0x32`.
+- Receiver accepts the same `--format` values plus an `--alsa-format` override to match the ALSA DSD format your DAC's `snd_usb_audio` quirk exposes:
+  - `dsd_u8` (default) — wire bytes pass through 1:1, zero reorder.
+  - `dsd_u16_le` / `dsd_u16_be` — receiver deinterleaves into per-channel streams and repacks at 2-byte granularity, byte-reversing within each 2-byte group for `_le`.
+  - `dsd_u32_le` / `dsd_u32_be` — same at 4-byte granularity.
+  - The receiver carries up to (N−1) bytes per channel across packet boundaries, so the talker's fractional accumulator can emit any `payload_count` without worrying about ALSA-frame alignment.
 - Mode C clock discipline works at DSD byte rates with no code change — the talker's fractional accumulator and the receiver's `snd_pcm_delay()`-based rate estimator are rate-independent.
 - Works over both L2 (`--transport l2`) and IP/UDP (`--transport ip`). AVTP (`--transport avtp`) does not carry DSD — AAF is PCM-only — and the talker and receiver both reject `avtp + dsd*` at startup.
 
 ## What does NOT work yet
 
-- **Only `SND_PCM_FORMAT_DSD_U8`.** Many modern DACs advertise `SND_PCM_FORMAT_DSD_U32_BE` or `DSD_U16_LE` instead. These work fine with `snd_usb_audio` natively, but require a byte-reorder step in our receiver (4-byte- or 2-byte-granularity channel interleaving instead of 1-byte). That follow-up is tracked in the M6 PR.
-- **Only synthesized silence.** The talker's built-in `--source dsdsilence` emits the DSD idle pattern (`0x69`) on every channel. On a real DAC this plays as silence, which is exactly what's needed to verify the wire path and ALSA format selection work. Playing a real DSD file requires a `.dsf` / `.dff` reader (deferred to M8 alongside DSD1024/2048 — per-DAC quirk testing concentrates there).
+- **DSD512 and higher.** DSD512 stereo needs ~353 bytes per channel per USB microframe, which overflows the wire format's `u8 payload_count` field (max 255). DSD1024 stereo at ~705 bytes per channel additionally breaks the 1500-byte MTU. Both land in M8 with the packet-splitting work and the `last-in-group` reassembly flag.
+- **Only synthesized silence.** The talker's built-in `--source dsdsilence` emits the DSD idle pattern (`0x69`) on every channel. On a real DAC this plays as silence, which is exactly what's needed to verify the wire path and ALSA format selection work. Playing a real DSD file requires a `.dsf` / `.dff` reader (deferred to M8 — per-DAC quirk testing concentrates there).
 - **DoP mode is not wired up.** The wire format reserves codes `0x20..0x23` for DoP (PCM s24le-3 with 0x05 / 0xFA marker bytes at inflated rates), and talker/receiver framework would accept them, but the talker has no DoP encoder source yet. If a DAC works only through DoP and not native DSD, use PCM mode for now and wait for the DoP encoder.
-- **DSD1024 / DSD2048 require packet splitting.** At DSD1024 the per-microframe byte count exceeds 1500-byte MTU for stereo and the talker will refuse the configuration. M8 adds packet splitting and the `last-in-group` reassembly path.
 
 ## Step 1 — smoke test: talker → receiver → DSD DAC
 
-Pick a rate your DAC supports natively. DSD64 and DSD128 are near-universal; DSD256 is common on modern DACs; DSD512 needs a specifically capable DAC.
+Pick a rate your DAC supports natively. DSD64 and DSD128 are near-universal; DSD256 is common on modern DACs. DSD512 is supported on many modern DACs but requires packet splitting on our side, landing in M8.
 
 ```sh
 # Receiver
@@ -37,7 +40,7 @@ sudo ./build/talker --iface eno1 \
 Expected banner output on receiver:
 
 ```
-receiver: transport=l2 iface=eth0 dac=hw:CARD=D90,DEV=0 fmt=dsd64 ch=2 rate=352800 latency_us=5000 feedback=on
+receiver: transport=l2 iface=eth0 dac=hw:CARD=D90,DEV=0 fmt=dsd64 alsa=dsd_u8 ch=2 rate=352800 alsa_rate=352800 latency_us=5000 feedback=on
 ```
 
 Expected on talker:
@@ -55,20 +58,37 @@ On the DAC front panel / status LEDs you should see "DSD64" (or equivalent). Aud
 3. `fb_sent` counter on receiver rises (Mode C active; talker has locked onto the DAC clock).
 4. No xruns / underruns over a 5-minute run.
 
-## Step 2 — if the DAC rejects the stream
+## Step 2 — picking the right `--alsa-format` for your DAC
 
-The most common cause is the DAC not supporting `SND_PCM_FORMAT_DSD_U8`. Check what ALSA sees for your hardware:
+If the default (`dsd_u8`) open fails with `Invalid argument`, the DAC's `snd_usb_audio` quirk probably exposes only a wider DSD format. Check what ALSA says:
 
 ```sh
 cat /proc/asound/card0/pcm0p/sub0/hw_params  # while receiver is running
 # or:
-amixer -c 0 contents  # look for DSD format support
+cat /proc/asound/card0/stream0  # shows the advertised UAC/DSD formats
 ```
 
-If `snd_usb_audio` quirks-table only exposes `DSD_U32_BE` or `DSD_U16_LE` for your DAC, AOEther's M6 `DSD_U8` path cannot drive it. Options:
+Look for a line like `Format: DSD_U32_BE` or `DSD_U16_LE`. Then restart the receiver with a matching override:
 
-- Use PCM mode (`--format pcm --rate 192000`) and accept PCM output until the reorder follow-up lands.
-- Patch `receiver/src/receiver.c::parse_format` to select `SND_PCM_FORMAT_DSD_U32_BE` for your DAC **and** add a transpose-by-4 step before `snd_pcm_writei` (the in-PR follow-up covers this properly).
+```sh
+sudo ./build/receiver --iface eth0 --dac hw:CARD=D90,DEV=0 \
+                      --format dsd64 --alsa-format dsd_u32_be
+```
+
+The receiver deinterleaves the wire bytes into per-channel streams, repacks them at the right granularity (2 or 4 bytes per channel per ALSA frame), and reverses byte order within each group for `_le` variants. Any leftover bytes below one ALSA-frame's worth are carried over to the next packet, so payload alignment on the wire is not a concern.
+
+Common quirk → flag mapping:
+
+| DAC family                    | Typical ALSA format | Flag              |
+|-------------------------------|---------------------|-------------------|
+| Topping D90 / E70 / A90D      | DSD_U32_BE          | `dsd_u32_be`      |
+| SMSL M500 / M400              | DSD_U32_BE          | `dsd_u32_be`      |
+| RME ADI-2 DAC                 | DSD_U32_BE          | `dsd_u32_be`      |
+| Holo May / Spring / Cyan      | DSD_U32_BE          | `dsd_u32_be`      |
+| Older iFi / Chord             | DSD_U16_LE          | `dsd_u16_le`      |
+| DACs with pure DSD-UAC support | DSD_U8             | `dsd_u8` (default) |
+
+These are typical — trust `/proc/asound` over this table.
 
 ## Step 3 — playing real DSD content
 
@@ -95,10 +115,10 @@ Mode C feedback still applies and behaves identically to PCM: the receiver sampl
 
 ## Troubleshooting
 
-**Receiver: `snd_pcm_set_params (ch=2 rate=352800 fmt=dsd64): Invalid argument`** — DAC doesn't advertise DSD_U8. See Step 2 above.
+**Receiver: `snd_pcm_set_params (ch=2 alsa_rate=... fmt=dsd64 alsa=dsd_u8): Invalid argument`** — DAC doesn't advertise DSD_U8 at that rate. See Step 2 above and try `--alsa-format dsd_u32_be` (most common) or `dsd_u16_le`.
 
 **Talker: `AVTP AAF does not carry DSD; use --transport l2 or ip with --format dsd*`** — correct; AAF is PCM-only. Switch transport.
 
 **Receiver: `dropped` counter rises with `rx=0`** — frames are arriving but the format code in the header doesn't match CLI. Make sure both talker and receiver use the same `--format`.
 
-**Receiver: `underruns` counter rises steadily** — DSD bandwidth at DSD512 stereo is ~22 Mbps; if the network or the DAC's USB path can't sustain that, underruns follow. Try a lower DSD rate or check for USB 2.0 hub contention (DSD512 requires a direct USB 2.0 HS connection, no hub in most cases).
+**Receiver: `underruns` counter rises steadily** — DSD bandwidth at DSD256 stereo is ~11 Mbps; if the network or the DAC's USB path can't sustain that, underruns follow. Try a lower DSD rate or check for USB 2.0 hub contention (DSD256+ generally wants a direct USB 2.0 HS connection, no hub in most cases).
