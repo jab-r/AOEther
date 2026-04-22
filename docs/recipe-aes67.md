@@ -67,15 +67,26 @@ Each entry comes with a ready-to-run receiver command, so you can copy-paste it 
 
 ## Phase B: SAP announcement + SDP
 
-Pass `--announce-sap` to have the talker periodically multicast an SDP describing this session on `239.255.255.255:9875`:
+Pass `--announce-sap` to have the talker periodically multicast an SDP describing this session.
+The SAP family is auto-derived from `--dest-ip`: an IPv4 destination announces on `239.255.255.255:9875` (AES67 baseline); an IPv6 destination announces on `[ff0e::2:7ffe]:9875` (RFC 2974 §3 global scope) and emits an `IN IP6` SDP.
 
 ```sh
+# IPv4 (AES67 baseline — what almost every controller speaks today)
 sudo ./build/talker --iface eno1 --transport rtp \
                     --dest-ip 239.69.1.10 \
                     --source testtone --channels 2 --rate 48000 \
                     --announce-sap \
                     --session-name "AOEther / Kitchen DAC"
+
+# IPv6 (less common; supported for parity with the IPv6 data path)
+sudo ./build/talker --iface eno1 --transport rtp \
+                    --dest-ip ff3e::beef --port 5004 \
+                    --source testtone --channels 2 --rate 48000 \
+                    --announce-sap \
+                    --session-name "AOEther / Kitchen DAC (v6)"
 ```
+
+`--list-sap` on the receiver listens on both families simultaneously, so a v4-only controller and a v6-only controller can discover the same talker depending on which family it announces on.
 
 Announcements go out every 30 s while the talker runs. When it exits cleanly (SIGINT / SIGTERM), it sends one SAP deletion packet so controllers drop the session promptly instead of waiting out their session timeout.
 
