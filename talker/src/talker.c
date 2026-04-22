@@ -3,6 +3,8 @@
 #include "avtp.h"
 #include "packet.h"
 #include "rtp.h"
+#include "sap.h"
+#include "sdp.h"
 
 #include <pthread.h>
 
@@ -183,6 +185,26 @@ static int iface_lookup(int sock, const char *name, int *ifindex, uint8_t src_ma
     return 0;
 }
 
+/* Fetch the primary IPv4 address bound to `name` via SIOCGIFADDR. Used to
+ * populate the o= / a=source-filter fields of the outgoing SDP. Returns 0
+ * and writes the address (in network byte order) on success; returns -1
+ * if the interface has no IPv4 address (e.g. pure-L2 bring-up). */
+static int iface_ipv4(const char *name, uint32_t *out_be)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof ifr);
+    strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+    ifr.ifr_addr.sa_family = AF_INET;
+    int rc = ioctl(s, SIOCGIFADDR, &ifr);
+    close(s);
+    if (rc < 0) return -1;
+    const struct sockaddr_in *sin = (const struct sockaddr_in *)&ifr.ifr_addr;
+    *out_be = sin->sin_addr.s_addr;
+    return 0;
+}
+
 static int64_t ts_diff_ms(struct timespec a, struct timespec b)
 {
     return (int64_t)(a.tv_sec - b.tv_sec) * 1000 +
@@ -202,11 +224,26 @@ static void usage(const char *prog)
         "    --port N                        UDP port, default %d\n"
         "  --transport avtp             IEEE 1722 AAF, Milan interop (Mode 2, M5)\n"
         "    --dest-mac AA:BB:CC:DD:EE:FF    (required; unicast or AVTP multicast)\n"
-        "  --transport rtp              RTP/AES67 over UDP (Mode 4, M9 Phase A)\n"
+        "  --transport rtp              RTP/AES67 over UDP (Mode 4, M9)\n"
         "    --dest-ip X.Y.Z.W | v6:literal  (required; 239.X.X.X typical)\n"
         "    --port N                        UDP port, default 5004 (AES67)\n"
         "    --ptime US                      packet time: 1000 (AES67 default)\n"
         "                                    or 125 (low-latency profile)\n"
+        "    --announce-sap                  emit SAP announcements on\n"
+        "                                    239.255.255.255:9875 every 30 s\n"
+        "                                    so Dante Controller / ANEMAN /\n"
+        "                                    aes67-linux-daemon discover us\n"
+        "                                    (M9 Phase B)\n"
+        "    --session-name NAME             session name surfaced in SDP / SAP\n"
+        "                                    (default: hostname + stream id)\n"
+        "    --ptp                           use CLOCK_TAI for the RTP timestamp\n"
+        "                                    base and advertise PTPv2 traceable\n"
+        "                                    in SDP (M9 Phase C). Requires\n"
+        "                                    ptp4l + phc2sys running — see\n"
+        "                                    docs/ptp-setup.md.\n"
+        "    --sdp-only                      print the generated SDP to stdout\n"
+        "                                    and exit; use when a controller\n"
+        "                                    wants a static session file\n"
         "\n"
         "Source:\n"
         "  --source testtone|wav|alsa|dsdsilence|dsf|dff\n"
@@ -258,6 +295,10 @@ int main(int argc, char **argv)
     int ptime_us = 0;                 /* 0 = transport-default; user may set 125 or 1000 */
     int avdecc_enabled = 0;
     const char *entity_name = NULL;
+    int announce_sap = 0;
+    int ptp_enabled = 0;
+    int sdp_only = 0;
+    const char *session_name = NULL;
 
     static const struct option opts[] = {
         { "iface",     required_argument, 0, 'i' },
@@ -274,6 +315,10 @@ int main(int argc, char **argv)
         { "format",    required_argument, 0, 'F' },
         { "avdecc",    no_argument,       0, 'V' },
         { "name",      required_argument, 0, 'N' },
+        { "announce-sap",  no_argument,       0, 1002 },
+        { "session-name",  required_argument, 0, 1003 },
+        { "ptp",           no_argument,       0, 1004 },
+        { "sdp-only",      no_argument,       0, 1005 },
         { "help",      no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
@@ -300,6 +345,10 @@ int main(int argc, char **argv)
         case 'F': format_s = optarg; break;
         case 'V': avdecc_enabled = 1; break;
         case 'N': entity_name = optarg; break;
+        case 1002: announce_sap = 1; break;
+        case 1003: session_name = optarg; break;
+        case 1004: ptp_enabled = 1; break;
+        case 1005: sdp_only = 1; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -319,6 +368,12 @@ int main(int argc, char **argv)
     if ((transport == TRANSPORT_IP || transport == TRANSPORT_RTP) && !dest_ip_s) {
         fprintf(stderr, "talker: --dest-ip required for --transport %s\n",
                 transport == TRANSPORT_IP ? "ip" : "rtp");
+        return 2;
+    }
+    if ((announce_sap || ptp_enabled || sdp_only) && transport != TRANSPORT_RTP) {
+        fprintf(stderr,
+                "talker: --announce-sap / --ptp / --sdp-only require "
+                "--transport rtp\n");
         return 2;
     }
     if (transport == TRANSPORT_RTP && udp_port == DEFAULT_UDP_PORT) {
@@ -386,6 +441,61 @@ int main(int argc, char **argv)
     const uint8_t format_code = fmt.code;
     const int bytes_per_sample = fmt.bytes_per_sample;
     const int is_dsd = fmt.is_dsd;
+
+    /* M9 Phase B + C — build one canonical SDP for the current stream.
+     * Used by --sdp-only (print and exit) and --announce-sap (periodic
+     * multicast announcement in the main loop below). */
+    char sdp_text[SDP_MAX_LEN];
+    int  sdp_len = 0;
+    uint32_t origin_ipv4_be = 0;
+    struct sdp_params sdp = {0};
+    if (transport == TRANSPORT_RTP && (announce_sap || sdp_only)) {
+        if (iface_ipv4(iface, &origin_ipv4_be) < 0) {
+            fprintf(stderr,
+                    "talker: could not read IPv4 address of %s — "
+                    "--announce-sap / --sdp-only need an IPv4-assigned "
+                    "interface (set one with `ip addr add`, then retry)\n",
+                    iface);
+            return 2;
+        }
+        char origin_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &origin_ipv4_be, origin_ip, sizeof origin_ip);
+
+        sdp.origin_ip     = origin_ip;
+        sdp.dest_ip       = dest_ip_s;
+        sdp.port          = (uint16_t)udp_port;
+        sdp.ttl           = 32;
+        sdp.session_id    = (uint64_t)time(NULL);
+        sdp.session_version = sdp.session_id;
+        sdp.encoding      = SDP_ENC_L24;
+        sdp.sample_rate_hz = (uint32_t)rate_hz;
+        sdp.channels      = (uint8_t)channels;
+        sdp.payload_type  = RTP_DEFAULT_PT_L24;
+        sdp.ptime_us      = (uint32_t)ptime_us;
+        sdp.refclk        = ptp_enabled ? SDP_REFCLK_PTP_TRACEABLE
+                                        : SDP_REFCLK_NONE;
+        if (session_name) {
+            strncpy(sdp.session_name, session_name, SDP_MAX_SESSION_NAME - 1);
+            sdp.session_name[SDP_MAX_SESSION_NAME - 1] = '\0';
+        } else {
+            char host[64] = "aoether";
+            gethostname(host, sizeof host - 1);
+            snprintf(sdp.session_name, SDP_MAX_SESSION_NAME,
+                     "%s %uch/%u", host,
+                     (unsigned)channels, (unsigned)rate_hz);
+        }
+
+        sdp_len = sdp_build(sdp_text, sizeof sdp_text, &sdp);
+        if (sdp_len < 0) {
+            fprintf(stderr, "talker: SDP build failed\n");
+            return 1;
+        }
+
+        if (sdp_only) {
+            fwrite(sdp_text, 1, (size_t)sdp_len, stdout);
+            return 0;
+        }
+    }
 
     /* Default source depends on format: testtone (PCM sine) or dsdsilence.
      * --source dsf is the other DSD-capable source; everything else is PCM. */
@@ -816,15 +926,59 @@ int main(int argc, char **argv)
     /* RTP timestamp advances by samples-per-packet in the stream's media
      * clock ticks. Starts at a random-ish value to avoid collisions and
      * to match AES67's expectation that timestamps reflect media-clock
-     * state rather than wall-clock zero. We derive from a local monotonic
-     * timestamp at start; once PTPv2 lands (M9 Phase C) this becomes the
-     * PTP-disciplined timestamp. */
+     * state rather than wall-clock zero.
+     *
+     * Without --ptp the base is CLOCK_MONOTONIC (M9 Phase A). With --ptp
+     * the base is CLOCK_TAI, which linuxptp's phc2sys slews against the
+     * PTPv2 grandmaster. That matches the AES67 expectation that the
+     * RTP timestamp counts seconds from the PTP epoch on the media
+     * clock (M9 Phase C). */
     struct timespec rtp_start_ts;
-    clock_gettime(CLOCK_MONOTONIC, &rtp_start_ts);
+    clockid_t rtp_clock = ptp_enabled ? CLOCK_TAI : CLOCK_MONOTONIC;
+    clock_gettime(rtp_clock, &rtp_start_ts);
     uint32_t rtp_timestamp = (uint32_t)(
         (uint64_t)rtp_start_ts.tv_sec * (uint64_t)rate_hz +
         ((uint64_t)rtp_start_ts.tv_nsec * (uint64_t)rate_hz) / 1000000000ull);
     uint16_t rtp_seq16 = 0;
+
+    /* M9 Phase B — SAP announcer state. Opened once, used to periodically
+     * emit the SDP built above on 239.255.255.255:9875 so AES67
+     * controllers can discover this talker. Sending is driven from the
+     * main loop (every SAP_ANNOUNCE_INTERVAL_S seconds); one deletion
+     * packet is emitted on shutdown so controllers drop the session
+     * promptly instead of waiting for the session-timeout. */
+    int sap_fd = -1;
+    struct sockaddr_in sap_to = {0};
+    uint16_t sap_msg_id = 0;
+    struct timespec last_sap_ts = {0};
+    uint8_t sap_pkt[SDP_MAX_LEN + SAP_HDR_LEN + SAP_MIME_LEN];
+    int sap_pkt_len = 0;
+    if (announce_sap) {
+        sap_fd = sap_open_tx_socket(iface);
+        if (sap_fd < 0) {
+            fprintf(stderr,
+                    "talker: sap_open_tx_socket failed; continuing without "
+                    "SAP announcements\n");
+        } else {
+            sap_to.sin_family = AF_INET;
+            sap_to.sin_port   = htons(SAP_PORT);
+            inet_pton(AF_INET, SAP_IPV4_ADDR_STR, &sap_to.sin_addr);
+            /* RFC 2974 msg-id hash: any stable 16-bit value for this
+             * session. XOR low halves of session_id to get one. */
+            sap_msg_id = (uint16_t)(sdp.session_id ^ (sdp.session_id >> 16));
+
+            sap_pkt_len = sap_build(sap_pkt, sizeof sap_pkt,
+                                    SAP_ANNOUNCE,
+                                    origin_ipv4_be, sap_msg_id,
+                                    sdp_text, (size_t)sdp_len);
+            if (sap_pkt_len > 0) {
+                ssize_t n = sendto(sap_fd, sap_pkt, (size_t)sap_pkt_len, 0,
+                                   (struct sockaddr *)&sap_to, sizeof sap_to);
+                if (n < 0) perror("sendto(SAP announce)");
+            }
+            clock_gettime(CLOCK_MONOTONIC, &last_sap_ts);
+        }
+    }
 
     /* Predicted fragment count for the nominal microframe. K=1 is the
      * common case; larger values report the split that will be applied
@@ -870,7 +1024,7 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "talker: transport=%s dest=%s:%d family=%s %s\n"
                 "        iface=%s ifindex=%d\n"
-                "        fmt=%s ch=%d rate=%d pps=%.0f nominal_spp=%.2f max_frag_pc=%d frags/packet=%d max_payload=%zuB feedback=%s%s\n",
+                "        fmt=%s ch=%d rate=%d pps=%.0f nominal_spp=%.2f max_frag_pc=%d frags/packet=%d max_payload=%zuB feedback=%s%s%s%s\n",
                 label, ip_str, udp_port,
                 dest_family == AF_INET ? "v4" : "v6",
                 dest_is_multicast ? "multicast" : "unicast",
@@ -880,7 +1034,9 @@ int main(int argc, char **argv)
                 pps, nominal_spm, max_frag_pc, nominal_K,
                 max_frame - sizeof(struct ether_header),
                 feedback_enabled_for_transport ? "on" : "off",
-                transport == TRANSPORT_RTP ? " (AES67 relies on PTPv2)" : "");
+                transport == TRANSPORT_RTP ? " (AES67 relies on PTPv2)" : "",
+                transport == TRANSPORT_RTP && sap_fd >= 0  ? " sap=on"  : "",
+                transport == TRANSPORT_RTP && ptp_enabled  ? " ptp=TAI" : "");
     }
 
     /* Mode C talker state: current target samples-per-microframe, fractional
@@ -908,6 +1064,20 @@ int main(int argc, char **argv)
     uint64_t fb_rx = 0, fb_ignored = 0;
 
     while (!g_stop) {
+        /* 0. Re-emit SAP announcement every SAP_ANNOUNCE_INTERVAL_S
+         *    seconds. Cheap — one sendto() per 30 s against monotonic. */
+        if (sap_fd >= 0 && sap_pkt_len > 0) {
+            struct timespec mono_now;
+            clock_gettime(CLOCK_MONOTONIC, &mono_now);
+            if (mono_now.tv_sec - last_sap_ts.tv_sec >=
+                (time_t)SAP_ANNOUNCE_INTERVAL_S) {
+                ssize_t n = sendto(sap_fd, sap_pkt, (size_t)sap_pkt_len, 0,
+                                   (struct sockaddr *)&sap_to, sizeof sap_to);
+                if (n < 0 && errno != EINTR) perror("sendto(SAP refresh)");
+                last_sap_ts = mono_now;
+            }
+        }
+
         /* 1. Drain any pending feedback frames (non-blocking). RTP/AES67
          * doesn't use AOEther's UAC2-shape feedback (AES67 devices rely
          * on PTPv2 for clocking), so we skip the drain and the
@@ -1182,6 +1352,22 @@ skip_feedback:
             "talker: shutting down; sent=%u late_wakeups=%llu fb_rx=%llu fb_ignored=%llu\n",
             seq, (unsigned long long)late_wakeups,
             (unsigned long long)fb_rx, (unsigned long long)fb_ignored);
+
+    /* SAP: one deletion packet so controllers drop the session promptly
+     * rather than waiting out the session timeout (~minutes). Best-effort. */
+    if (sap_fd >= 0 && sdp_len > 0) {
+        uint8_t del_pkt[SDP_MAX_LEN + SAP_HDR_LEN + SAP_MIME_LEN];
+        int del_len = sap_build(del_pkt, sizeof del_pkt,
+                                SAP_DELETION,
+                                origin_ipv4_be, sap_msg_id,
+                                sdp_text, (size_t)sdp_len);
+        if (del_len > 0) {
+            ssize_t n = sendto(sap_fd, del_pkt, (size_t)del_len, 0,
+                               (struct sockaddr *)&sap_to, sizeof sap_to);
+            (void)n;
+        }
+        close(sap_fd);
+    }
 
     src->close(src);
     close(tfd);
