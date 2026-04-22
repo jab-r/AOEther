@@ -4,7 +4,7 @@
 
 Pairs with [`docs/recipe-milan.md`](recipe-milan.md), which covers the AAF data path — this recipe is about the control plane.
 
-**Step 2 status:** ADP advertising works. Hive and other Milan controllers discover AOEther receivers and talkers and can browse their descriptors (entity name, group name, firmware version). The entity's single configuration is minimal — step 3 expands it with `STREAM_INPUT` / `STREAM_OUTPUT` / `AUDIO_UNIT` / `AVB_INTERFACE` descriptors and wires an ACMP delegate so Hive's "Connect" button actually drives the AOEther data path.
+**Step 3 status:** full descriptor tree.  The entity now advertises one `STREAM_INPUT` (listener) or `STREAM_OUTPUT` (talker) at 48 kHz / 24-bit / stereo AAF, parented under `AUDIO_UNIT` / `CLOCK_DOMAIN` / `CLOCK_SOURCE` with an `AVB_INTERFACE` carrying the iface's real MAC.  Hive renders a complete entity and the Connect button is enabled.  Clicking Connect updates la_avdecc's internal stream state, which is visible in Hive's inspector — but AOEther's data path still uses CLI `--dest-mac` / learned-first-frame until step 4 wires ACMP state changes through to the receiver's talker-MAC learning and the talker's dest-MAC override.
 
 ## One-time setup
 
@@ -49,7 +49,7 @@ Banner includes:
 
 ```
 avdecc: entity up (role=listener name="living-room-dac" iface=eth0 EID=0x....)
-        [Phase B step 2 — streams + ACMP handler arrive in step 3]
+        [Phase B step 3 — stream visible in Hive; ACMP→data-path is step 4]
 ```
 
 ### Talker side (talker entity)
@@ -89,4 +89,4 @@ Run both on the same receiver if you want — they answer different clients on d
 
 **Entity not visible in Hive** — both machines must be on the same L2 segment (AVDECC is not routed through IP gateways); no firewall may drop EtherType `0x22F0` or `0x88B5`; the receiver/talker must be running as root (CAP_NET_RAW) so PCap can open the interface. `enableEntityAdvertising failed (EntityID already in use?)` in the log means another entity on the network is using the same EID — currently AOEther synthesizes EIDs from MAC + role, so two AOEther listeners on the same box collide; use two different interfaces or run only one for now.
 
-**Entity visible but "Connect" has no effect** — expected through step 2. Step 2 delivers discovery only; step 3 adds ACMP CONNECT handling that drives the AOEther data path. Hive will either show "Stream format not compatible" or simply do nothing when you drag-connect. Until step 3 lands, drive the data path manually with `--dest-mac` on the talker after noting the receiver's MAC from Hive's entity details pane.
+**Connect succeeds in Hive but no audio flows** — expected through step 3.  Step 3 delivers the descriptor tree and protocol-level Connect; Hive will mark the stream as `Connected` and its inspector will show the bound talker/listener.  Step 4 wires that state through to the data path so the receiver learns the talker's MAC from ACMP and the talker emits to the listener's stream-destination MAC.  Until step 4 lands, drive the data path manually: note the peer's MAC from Hive's entity details pane, then pass `--dest-mac` on the talker and let the receiver learn the talker from the first data frame as before.

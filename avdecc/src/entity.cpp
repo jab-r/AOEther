@@ -1,19 +1,28 @@
 /* AOEther ↔ la_avdecc glue (C++ side of the wrapper).
  *
- * M7 Phase B step 2: real AVDECC entity.  Opens a PCap-backed
- * ProtocolInterface on the named iface, creates a la_avdecc
- * AggregateEntity with a minimal EntityTree (one configuration, the
- * --name flag surfaced as the ENTITY descriptor's entityName), and
- * enables ADP advertising.  Hive and other Milan controllers will see
- * the entity and can browse its descriptors.
+ * M7 Phase B step 3: full descriptor tree.  Beyond step 2's entity
+ * name and configuration label, the tree now carries one
+ * STREAM_INPUT (listener role) or STREAM_OUTPUT (talker role) plus the
+ * AUDIO_UNIT / AVB_INTERFACE / CLOCK_SOURCE / CLOCK_DOMAIN /
+ * AUDIO_CLUSTER / AUDIO_MAP descendants Hive needs to render Connect.
  *
- * Step 3 (next commit) expands the ConfigurationTree with STREAM_INPUT
- * or STREAM_OUTPUT descriptors and wires an ACMP delegate so Hive's
- * "Connect" button drives AOEther's data path.
+ * The stream is advertised in an AAF-48k-24bit-2ch format by default
+ * (multichannel variants land with the capability-matrix work in
+ * Phase B step 5 / M8).  DSD streams are still exposed on the L2
+ * or IP path only — AAF is PCM-only by design, so listener/talker
+ * entities for DSD run with a no-op AVDECC side until AVDECC gains
+ * a native-DSD format, which is post-M9 work.
  *
- * Kept #include-light: la_avdecc is a heavy dependency and dragging its
- * templates through every translation unit slows incremental builds.
- * This file is the only place in AOEther that includes la_avdecc.
+ * Step 4 (next commit) wires ACMP CONNECT state changes into the
+ * AOEther data path via the on_bind / on_unbind callbacks declared
+ * in avdecc.h.  Until step 4 lands, Hive's Connect button updates
+ * la_avdecc's internal state and is visible in Hive, but AOEther's
+ * data path keeps using CLI --dest-mac / learned-first-frame.
+ *
+ * Kept #include-light: la_avdecc is a heavy dependency and dragging
+ * its templates through every translation unit slows incremental
+ * builds.  This file is the only place in AOEther that includes
+ * la_avdecc.
  */
 
 #include "avdecc.h"
@@ -97,33 +106,153 @@ struct AoetherEntity {
     model::EntityTree         entityTree {};
 };
 
-/* Build the smallest EntityTree that Hive can render — one
- * configuration with an entityName.  Step 3 adds STREAM_INPUT or
- * STREAM_OUTPUT descriptors and their AUDIO_UNIT / AVB_INTERFACE
- * parents so the "Connect" button has something to connect. */
-static void buildMinimalTree(model::EntityTree &tree, const std::string &name)
+/* Build a full EntityTree Hive can render + offer Connect on.
+ *
+ * One AUDIO_UNIT, one AVB_INTERFACE, one CLOCK_SOURCE, one CLOCK_DOMAIN,
+ * one STREAM_INPUT (listener) or one STREAM_OUTPUT (talker), each with
+ * the minimum static + dynamic fields populated.
+ *
+ * Stream format is hardcoded to 48 kHz / 24-bit / stereo AAF for now.
+ * Wider format matrices (multichannel, hi-res, variable channel count)
+ * land with the capability-advertisement work in Phase B step 5. */
+static void buildEntityTree(model::EntityTree &tree,
+                            const std::string &name,
+                            const aoether_avdecc_config &cfg)
 {
-    /* Static model: vendor/model name strings are references into the
-     * STRINGS descriptor.  Leaving them at default (no-reference)
-     * prints as "(null)" in Hive; step 3 will populate a STRINGS
-     * descriptor and reference it here so the vendor/model rows render. */
-    tree.staticModel = model::EntityNodeStaticModel{};
+    using namespace la::avdecc::entity::model;
 
-    /* Dynamic model: the entity name is what shows up as the row label
-     * in Hive's controller pane. */
-    tree.dynamicModel = model::EntityNodeDynamicModel{};
+    tree.staticModel  = EntityNodeStaticModel{};
+    tree.dynamicModel = EntityNodeDynamicModel{};
     setFixedString(tree.dynamicModel.entityName,    name);
     setFixedString(tree.dynamicModel.groupName,     "AOEther");
-    setFixedString(tree.dynamicModel.firmwareVersion, "0.1 (M7 Phase B step 2)");
+    setFixedString(tree.dynamicModel.firmwareVersion, "0.1 (M7 Phase B step 3)");
     setFixedString(tree.dynamicModel.serialNumber,  "");
     tree.dynamicModel.currentConfiguration = AOETHER_CONF_INDEX;
 
-    /* One configuration — stays mostly empty until step 3 adds
-     * stream / audio-unit / avb-interface descriptors. */
-    model::ConfigurationTree conf{};
-    conf.dynamicModel.objectName          = model::AvdeccFixedString{ "AOEther Stream" };
+    ConfigurationTree conf{};
+    conf.dynamicModel.objectName            = AvdeccFixedString{ "AOEther Stream" };
     conf.dynamicModel.isActiveConfiguration = true;
+
+    const SamplingRate sr48k{ 48000u };
+    const std::uint16_t streamChannels = 2;
+
+    /* AAF-PCM 48k/24-bit/2ch/6-samples-per-frame. samplesPerFrame=6
+     * matches AAF's SDT 8 kHz packet cadence at 48 kHz (48000/8000=6). */
+    const StreamFormat aafStreamFormat =
+        StreamFormatInfo::buildFormat_AAF(streamChannels,
+                                          /*isUpToChannelsCount=*/false,
+                                          sr48k,
+                                          SampleFormat::Int24,
+                                          /*sampleBitDepth=*/24,
+                                          /*samplesPerFrame=*/6);
+
+    /* -- AVB_INTERFACE[0] ------------------------------------------------- */
+    AvbInterfaceNodeModels avb{};
+    avb.staticModel.localizedDescription = LocalizedStringReference{};
+    avb.staticModel.interfaceFlags       = la::avdecc::entity::AvbInterfaceFlags{};
+    avb.dynamicModel.objectName          = AvdeccFixedString{ "eth0" };
+    /* MAC address is filled in after open from the iface's real HW
+     * address; leaving it zeroed here produces an invalid ADP field,
+     * so we patch it in aoether_avdecc_cpp_open after EndStation
+     * creation gives us access to the protocol interface. */
+    conf.avbInterfaceModels[AvbInterfaceIndex{ 0 }] = std::move(avb);
+
+    /* -- CLOCK_SOURCE[0] -------------------------------------------------- */
+    ClockSourceNodeModels cs{};
+    cs.staticModel.localizedDescription = LocalizedStringReference{};
+    cs.staticModel.clockSourceType      = ClockSourceType::Internal;
+    cs.staticModel.clockSourceLocationType  = DescriptorType::AudioUnit;
+    cs.staticModel.clockSourceLocationIndex = DescriptorIndex{ 0 };
+    cs.dynamicModel.objectName          = AvdeccFixedString{ "Internal" };
+    conf.clockSourceModels[ClockSourceIndex{ 0 }] = std::move(cs);
+
+    /* -- CLOCK_DOMAIN[0] -------------------------------------------------- */
+    ClockDomainNodeModels cd{};
+    cd.staticModel.localizedDescription = LocalizedStringReference{};
+    cd.staticModel.clockSources         = ClockSources{ ClockSourceIndex{ 0 } };
+    cd.dynamicModel.objectName          = AvdeccFixedString{ "Clock Domain" };
+    cd.dynamicModel.clockSourceIndex    = ClockSourceIndex{ 0 };
+    conf.clockDomainModels[ClockDomainIndex{ 0 }] = std::move(cd);
+
+    /* -- AUDIO_UNIT[0] ---------------------------------------------------- */
+    AudioUnitTree au{};
+    au.audioUnitModels.staticModel.localizedDescription = LocalizedStringReference{};
+    au.audioUnitModels.staticModel.clockDomainIndex     = ClockDomainIndex{ 0 };
+    au.audioUnitModels.staticModel.samplingRates        = SamplingRates{ sr48k };
+    au.audioUnitModels.dynamicModel.objectName          = AvdeccFixedString{ "Audio Unit" };
+    au.audioUnitModels.dynamicModel.currentSamplingRate = sr48k;
+    if (cfg.role == AOETHER_AVDECC_LISTENER) {
+        au.audioUnitModels.staticModel.numberOfStreamInputPorts = 1;
+    } else {
+        au.audioUnitModels.staticModel.numberOfStreamOutputPorts = 1;
+    }
+    /* One STREAM_PORT_INPUT or STREAM_PORT_OUTPUT with a single
+     * AUDIO_CLUSTER (the stereo pair).  No AUDIO_MAP entries — Hive
+     * accepts an empty mapping, and full channel mapping is step 5's
+     * work along with the multichannel format matrix. */
+    StreamPortTree sp{};
+    sp.staticModel.clockDomainIndex = ClockDomainIndex{ 0 };
+    sp.staticModel.numberOfClusters = 1;
+    sp.staticModel.baseCluster      = ClusterIndex{ 0 };
+    AudioClusterNodeModels cluster{};
+    cluster.staticModel.localizedDescription = LocalizedStringReference{};
+    cluster.staticModel.signalType           = DescriptorType::Invalid;
+    cluster.staticModel.signalIndex          = DescriptorIndex{ 0 };
+    cluster.staticModel.channelCount         = streamChannels;
+    cluster.staticModel.format               = AudioClusterFormat::Mbla;
+    cluster.dynamicModel.objectName          = AvdeccFixedString{ "L/R" };
+    sp.audioClusterModels[ClusterIndex{ 0 }] = std::move(cluster);
+    if (cfg.role == AOETHER_AVDECC_LISTENER) {
+        au.streamPortInputTrees[StreamPortIndex{ 0 }] = std::move(sp);
+    } else {
+        au.streamPortOutputTrees[StreamPortIndex{ 0 }] = std::move(sp);
+    }
+    conf.audioUnitTrees[AudioUnitIndex{ 0 }] = std::move(au);
+
+    /* -- STREAM_INPUT[0] or STREAM_OUTPUT[0] ------------------------------ */
+    StreamNodeStaticModel sm{};
+    sm.localizedDescription = LocalizedStringReference{};
+    sm.clockDomainIndex     = ClockDomainIndex{ 0 };
+    sm.streamFlags          = la::avdecc::entity::StreamFlags{};
+    sm.avbInterfaceIndex    = AvbInterfaceIndex{ 0 };
+    sm.bufferLength         = 0;
+    sm.formats              = StreamFormats{ aafStreamFormat };
+    if (cfg.role == AOETHER_AVDECC_LISTENER) {
+        StreamInputNodeModels s{};
+        s.staticModel              = std::move(sm);
+        s.dynamicModel.objectName  = AvdeccFixedString{ "Input Stream" };
+        s.dynamicModel.streamFormat = aafStreamFormat;
+        conf.streamInputModels[StreamIndex{ 0 }] = std::move(s);
+    } else {
+        StreamOutputNodeModels s{};
+        s.staticModel              = std::move(sm);
+        s.dynamicModel.objectName  = AvdeccFixedString{ "Output Stream" };
+        s.dynamicModel.streamFormat = aafStreamFormat;
+        conf.streamOutputModels[StreamIndex{ 0 }] = std::move(s);
+    }
+
     tree.configurationTrees[AOETHER_CONF_INDEX] = std::move(conf);
+}
+
+/* Read the iface MAC via SIOCGIFHWADDR and patch it into the
+ * AVB_INTERFACE descriptor's dynamic model. la_avdecc also fills this
+ * in internally from the ProtocolInterface for ADPDU emission, but
+ * the AEM descriptor needs a matching value so Hive's interface pane
+ * renders the expected MAC. */
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <net/if.h>
+static bool readIfaceMac(const char *iface, std::uint8_t mac[6])
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return false;
+    struct ifreq ifr{};
+    std::strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+    const bool ok = ioctl(s, SIOCGIFHWADDR, &ifr) == 0;
+    ::close(s);
+    if (!ok) return false;
+    std::memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+    return true;
 }
 
 static std::string defaultEntityName(const aoether_avdecc_config &cfg)
@@ -181,7 +310,20 @@ extern "C" void *aoether_avdecc_cpp_open(const struct aoether_avdecc_config *cfg
                           (static_cast<std::uint16_t>(AOETHER_DEVICE_REV) << 8) |
                           (cfg->role == AOETHER_AVDECC_LISTENER ? 0x01 : 0x02));
 
-    buildMinimalTree(e->entityTree, name);
+    buildEntityTree(e->entityTree, name, *cfg);
+
+    /* Patch the iface's real MAC into the AVB_INTERFACE dynamic model
+     * before handing the tree to AggregateEntity::create (which takes
+     * a snapshot on construction). */
+    std::uint8_t hwaddr[6] = {};
+    if (readIfaceMac(cfg->iface, hwaddr)) {
+        auto &confRef = e->entityTree.configurationTrees[AOETHER_CONF_INDEX];
+        auto itAvb = confRef.avbInterfaceModels.find(
+            la::avdecc::entity::model::AvbInterfaceIndex{ 0 });
+        if (itAvb != confRef.avbInterfaceModels.end()) {
+            std::memcpy(itAvb->second.dynamicModel.macAddress.data(), hwaddr, 6);
+        }
+    }
 
     try {
         e->aggEntity = e->endStation->addAggregateEntity(progID,
@@ -216,7 +358,7 @@ extern "C" void *aoether_avdecc_cpp_open(const struct aoether_avdecc_config *cfg
 
     std::fprintf(stderr,
                  "avdecc: entity up (role=%s name=\"%s\" iface=%s EID=0x%016llx)\n"
-                 "        [Phase B step 2 — streams + ACMP handler arrive in step 3]\n",
+                 "        [Phase B step 3 — stream visible in Hive; ACMP→data-path is step 4]\n",
                  cfg->role == AOETHER_AVDECC_LISTENER ? "listener" : "talker",
                  name.c_str(),
                  cfg->iface,
