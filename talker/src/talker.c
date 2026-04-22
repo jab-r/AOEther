@@ -194,9 +194,11 @@ static void usage(const char *prog)
         "    --dest-mac AA:BB:CC:DD:EE:FF    (required; unicast or AVTP multicast)\n"
         "\n"
         "Source:\n"
-        "  --source testtone|wav|alsa|dsdsilence   default: testtone (pcm) /\n"
-        "                                          dsdsilence when --format is DSD\n"
-        "  --file   PATH                WAV file, required with --source wav\n"
+        "  --source testtone|wav|alsa|dsdsilence|dsf\n"
+        "                               default: testtone (pcm) /\n"
+        "                               dsdsilence when --format is DSD\n"
+        "  --file   PATH                WAV file for --source wav,\n"
+        "                               DSF file for --source dsf\n"
         "  --capture hw:CARD=...        ALSA capture device, required with --source alsa\n"
         "\n"
         "Stream format:\n"
@@ -328,14 +330,21 @@ int main(int argc, char **argv)
     const int bytes_per_sample = fmt.bytes_per_sample;
     const int is_dsd = fmt.is_dsd;
 
-    /* Default source depends on format: testtone (PCM sine) or dsdsilence. */
+    /* Default source depends on format: testtone (PCM sine) or dsdsilence.
+     * --source dsf is the other DSD-capable source; everything else is PCM. */
+    const int source_is_dsd = source && (strcmp(source, "dsdsilence") == 0 ||
+                                         strcmp(source, "dsf") == 0);
     if (!source) {
         source = is_dsd ? "dsdsilence" : "testtone";
-    } else if (is_dsd && strcmp(source, "dsdsilence") != 0) {
-        fprintf(stderr, "talker: --source %s is PCM-only; native DSD requires --source dsdsilence (default)\n", source);
+    } else if (is_dsd && !source_is_dsd) {
+        fprintf(stderr,
+                "talker: --source %s is PCM-only; native DSD requires "
+                "--source dsdsilence (default) or --source dsf\n", source);
         return 2;
-    } else if (!is_dsd && strcmp(source, "dsdsilence") == 0) {
-        fprintf(stderr, "talker: --source dsdsilence requires --format dsd64|128|256|512\n");
+    } else if (!is_dsd && source_is_dsd) {
+        fprintf(stderr,
+                "talker: --source %s requires --format dsd64|dsd128|dsd256\n",
+                source);
         return 2;
     }
 
@@ -441,6 +450,22 @@ int main(int argc, char **argv)
         src = audio_source_alsa_open(capture_pcm, channels, rate_hz);
     } else if (strcmp(source, "dsdsilence") == 0) {
         src = audio_source_dsd_silence_open(channels, rate_hz);
+    } else if (strcmp(source, "dsf") == 0) {
+        if (!wav_path) {
+            fprintf(stderr, "talker: --file PATH.dsf required with --source dsf\n");
+            return 2;
+        }
+        src = audio_source_dsf_open(wav_path);
+        if (src && (src->channels != channels || src->rate != rate_hz)) {
+            fprintf(stderr,
+                    "talker: DSF file is ch=%d rate=%d (DSD bytes/s/ch); "
+                    "talker configured ch=%d rate=%d. They must match — "
+                    "use --format dsd64|dsd128|dsd256 matching the file, "
+                    "and --channels to match.\n",
+                    src->channels, src->rate, channels, rate_hz);
+            src->close(src);
+            return 2;
+        }
     } else {
         fprintf(stderr, "talker: unknown --source %s\n", source);
         return 2;

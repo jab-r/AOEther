@@ -423,7 +423,7 @@ M3 is split into two sub-phases because it's mostly hardware work:
 
 **Out of scope for M6 (tracked as follow-ups):**
 - DoP encoder on the talker (format codes `0x20..0x23`). The wire format already reserves them; wiring up a PCM-wrapped-DSD source needs a small DoP modulator which is straightforward but didn't make M6's code budget.
-- DSF / DFF file reader. `.dsf` is simple (Sony spec, LSB-first per-byte bit order — inverse of our wire format, so a bit-reverse step is needed on read) but the per-DAC quirk testing it enables is better concentrated in M8 alongside DSD512+.
+- DSF file reader shipped as a post-M6 follow-up (`talker/src/audio_source_dsf.c`; see `docs/recipe-dsd.md` §"Step 3"). Handles the Sony spec's block-per-channel interleave and LSB-first per-byte bit order (AOE wire is MSB-first, so each byte is bit-reversed on read). DFF remains deferred — the per-DAC quirk testing it enables is better concentrated in M8 alongside DSD512+.
 - DSD512 / DSD1024 / DSD2048. DSD512 overflows the u8 `payload_count` field; DSD1024 stereo additionally breaks the 1500-byte MTU. Packet splitting + `last-in-group` reassembly arrives in M8.
 
 **Key note:** This milestone is dramatically simpler than it was in earlier drafts because `snd_usb_audio` already does the hard work. Our code is about wire format and format selection, not kernel drivers.

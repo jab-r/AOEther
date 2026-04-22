@@ -19,6 +19,15 @@ struct audio_source *audio_source_alsa_open(const char *pcm_name, int channels, 
  * DSD64 it's 352800, for DSD256 it's 1411200. `read()` returns the idle
  * pattern (`AOE_DSD_IDLE_BYTE`) interleaved across channels — acoustically
  * silent on a real DAC, but exercises the full wire-format and ALSA
- * native-DSD path. A real DSF/DFF file reader is deferred to M8 alongside
- * DSD1024/2048 because it ties into the same per-DAC-quirk matrix. */
+ * native-DSD path. */
 struct audio_source *audio_source_dsd_silence_open(int channels, int dsd_byte_rate);
+
+/* DSF file reader. Opens a Sony DSF (DSD Stream File) and exposes its
+ * contents through the standard audio_source interface. The reader
+ * deinterleaves DSF's 4096-byte-per-channel blocks into AOE's byte-
+ * granular wire interleave and bit-reverses each byte when the file is
+ * stored LSB-first (the usual bits_per_sample=1 case). Supported rates:
+ * DSD64 / DSD128 / DSD256; DSD512+ is rejected pending the M8 packet-
+ * splitting extension. The caller must verify the DSF's reported channels
+ * and rate match --format / --channels, exactly as for the WAV source. */
+struct audio_source *audio_source_dsf_open(const char *path);
