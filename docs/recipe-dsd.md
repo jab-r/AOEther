@@ -17,8 +17,8 @@ For the wire-format byte layout see [`wire-format.md`](wire-format.md) §"Native
 
 ## What does NOT work yet
 
-- **DFF (.dff) file reading.** AOEther ships a DSF reader (Sony `.dsf`) but not a DSF-Interchange-File-Format reader. DFF is a straightforward follow-up — its bit order already matches the AOE wire format (MSB-first) — but is deferred alongside the per-DAC quirk matrix.
 - **DoP mode is not wired up.** The wire format reserves codes `0x20..0x23` for DoP (PCM s24le-3 with 0x05 / 0xFA marker bytes at inflated rates), and talker/receiver framework would accept them, but the talker has no DoP encoder source yet. If a DAC works only through DoP and not native DSD, use PCM mode for now and wait for the DoP encoder.
+- **DST-compressed DFF files.** The DFF reader accepts uncompressed DSDIFF (the usual `DSD ` CMPR type). DST compression decompression is not implemented; files that advertise `DST ` compression are rejected at open.
 
 ## Step 1 — smoke test: talker → receiver → DSD DAC
 
@@ -91,26 +91,27 @@ These are typical — trust `/proc/asound` over this table.
 
 ## Step 3 — playing real DSD content
 
-The talker accepts Sony DSF (`.dsf`) files via `--source dsf --file PATH.dsf`. Point `--format` at the file's DSD rate and `--channels` at its channel count; the file is validated at startup and loops when it hits EOF (same semantics as the WAV source).
+The talker accepts two native-DSD file formats: Sony DSF (`.dsf`) via `--source dsf --file PATH.dsf`, and Philips/Sony DSDIFF (`.dff`) via `--source dff --file PATH.dff`. Point `--format` at the file's DSD rate and `--channels` at its channel count; the file is validated at startup and loops when it hits EOF (same semantics as the WAV source). Both readers accept DSD64 through DSD2048 — DSD512 and higher ride the per-microframe packet-splitting path added in M8.
 
 ```sh
 # DSD64 stereo .dsf, Mode 1 transport:
 sudo ./build/talker --iface eno1 --dest-mac <receiver-iface-MAC> \
                     --source dsf --file track.dsf \
                     --format dsd64 --channels 2
+
+# DSD256 stereo .dff, IP transport:
+sudo ./build/talker --iface eno1 --transport ip --dest-ip 10.0.0.42 \
+                    --source dff --file track.dff \
+                    --format dsd256 --channels 2
 ```
 
-What the reader does internally:
+What the readers do internally:
 
-- Parses the DSF header, `fmt ` chunk, and `data` chunk per the Sony DSF 1.01 spec.
-- Deinterleaves the file's 4096-byte-per-channel blocks into AOE's byte-granular channel interleave on every `read()`.
-- Bit-reverses each byte when the file is stored LSB-first (`bits_per_sample=1`, the usual case) so the wire stream comes out MSB-first.
-- Validates the file's declared channels and sampling frequency against the configured `--format` / `--channels`. Mismatches abort at startup — AOEther never resamples.
-- Rejects DSD512+ DSF content with a clear error pointing at M8 (packet-splitting extension needed).
+- **DSF (`audio_source_dsf.c`)**: parses the DSD/fmt/data chunks per Sony DSF 1.01, deinterleaves the file's 4096-byte-per-channel block layout into AOE's byte-granular channel interleave, and bit-reverses each byte when the file is stored LSB-first (`bits_per_sample=1`, the usual case) so the wire stream comes out MSB-first.
+- **DFF (`audio_source_dff.c`)**: parses DSDIFF 1.5 — walks FRM8 sub-chunks to locate PROP and DSD, extracts sample rate and channel count from PROP/SND. DSDIFF's payload already matches the AOE wire format (byte-interleaved across channels, MSB-first within each byte), so `read()` memcpys straight from the mmap. DST-compressed DSDIFF is rejected.
+- Both readers validate the file's declared channels and sampling frequency against the configured `--format` / `--channels`. Mismatches abort at startup — AOEther never resamples.
 
-The bridge-via-snd-aloop pattern used for PCM (`docs/recipe-roon.md`, `docs/recipe-capture.md`) still does not work for DSD streams because `snd-aloop` is PCM-only. The DSF reader is the intended path for local DSD file playback today.
-
-DFF (`.dff`) files are a tracked follow-up; HQPlayer's NAA remains a reasonable external option for DFF or for content above DSD256 until M8 lands.
+The bridge-via-snd-aloop pattern used for PCM (`docs/recipe-roon.md`, `docs/recipe-capture.md`) still does not work for DSD streams because `snd-aloop` is PCM-only. The file readers are the intended path for local DSD playback.
 
 ## Step 4 — DSD + IP/UDP
 

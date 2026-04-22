@@ -31,3 +31,11 @@ struct audio_source *audio_source_dsd_silence_open(int channels, int dsd_byte_ra
  * wire). The caller must verify the DSF's reported channels and rate match
  * --format / --channels, exactly as for the WAV source. */
 struct audio_source *audio_source_dsf_open(const char *path);
+
+/* DFF (Philips/Sony DSDIFF) file reader. DSDIFF's byte interleave already
+ * matches AOE's wire format (byte-granular channel interleave, MSB-first
+ * within each byte) so read() memcpy's straight from the mmap. Uncompressed
+ * DSD only — DST-compressed DSDIFF files are rejected. Supported rates:
+ * DSD64 through DSD2048. Like the DSF reader, the caller must verify the
+ * file's reported channels and rate match --format / --channels. */
+struct audio_source *audio_source_dff_open(const char *path);
