@@ -223,7 +223,7 @@ int main(int argc, char **argv)
         { "alsa-format", required_argument, 0, 'A' },
         { "latency-us",  required_argument, 0, 'l' },
         { "no-feedback", no_argument,       0, 'n' },
-        { "announce",    no_argument,       0, 'A' },
+        { "announce",    no_argument,       0, 1001 },
         { "name",        required_argument, 0, 'N' },
         { "avdecc",      no_argument,       0, 'V' },
         { "help",        no_argument,       0, 'h' },
@@ -248,7 +248,7 @@ int main(int argc, char **argv)
         case 'A': alsa_format_s = optarg; break;
         case 'l': latency_us = atoi(optarg); break;
         case 'n': feedback_enabled = 0; break;
-        case 'A': announce = 1; break;
+        case 1001: announce = 1; break;
         case 'N': announce_name = optarg; break;
         case 'V': avdecc_enabled = 1; break;
         case 'h': usage(argv[0]); return 0;
