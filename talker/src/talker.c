@@ -1,4 +1,5 @@
 #include "audio_source.h"
+#include "avdecc.h"
 #include "avtp.h"
 #include "packet.h"
 
@@ -182,7 +183,13 @@ static void usage(const char *prog)
         "must match channels, rate, and format exactly — AOEther never resamples.\n"
         "For music playback, point --capture at one half of a snd-aloop pair\n"
         "and route Roon/UPnP/AirPlay/PipeWire at the other half; see\n"
-        "docs/recipe-*.md.\n",
+        "docs/recipe-*.md.\n"
+        "\n"
+        "Discovery / control plane:\n"
+        "  --avdecc               start an AVDECC talker entity so Hive and other\n"
+        "                         Milan controllers can discover this stream (M7 Phase B;\n"
+        "                         needs la_avdecc submodule built — see docs/recipe-avdecc.md)\n"
+        "  --name NAME            entity name for --avdecc (default: hostname + \"-talker\")\n",
         prog, DEFAULT_UDP_PORT, DEFAULT_CHANNELS, DEFAULT_RATE_HZ);
 }
 
@@ -199,6 +206,8 @@ int main(int argc, char **argv)
     int rate_hz = DEFAULT_RATE_HZ;
     enum transport_mode transport = TRANSPORT_L2;
     int udp_port = DEFAULT_UDP_PORT;
+    int avdecc_enabled = 0;
+    const char *entity_name = NULL;
 
     static const struct option opts[] = {
         { "iface",     required_argument, 0, 'i' },
@@ -212,11 +221,13 @@ int main(int argc, char **argv)
         { "channels",  required_argument, 0, 'C' },
         { "rate",      required_argument, 0, 'r' },
         { "format",    required_argument, 0, 'F' },
+        { "avdecc",    no_argument,       0, 'V' },
+        { "name",      required_argument, 0, 'N' },
         { "help",      no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "i:d:I:T:P:s:f:c:C:r:F:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:d:I:T:P:s:f:c:C:r:F:VN:h", opts, NULL)) != -1) {
         switch (c) {
         case 'i': iface = optarg; break;
         case 'd': dest_mac_s = optarg; break;
@@ -234,6 +245,8 @@ int main(int argc, char **argv)
         case 'C': channels = atoi(optarg); break;
         case 'r': rate_hz = atoi(optarg); break;
         case 'F': format_s = optarg; break;
+        case 'V': avdecc_enabled = 1; break;
+        case 'N': entity_name = optarg; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -537,6 +550,27 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
+    /* AVDECC entity (M7 Phase B). Talker publishes a STREAM_OUTPUT so
+     * Milan controllers can discover and bind it. Scaffolding only
+     * in step 1 — descriptor tree and ACMP CONNECT_TX handling arrive
+     * in step 2. */
+    struct aoether_avdecc *avdecc = NULL;
+    if (avdecc_enabled) {
+        struct aoether_avdecc_config cfg = {
+            .role        = AOETHER_AVDECC_TALKER,
+            .entity_name = entity_name,
+            .iface       = iface,
+            .channels    = channels,
+            .rate_hz     = rate_hz,
+            .format_name = fmt.name,
+        };
+        avdecc = aoether_avdecc_open(&cfg, NULL, NULL, NULL);
+        if (!avdecc) {
+            fprintf(stderr,
+                    "talker: AVDECC entity open failed (continuing without --avdecc)\n");
+        }
+    }
+
     uint8_t *frame = calloc(1, max_frame);
     if (!frame) return 1;
 
@@ -826,5 +860,6 @@ int main(int argc, char **argv)
     if (fb_sock != data_sock) close(fb_sock);
     close(data_sock);
     free(frame);
+    aoether_avdecc_close(avdecc);
     return 0;
 }
