@@ -349,11 +349,46 @@ Mode 4 does **not** use fragmentation. Configs whose per-packet payload would ex
 
 AES67 typically uses IPv4 multicast in `239.X.X.X` on UDP port 5004. AOEther accepts any unicast or multicast IPv4/IPv6 destination via `--dest-ip`. Receivers optionally join a group via `--group`; for unicast deployments `--group` is omitted and receivers bind to the UDP port.
 
+SAP discovery (`--announce-sap` / `--list-sap`) follows the same family: an IPv4 destination announces on `239.255.255.255:9875` with an `IN IP4` SDP; an IPv6 destination announces on `[ff0e::2:7ffe]:9875` (RFC 2974 §3 global scope) with an `A=1` SAP header and an `IN IP6` SDP. The listener opens both families when present and dedupes sessions by `(family, origin, msg-id)`.
+
 ### What is not in Mode 4 today
 
 - **SDP / SAP** — M9 Phase B. Without SDP, the talker and receiver must agree on format / channels / rate / destination out of band. No dynamic payload-type negotiation.
 - **PTPv2 timestamp discipline** — M9 Phase C. The RTP timestamp advances from a local monotonic clock; it is not PTP-locked. Strict AES67 listeners may tolerate this or may not, depending on their sync policy.
 - **Mode C clock feedback** — disabled entirely under `--transport rtp`. AES67 expects PTP, not UAC2-style feedback. Receivers do not emit 0x88B6 frames when running in RTP mode.
+
+### Multi-stream SDP bundling (M10)
+
+AES67 streams are capped at 8 channels per RTP session. Channel counts above 8 (7.1.4 = 12 ch, 7.1.6 = 14 ch, 9.1.6 = 16 ch, 22.2 = 24 ch) split across multiple substreams at the SDP layer. M10 defines the bundling convention.
+
+One SDP session contains N `m=audio` sections, one per substream. Each substream carries at most 8 channels, first-fit (a 14 ch source splits 8 + 6 by default; `--channels-per-stream` overrides). Each `m=` line gets an `a=mid:<id>` tag; session-level `a=group:LS <mid1> <mid2> …` declares lip-sync grouping per RFC 5888 §5.2. Per-`m=` `c=` lines carry distinct multicast groups when substreams are addressed independently (the default via `--dest-ip-base`).
+
+Timestamp alignment is the core wire-level invariant: RTP timestamps across all substreams in a bundle share the same base and advance in lockstep. A listener reassembling channels from multiple substreams keys its demux off the common timestamp, not per-substream sequence numbers. SSRCs and sequence numbers are independent per substream. PTIME and payload type are identical across all substreams in a bundle (enforced at talker startup).
+
+Example SDP for a 7.1.6 (14 ch) bundle split 8 + 6 across two substreams at 48 kHz / L24, 1 ms PTIME, PTP-disciplined:
+
+```
+v=0
+o=- 1714000000 1 IN IP4 192.168.1.100
+s=AOEther 7.1.6
+c=IN IP4 192.168.1.100
+t=0 0
+a=group:LS 1 2
+a=ts-refclk:ptp=IEEE1588-2008:00-1B-21-FF-FE-12-34-56:0
+a=mediaclk:direct=0
+m=audio 5004 RTP/AVP 96
+c=IN IP4 239.10.20.10/32
+a=mid:1
+a=rtpmap:96 L24/48000/8
+a=ptime:1
+m=audio 5006 RTP/AVP 96
+c=IN IP4 239.10.20.11/32
+a=mid:2
+a=rtpmap:96 L24/48000/6
+a=ptime:1
+```
+
+Listeners that ignore `a=group:LS` can still bind substreams individually and will reproduce audio correctly (the timestamp alignment invariant is on the wire, not in the SDP). They will not assert lip-sync-group semantics — so if a listener binds only one of the two substreams and plays it against a local reference, cross-substream phase coherence cannot be guaranteed from the listener's side. Phase-D interop testing characterises per-manufacturer handling of the group line; see `docs/recipe-multichannel-aes67.md`.
 
 ## Control frames
 

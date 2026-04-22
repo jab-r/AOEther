@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <ifaddrs.h>
 #include <linux/if_packet.h>
 #include <net/ethernet.h>
 #include <net/if.h>
@@ -72,6 +73,111 @@ enum transport_mode {
 
 /* Safety clamp on feedback-derived rate: ±1000 ppm of nominal. */
 #define RATE_CLAMP_PPM        1000.0
+
+/* M10 Phase A — multi-stream RTP emission.
+ *
+ * The auto-derived path (default) splits channels first-fit into
+ * ⌈channels / channels_per_stream⌉ substreams and increments the IPv4
+ * last octet of --dest-ip per substream. The explicit path, driven by
+ * repeated --stream flags, lets the operator pick each substream's
+ * channel range, destination, and port — required for unicast, IPv6,
+ * or any layout the auto-derive can't express.
+ *
+ * MAX_RTP_SUBSTREAMS is a sanity cap. 22.2 immersive (24 ch) splits
+ * into 3 substreams; the cap comfortably covers 22.2 plus headroom for
+ * future larger formats. */
+#define MAX_RTP_SUBSTREAMS 16
+
+/* Parsed form of a single --stream flag. */
+struct rtp_stream_spec {
+    int   id;                             /* 1-based, operator-chosen */
+    int   ch_start;                       /* 0-based inclusive */
+    int   ch_end;                         /* 0-based inclusive */
+    char  dest[INET6_ADDRSTRLEN];         /* without IPv6 brackets */
+    int   port;
+    int   family;                         /* AF_INET or AF_INET6 */
+};
+
+/* Parse "<id>:<ch_start>-<ch_end>:<dest>:<port>".
+ *   IPv4 example: "1:0-7:239.10.20.10:5004"
+ *   IPv6 example: "2:8-13:[ff0e::101]:5004"  (brackets mandatory so the
+ *                  inner colons don't confuse the port separator)
+ * Returns 0 on success, -1 on any parse error. */
+static int parse_stream_spec(const char *s, struct rtp_stream_spec *out)
+{
+    if (!s || !out) return -1;
+    const char *c1 = strchr(s, ':');
+    if (!c1) return -1;
+    const char *c2 = strchr(c1 + 1, ':');
+    if (!c2) return -1;
+
+    /* id */
+    char buf[64];
+    size_t id_len = (size_t)(c1 - s);
+    if (id_len == 0 || id_len >= sizeof(buf)) return -1;
+    memcpy(buf, s, id_len);
+    buf[id_len] = '\0';
+    char *endp;
+    long id_v = strtol(buf, &endp, 10);
+    if (*endp != '\0' || id_v < 1 || id_v > 1000) return -1;
+    out->id = (int)id_v;
+
+    /* ch_start - ch_end */
+    size_t range_len = (size_t)(c2 - c1 - 1);
+    if (range_len == 0 || range_len >= sizeof(buf)) return -1;
+    memcpy(buf, c1 + 1, range_len);
+    buf[range_len] = '\0';
+    char *dash = strchr(buf, '-');
+    if (!dash) return -1;
+    *dash = '\0';
+    long s_v = strtol(buf, &endp, 10);
+    if (*endp != '\0' || s_v < 0 || s_v > 1023) return -1;
+    long e_v = strtol(dash + 1, &endp, 10);
+    if (*endp != '\0' || e_v < s_v || e_v > 1023) return -1;
+    out->ch_start = (int)s_v;
+    out->ch_end   = (int)e_v;
+
+    /* dest:port */
+    const char *rest = c2 + 1;
+    const char *port_colon;
+    size_t addr_len;
+    if (*rest == '[') {
+        const char *rbracket = strchr(rest, ']');
+        if (!rbracket || rbracket == rest + 1) return -1;
+        if (rbracket[1] != ':') return -1;
+        port_colon = rbracket + 1;
+        addr_len = (size_t)(rbracket - rest - 1);
+        if (addr_len == 0 || addr_len >= sizeof(out->dest)) return -1;
+        memcpy(out->dest, rest + 1, addr_len);
+        out->dest[addr_len] = '\0';
+        out->family = AF_INET6;
+    } else {
+        port_colon = strrchr(rest, ':');
+        if (!port_colon || port_colon == rest) return -1;
+        addr_len = (size_t)(port_colon - rest);
+        if (addr_len == 0 || addr_len >= sizeof(out->dest)) return -1;
+        memcpy(out->dest, rest, addr_len);
+        out->dest[addr_len] = '\0';
+        out->family = AF_INET;
+    }
+
+    /* Verify the address literal actually parses in the claimed family.
+     * Catches common mistakes like a typo turning a valid address into
+     * something that parses as the other family (rare but possible). */
+    struct in_addr  v4_probe;
+    struct in6_addr v6_probe;
+    if (out->family == AF_INET) {
+        if (inet_pton(AF_INET, out->dest, &v4_probe) != 1) return -1;
+    } else {
+        if (inet_pton(AF_INET6, out->dest, &v6_probe) != 1) return -1;
+    }
+
+    long port_v = strtol(port_colon + 1, &endp, 10);
+    if (*endp != '\0' || port_v < 1 || port_v > 65535) return -1;
+    out->port = (int)port_v;
+
+    return 0;
+}
 
 /* Talker reverts to nominal after this long without FEEDBACK. */
 #define FEEDBACK_STALE_MS     5000
@@ -186,24 +292,41 @@ static int iface_lookup(int sock, const char *name, int *ifindex, uint8_t src_ma
     return 0;
 }
 
-/* Fetch the primary IPv4 address bound to `name` via SIOCGIFADDR. Used to
- * populate the o= / a=source-filter fields of the outgoing SDP. Returns 0
- * and writes the address (in network byte order) on success; returns -1
- * if the interface has no IPv4 address (e.g. pure-L2 bring-up). */
-static int iface_ipv4(const char *name, uint32_t *out_be)
+/* Fetch the primary address of the requested family bound to `name`. Used
+ * to populate the o= / a=source-filter fields of the outgoing SDP, and the
+ * SAP packet origin field. Returns 0 and writes the address on success;
+ * returns -1 if the interface has no address of that family (e.g. v4-only
+ * iface asked for an IPv6 source). For IPv6 we skip link-local addresses,
+ * since publishing an `fe80::` source in an SDP without a scope-id is
+ * meaningless to controllers on other links. */
+static int iface_addr(const char *name, int family, struct sap_origin *out)
 {
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) return -1;
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof ifr);
-    strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
-    ifr.ifr_addr.sa_family = AF_INET;
-    int rc = ioctl(s, SIOCGIFADDR, &ifr);
-    close(s);
-    if (rc < 0) return -1;
-    const struct sockaddr_in *sin = (const struct sockaddr_in *)&ifr.ifr_addr;
-    *out_be = sin->sin_addr.s_addr;
-    return 0;
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) < 0) return -1;
+    int rc = -1;
+    for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+        if (strcmp(ifa->ifa_name, name) != 0) continue;
+        if (ifa->ifa_addr->sa_family != family) continue;
+        if (family == AF_INET) {
+            const struct sockaddr_in *sin =
+                (const struct sockaddr_in *)ifa->ifa_addr;
+            out->family = AF_INET;
+            out->addr.v4_be = sin->sin_addr.s_addr;
+            rc = 0;
+            break;
+        } else if (family == AF_INET6) {
+            const struct sockaddr_in6 *sin6 =
+                (const struct sockaddr_in6 *)ifa->ifa_addr;
+            if (IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) continue;
+            out->family = AF_INET6;
+            memcpy(out->addr.v6, &sin6->sin6_addr, 16);
+            rc = 0;
+            break;
+        }
+    }
+    freeifaddrs(ifaddr);
+    return rc;
 }
 
 static int64_t ts_diff_ms(struct timespec a, struct timespec b)
@@ -250,6 +373,24 @@ static void usage(const char *prog)
         "    --sdp-only                      print the generated SDP to stdout\n"
         "                                    and exit; use when a controller\n"
         "                                    wants a static session file\n"
+        "    --channels-per-stream N         M10: split --channels > N into\n"
+        "                                    ⌈channels/N⌉ RTP substreams with\n"
+        "                                    shared timestamp base and per-\n"
+        "                                    substream SSRC / seq / multicast\n"
+        "                                    group (auto-incrementing IPv4\n"
+        "                                    last octet from --dest-ip).\n"
+        "                                    N range 1..8 (AES67 cap), default 8.\n"
+        "    --stream ID:CH-RANGE:DEST:PORT  M10: explicit per-substream address.\n"
+        "                                    Repeatable. Replaces --dest-ip —\n"
+        "                                    each flag carries its own dest.\n"
+        "                                    Ranges must cover 0..channels-1\n"
+        "                                    exactly once, per range ≤ 8 (AES67).\n"
+        "                                    IPv6 dests must be bracketed, e.g.\n"
+        "                                    --stream 2:8-13:[ff0e::101]:5004\n"
+        "                                    Needed for unicast, IPv6, or\n"
+        "                                    operator-managed addressing;\n"
+        "                                    auto-derive from --dest-ip covers\n"
+        "                                    the common IPv4 multicast case.\n"
         "\n"
         "Source:\n"
         "  --source testtone|wav|alsa|dsdsilence|dsf\n"
@@ -306,6 +447,9 @@ int main(int argc, char **argv)
     int sdp_only = 0;
     int ptp_domain = 0;
     const char *session_name = NULL;
+    int channels_per_stream = 8;   /* M10 Phase A: AES67 cap, first-fit split */
+    struct rtp_stream_spec explicit_specs[MAX_RTP_SUBSTREAMS];
+    int n_explicit_specs = 0;
 
     static const struct option opts[] = {
         { "iface",     required_argument, 0, 'i' },
@@ -327,6 +471,8 @@ int main(int argc, char **argv)
         { "ptp",           no_argument,       0, 1004 },
         { "sdp-only",      no_argument,       0, 1005 },
         { "ptp-domain",    required_argument, 0, 1006 },
+        { "channels-per-stream", required_argument, 0, 1007 },
+        { "stream",    required_argument, 0, 1008 },
         { "help",      no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
@@ -364,6 +510,34 @@ int main(int argc, char **argv)
                 return 2;
             }
             break;
+        case 1007:
+            channels_per_stream = atoi(optarg);
+            if (channels_per_stream < 1 || channels_per_stream > 8) {
+                fprintf(stderr,
+                        "talker: --channels-per-stream must be 1..8 "
+                        "(AES67 cap)\n");
+                return 2;
+            }
+            break;
+        case 1008:
+            if (n_explicit_specs >= MAX_RTP_SUBSTREAMS) {
+                fprintf(stderr,
+                        "talker: too many --stream flags (max %d)\n",
+                        MAX_RTP_SUBSTREAMS);
+                return 2;
+            }
+            if (parse_stream_spec(optarg,
+                                  &explicit_specs[n_explicit_specs]) < 0) {
+                fprintf(stderr,
+                        "talker: --stream %s: expected "
+                        "<id>:<ch_start>-<ch_end>:<dest>:<port> "
+                        "(IPv6 dest must be bracketed, e.g. "
+                        "\"2:8-13:[ff0e::101]:5004\")\n",
+                        optarg);
+                return 2;
+            }
+            n_explicit_specs++;
+            break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -380,9 +554,24 @@ int main(int argc, char **argv)
                 transport == TRANSPORT_L2 ? "l2" : "avtp");
         return 2;
     }
-    if ((transport == TRANSPORT_IP || transport == TRANSPORT_RTP) && !dest_ip_s) {
+    if ((transport == TRANSPORT_IP || transport == TRANSPORT_RTP) && !dest_ip_s
+        && !(transport == TRANSPORT_RTP && n_explicit_specs > 0)) {
+        /* Explicit --stream replaces --dest-ip: each substream carries its
+         * own destination, so --dest-ip becomes redundant. Require one or
+         * the other — never both — to avoid ambiguous precedence. */
         fprintf(stderr, "talker: --dest-ip required for --transport %s\n",
                 transport == TRANSPORT_IP ? "ip" : "rtp");
+        return 2;
+    }
+    if (transport == TRANSPORT_RTP && dest_ip_s && n_explicit_specs > 0) {
+        fprintf(stderr,
+                "talker: --dest-ip and --stream are mutually exclusive "
+                "— --stream carries per-substream destinations. Drop one.\n");
+        return 2;
+    }
+    if (n_explicit_specs > 0 && transport != TRANSPORT_RTP) {
+        fprintf(stderr,
+                "talker: --stream only applies to --transport rtp.\n");
         return 2;
     }
     if ((announce_sap || ptp_enabled || sdp_only) && transport != TRANSPORT_RTP) {
@@ -459,23 +648,71 @@ int main(int argc, char **argv)
 
     /* M9 Phase B + C — build one canonical SDP for the current stream.
      * Used by --sdp-only (print and exit) and --announce-sap (periodic
-     * multicast announcement in the main loop below). */
+     * multicast announcement in the main loop below).
+     *
+     * Address family is taken from --dest-ip: an IPv6 destination produces
+     * an `IN IP6` SDP carried inside an IPv6 SAP envelope (RFC 2974, A=1,
+     * destination ff0e::2:7ffe); IPv4 keeps the AES67 baseline. */
     char sdp_text[SDP_MAX_LEN];
     int  sdp_len = 0;
-    uint32_t origin_ipv4_be = 0;
+    struct sap_origin sap_origin = {0};
     struct sdp_params sdp = {0};
+    /* M10 Phase B: bundle state for multi-stream RTP. Populated later
+     * (after substreams[] is built); sdp_build_bundle is called from the
+     * deferred SDP-emit block below. */
+    struct sdp_bundle_params bundle = {0};
+    struct sdp_media media_arr[MAX_RTP_SUBSTREAMS] = {0};
+    char media_dest_bufs[MAX_RTP_SUBSTREAMS][INET6_ADDRSTRLEN] = {0};
+    char origin_ip[INET6_ADDRSTRLEN] = {0};   /* lifetime: rest of main() */
     if (transport == TRANSPORT_RTP && (announce_sap || sdp_only)) {
-        if (iface_ipv4(iface, &origin_ipv4_be) < 0) {
+        /* Family for the SAP envelope + SDP o= / c= lines. With
+         * --dest-ip, probe the literal. With explicit --stream, read
+         * the family we already computed from the spec list. */
+        int sap_family = AF_UNSPEC;
+        if (dest_ip_s) {
+            struct in_addr probe4;
+            struct in6_addr probe6;
+            if (inet_pton(AF_INET, dest_ip_s, &probe4) == 1) {
+                sap_family = AF_INET;
+            } else if (inet_pton(AF_INET6, dest_ip_s, &probe6) == 1) {
+                sap_family = AF_INET6;
+            }
+        } else if (n_explicit_specs > 0) {
+            sap_family = (explicit_specs[0].family == AF_INET6)
+                         ? AF_INET6 : AF_INET;
+        }
+        if (sap_family == AF_UNSPEC) {
             fprintf(stderr,
-                    "talker: could not read IPv4 address of %s — "
-                    "--announce-sap / --sdp-only need an IPv4-assigned "
-                    "interface (set one with `ip addr add`, then retry)\n",
+                    "talker: --announce-sap / --sdp-only need a resolvable "
+                    "IPv4 or IPv6 destination (--dest-ip or --stream).\n");
+            return 2;
+        }
+
+        if (iface_addr(iface, sap_family, &sap_origin) < 0) {
+            fprintf(stderr,
+                    "talker: could not read %s address of %s — "
+                    "--announce-sap / --sdp-only need a matching address "
+                    "on the egress interface (set one with `ip addr add`, "
+                    "then retry)\n",
+                    sap_family == AF_INET6 ? "IPv6 (non-link-local)" : "IPv4",
                     iface);
             return 2;
         }
-        char origin_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &origin_ipv4_be, origin_ip, sizeof origin_ip);
+        if (sap_family == AF_INET) {
+            inet_ntop(AF_INET, &sap_origin.addr.v4_be,
+                      origin_ip, sizeof origin_ip);
+        } else {
+            inet_ntop(AF_INET6, sap_origin.addr.v6,
+                      origin_ip, sizeof origin_ip);
+        }
 
+        /* Session-level params. Shared between the single-stream
+         * (sdp_build) and multi-stream (sdp_build_bundle) output paths.
+         * Per-media fields (dest_ip, port, channels, ttl) are filled
+         * later from substreams[] for the bundle path, or from
+         * dest_ip_s / udp_port / channels here for single-stream. */
+        sdp.family        = (sap_family == AF_INET6) ? SDP_ADDR_IP6
+                                                     : SDP_ADDR_IP4;
         sdp.origin_ip     = origin_ip;
         sdp.dest_ip       = dest_ip_s;
         sdp.port          = (uint16_t)udp_port;
@@ -508,17 +745,9 @@ int main(int argc, char **argv)
                      "%s %uch/%u", host,
                      (unsigned)channels, (unsigned)rate_hz);
         }
-
-        sdp_len = sdp_build(sdp_text, sizeof sdp_text, &sdp);
-        if (sdp_len < 0) {
-            fprintf(stderr, "talker: SDP build failed\n");
-            return 1;
-        }
-
-        if (sdp_only) {
-            fwrite(sdp_text, 1, (size_t)sdp_len, stdout);
-            return 0;
-        }
+        /* Defer sdp_build (and --sdp-only exit) to after substreams[] is
+         * built, so the multi-stream bundle builder has per-substream
+         * media descriptors available. */
     }
 
     /* Default source depends on format: testtone (PCM sine) or dsdsilence.
@@ -585,20 +814,35 @@ int main(int argc, char **argv)
         max_frag_pc = (int)mtu_budget_pc;
     }
 
-    /* Startup MTU check for non-fragmenting transports. */
-    if ((transport == TRANSPORT_AVTP || transport == TRANSPORT_RTP) &&
-        max_microframe_payload + proto_hdr_len > ETH_MTU_PAYLOAD) {
-        const char *mode_name =
-            transport == TRANSPORT_AVTP ? "AVTP AAF" : "RTP/AES67";
-        fprintf(stderr,
-                "talker: ch=%d rate=%d under %s needs %zu-byte payload "
-                "— exceeds 1500-byte MTU.\n"
-                "  This transport does not support per-packet fragmentation "
-                "(would break listener interop). Try --transport l2 or "
-                "--transport ip, or reduce channels / rate.\n",
-                channels, rate_hz, mode_name,
-                max_microframe_payload + proto_hdr_len);
-        return 2;
+    /* Startup MTU check for non-fragmenting transports. AVTP is always
+     * single-stream; RTP under M10 Phase A splits into ⌈channels /
+     * channels_per_stream⌉ substreams of up to `channels_per_stream` (≤ 8)
+     * channels each, so the per-packet payload budget is per-substream. */
+    {
+        int check_ch = channels;
+        if (transport == TRANSPORT_RTP) {
+            check_ch = (channels < channels_per_stream)
+                     ? channels : channels_per_stream;
+        }
+        const size_t check_payload =
+            (size_t)max_samples_per_microframe
+            * (size_t)check_ch * (size_t)bytes_per_sample;
+        if ((transport == TRANSPORT_AVTP || transport == TRANSPORT_RTP) &&
+            check_payload + proto_hdr_len > ETH_MTU_PAYLOAD) {
+            const char *mode_name =
+                transport == TRANSPORT_AVTP ? "AVTP AAF" : "RTP/AES67";
+            fprintf(stderr,
+                    "talker: ch=%d rate=%d under %s needs %zu-byte payload "
+                    "— exceeds 1500-byte MTU.\n"
+                    "  This transport does not support per-packet fragmentation "
+                    "(would break listener interop). Try --transport l2 or "
+                    "--transport ip, or reduce channels / rate%s.\n",
+                    check_ch, rate_hz, mode_name,
+                    check_payload + proto_hdr_len,
+                    transport == TRANSPORT_RTP
+                        ? " (or lower --channels-per-stream)" : "");
+            return 2;
+        }
     }
 
     /* Per-frame buffer sizing:
@@ -646,6 +890,37 @@ int main(int argc, char **argv)
          * Hive CONNECT_TX binds us via the avdecc_on_bind callback.
          * The per-packet egress path swaps in the ACMP MAC before each
          * send, so the zero placeholder never reaches the wire. */
+    } else if (n_explicit_specs > 0) {
+        /* M10 Phase A — explicit per-substream destinations via --stream.
+         * dest_ss stays zeroed (substreams carry their own addresses in
+         * the emission loop). Derive dest_family + dest_is_multicast from
+         * the specs so the socket creation + multicast setsockopt below
+         * has what it needs. Require all specs to share one family for a
+         * single-socket egress path; mixed-family deployments would need
+         * two sockets and are deferred. */
+        dest_family = explicit_specs[0].family;
+        for (int s = 1; s < n_explicit_specs; s++) {
+            if (explicit_specs[s].family != dest_family) {
+                fprintf(stderr,
+                        "talker: --stream flags mix IPv4 and IPv6 "
+                        "destinations; single-socket egress requires one "
+                        "family. Pick one (or run two talkers).\n");
+                return 2;
+            }
+        }
+        for (int s = 0; s < n_explicit_specs; s++) {
+            const struct rtp_stream_spec *sp = &explicit_specs[s];
+            if (sp->family == AF_INET) {
+                struct in_addr v4a;
+                inet_pton(AF_INET, sp->dest, &v4a);
+                uint8_t first = ((uint8_t *)&v4a)[0];
+                if (first >= 224 && first <= 239) dest_is_multicast = 1;
+            } else {
+                struct in6_addr v6a;
+                inet_pton(AF_INET6, sp->dest, &v6a);
+                if (v6a.s6_addr[0] == 0xff) dest_is_multicast = 1;
+            }
+        }
     } else {
         /* IP (Mode 3) and RTP (Mode 4) both take a dest IP. */
         struct in_addr v4;
@@ -676,7 +951,12 @@ int main(int argc, char **argv)
     }
 
     struct audio_source *src = NULL;
-    if (strcmp(source, "testtone") == 0) {
+    /* --sdp-only exits after emitting SDP; no audio actually flows, so
+     * don't open the source (avoids needing ALSA hardware / files just
+     * to print an SDP). */
+    if (sdp_only) {
+        /* fall through to substream build and SDP emit */
+    } else if (strcmp(source, "testtone") == 0) {
         src = audio_source_test_open(channels, rate_hz, bytes_per_sample);
     } else if (strcmp(source, "wav") == 0) {
         if (!wav_path) {
@@ -720,7 +1000,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "talker: unknown --source %s\n", source);
         return 2;
     }
-    if (!src) return 1;
+    if (!sdp_only && !src) return 1;
 
     /* Socket setup. L2 mode uses two AF_PACKET raw sockets (one per
      * EtherType). IP mode uses one AF_INET/AF_INET6 UDP socket for both
@@ -957,7 +1237,237 @@ int main(int argc, char **argv)
     uint32_t rtp_timestamp = (uint32_t)(
         (uint64_t)rtp_start_ts.tv_sec * (uint64_t)rate_hz +
         ((uint64_t)rtp_start_ts.tv_nsec * (uint64_t)rate_hz) / 1000000000ull);
-    uint16_t rtp_seq16 = 0;
+
+    /* M10 Phase A — multi-stream substream table. AES67 caps a single
+     * RTP session at 8 channels; channel counts above that split across
+     * ⌈channels / channels_per_stream⌉ substreams that share the same
+     * rtp_timestamp base so a listener reassembling two or more of them
+     * recovers sample-accurate multichannel. Substreams each carry their
+     * own SSRC and RTP sequence-number state, but PTIME / payload type /
+     * payload-unit size all match. Only Mode 4 uses this; Modes 1 / 3
+     * carry arbitrary channel counts in a single AoE frame group via
+     * M8 packet splitting. */
+    struct rtp_substream {
+        int first_ch;
+        int n_ch;
+        struct sockaddr_storage dest_ss;
+        socklen_t dest_ss_len;
+        uint32_t ssrc;
+        uint16_t seq16;
+    };
+    struct rtp_substream substreams[MAX_RTP_SUBSTREAMS];
+    int n_substreams = 0;
+    if (transport == TRANSPORT_RTP && n_explicit_specs > 0) {
+        /* Explicit per-substream addressing via --stream flags. Validate
+         * coverage (every 0..channels-1 covered exactly once), per-stream
+         * AES67 cap, and reject SAP announce for now (Phase B owns bundled
+         * SDP). */
+        for (int s = 0; s < n_explicit_specs; s++) {
+            const struct rtp_stream_spec *sp = &explicit_specs[s];
+            const int n_ch = sp->ch_end - sp->ch_start + 1;
+            if (n_ch > 8) {
+                fprintf(stderr,
+                        "talker: --stream id=%d covers %d channels; AES67 "
+                        "caps a single RTP session at 8. Split into more "
+                        "--stream flags.\n",
+                        sp->id, n_ch);
+                return 2;
+            }
+            if (sp->ch_end >= channels) {
+                fprintf(stderr,
+                        "talker: --stream id=%d ch_end=%d exceeds --channels=%d\n",
+                        sp->id, sp->ch_end, channels);
+                return 2;
+            }
+        }
+        /* Channels cap at 1023 in parse_stream_spec; covered[] sized to match. */
+        unsigned char covered[1024] = {0};
+        for (int s = 0; s < n_explicit_specs; s++) {
+            const struct rtp_stream_spec *sp = &explicit_specs[s];
+            for (int ch = sp->ch_start; ch <= sp->ch_end; ch++) {
+                if (covered[ch]) {
+                    fprintf(stderr,
+                            "talker: channel %d is covered by more than one "
+                            "--stream flag\n", ch);
+                    return 2;
+                }
+                covered[ch] = 1;
+            }
+        }
+        for (int ch = 0; ch < channels; ch++) {
+            if (!covered[ch]) {
+                fprintf(stderr,
+                        "talker: channel %d is not covered by any --stream "
+                        "flag (must cover every channel in --channels=%d "
+                        "exactly once)\n", ch, channels);
+                return 2;
+            }
+        }
+        for (int s = 0; s < n_explicit_specs; s++) {
+            const struct rtp_stream_spec *sp = &explicit_specs[s];
+            memset(&substreams[s].dest_ss, 0, sizeof(substreams[s].dest_ss));
+            substreams[s].first_ch = sp->ch_start;
+            substreams[s].n_ch = sp->ch_end - sp->ch_start + 1;
+            if (sp->family == AF_INET) {
+                struct sockaddr_in *v4 =
+                    (struct sockaddr_in *)&substreams[s].dest_ss;
+                v4->sin_family = AF_INET;
+                v4->sin_port = htons((uint16_t)sp->port);
+                inet_pton(AF_INET, sp->dest, &v4->sin_addr);
+                substreams[s].dest_ss_len = sizeof(*v4);
+            } else {
+                struct sockaddr_in6 *v6 =
+                    (struct sockaddr_in6 *)&substreams[s].dest_ss;
+                v6->sin6_family = AF_INET6;
+                v6->sin6_port = htons((uint16_t)sp->port);
+                inet_pton(AF_INET6, sp->dest, &v6->sin6_addr);
+                substreams[s].dest_ss_len = sizeof(*v6);
+            }
+            substreams[s].ssrc = rtp_ssrc ^ (uint32_t)s;
+            substreams[s].seq16 = 0;
+        }
+        n_substreams = n_explicit_specs;
+    } else if (transport == TRANSPORT_RTP) {
+        /* Auto-derivation from --dest-ip + --channels-per-stream. */
+        const int per = channels_per_stream;   /* already clamped 1..8 */
+        const int n = (channels + per - 1) / per;
+        if (n > MAX_RTP_SUBSTREAMS) {
+            fprintf(stderr,
+                    "talker: --channels %d / --channels-per-stream %d → "
+                    "%d substreams exceeds internal cap %d\n",
+                    channels, per, n, MAX_RTP_SUBSTREAMS);
+            return 2;
+        }
+        if (n > 1 && !dest_is_multicast) {
+            fprintf(stderr,
+                    "talker: multi-stream RTP emission (--channels %d > "
+                    "--channels-per-stream %d) requires a multicast "
+                    "--dest-ip so substreams can auto-allocate distinct "
+                    "groups, or use explicit --stream flags for unicast.\n",
+                    channels, per);
+            return 2;
+        }
+        if (n > 1 && dest_family != AF_INET) {
+            fprintf(stderr,
+                    "talker: multi-stream RTP emission auto-derivation "
+                    "supports IPv4 multicast today. For IPv6 multi-stream, "
+                    "use explicit --stream flags.\n");
+            return 2;
+        }
+        int remaining = channels;
+        int cursor = 0;
+        for (int s = 0; s < n; s++) {
+            const int this_n = (remaining > per) ? per : remaining;
+            substreams[s].first_ch = cursor;
+            substreams[s].n_ch = this_n;
+            memcpy(&substreams[s].dest_ss, &dest_ss, dest_ss_len);
+            substreams[s].dest_ss_len = dest_ss_len;
+            if (s > 0) {
+                /* Auto-increment the final IPv4 octet per substream so
+                 * 239.10.20.10 → substream 1 on 239.10.20.11, etc. Multicast
+                 * groups are independent; the UDP port stays fixed at the
+                 * --dest-ip's port (typically 5004). */
+                struct sockaddr_in *v4 =
+                    (struct sockaddr_in *)&substreams[s].dest_ss;
+                uint32_t addr = ntohl(v4->sin_addr.s_addr);
+                v4->sin_addr.s_addr = htonl(addr + (uint32_t)s);
+            }
+            substreams[s].ssrc = rtp_ssrc ^ (uint32_t)s;
+            substreams[s].seq16 = 0;
+            cursor += this_n;
+            remaining -= this_n;
+        }
+        n_substreams = n;
+    }
+    if (transport == TRANSPORT_RTP) {
+        /* Log the chosen substream layout so operators can audit against
+         * their listener / switch multicast configuration. Works for both
+         * auto-derived and explicit paths. */
+        for (int s = 0; s < n_substreams; s++) {
+            char addrbuf[INET6_ADDRSTRLEN] = {0};
+            uint16_t port = 0;
+            if (substreams[s].dest_ss.ss_family == AF_INET) {
+                struct sockaddr_in *v4 =
+                    (struct sockaddr_in *)&substreams[s].dest_ss;
+                inet_ntop(AF_INET, &v4->sin_addr, addrbuf, sizeof(addrbuf));
+                port = ntohs(v4->sin_port);
+            } else {
+                struct sockaddr_in6 *v6 =
+                    (struct sockaddr_in6 *)&substreams[s].dest_ss;
+                inet_ntop(AF_INET6, &v6->sin6_addr, addrbuf, sizeof(addrbuf));
+                port = ntohs(v6->sin6_port);
+            }
+            fprintf(stderr,
+                    "talker: RTP substream %d: ch %d..%d (%dch) → %s:%u "
+                    "(SSRC 0x%08x)\n",
+                    s, substreams[s].first_ch,
+                    substreams[s].first_ch + substreams[s].n_ch - 1,
+                    substreams[s].n_ch, addrbuf, port, substreams[s].ssrc);
+        }
+    }
+
+    /* M10 Phase B — deferred SDP emit. Single-stream reuses M9's sdp_build
+     * output; multi-stream populates a bundle (session-level refclk +
+     * a=group:LS, per-media c=/a=mid from substreams[]) and calls
+     * sdp_build_bundle. --sdp-only exits here; --announce-sap keeps the
+     * text for the main-loop announcer below. */
+    if (transport == TRANSPORT_RTP && (announce_sap || sdp_only)) {
+        if (n_substreams > 1) {
+            bundle.family          = sdp.family;
+            bundle.origin_ip       = sdp.origin_ip;
+            memcpy(bundle.session_name, sdp.session_name,
+                   sizeof bundle.session_name);
+            bundle.session_id      = sdp.session_id;
+            bundle.session_version = sdp.session_version;
+            bundle.refclk          = sdp.refclk;
+            memcpy(bundle.gmid_str, sdp.gmid_str, sizeof bundle.gmid_str);
+            bundle.ptp_domain      = sdp.ptp_domain;
+            for (int s = 0; s < n_substreams; s++) {
+                struct sdp_media *m = &media_arr[s];
+                m->mid = s + 1;
+                if (substreams[s].dest_ss.ss_family == AF_INET) {
+                    struct sockaddr_in *v4 =
+                        (struct sockaddr_in *)&substreams[s].dest_ss;
+                    inet_ntop(AF_INET, &v4->sin_addr,
+                              media_dest_bufs[s], INET6_ADDRSTRLEN);
+                    m->port = ntohs(v4->sin_port);
+                } else {
+                    struct sockaddr_in6 *v6 =
+                        (struct sockaddr_in6 *)&substreams[s].dest_ss;
+                    inet_ntop(AF_INET6, &v6->sin6_addr,
+                              media_dest_bufs[s], INET6_ADDRSTRLEN);
+                    m->port = ntohs(v6->sin6_port);
+                }
+                m->dest_ip       = media_dest_bufs[s];
+                m->ttl           = dest_is_multicast ? 32 : 0;
+                m->encoding      = SDP_ENC_L24;
+                m->sample_rate_hz = (uint32_t)rate_hz;
+                m->channels      = (uint8_t)substreams[s].n_ch;
+                m->payload_type  = RTP_DEFAULT_PT_L24;
+                m->ptime_us      = (uint32_t)ptime_us;
+            }
+            bundle.media   = media_arr;
+            bundle.n_media = (size_t)n_substreams;
+            sdp_len = sdp_build_bundle(sdp_text, sizeof sdp_text, &bundle);
+        } else {
+            /* Single-stream: M9 sdp_build preserves the v1.5 wire output. */
+            if (!sdp.dest_ip && n_explicit_specs == 1) {
+                /* --stream form for single-stream: pull the one spec's
+                 * destination/port into the single-stream params. */
+                sdp.dest_ip = explicit_specs[0].dest;
+                sdp.port    = (uint16_t)explicit_specs[0].port;
+            }
+            sdp_len = sdp_build(sdp_text, sizeof sdp_text, &sdp);
+        }
+        if (sdp_len < 0) {
+            fprintf(stderr, "talker: SDP build failed\n");
+            return 1;
+        }
+        if (sdp_only) {
+            fwrite(sdp_text, 1, (size_t)sdp_len, stdout);
+            return 0;
+        }
+    }
 
     /* M9 Phase B — SAP announcer state. Opened once, used to periodically
      * emit the SDP built above on 239.255.255.255:9875 so AES67
@@ -966,32 +1476,43 @@ int main(int argc, char **argv)
      * packet is emitted on shutdown so controllers drop the session
      * promptly instead of waiting for the session-timeout. */
     int sap_fd = -1;
-    struct sockaddr_in sap_to = {0};
+    struct sockaddr_storage sap_to = {0};
+    socklen_t sap_to_len = 0;
     uint16_t sap_msg_id = 0;
     struct timespec last_sap_ts = {0};
-    uint8_t sap_pkt[SDP_MAX_LEN + SAP_HDR_LEN + SAP_MIME_LEN];
+    uint8_t sap_pkt[SDP_MAX_LEN + SAP_HDR_LEN_V6 + SAP_MIME_LEN];
     int sap_pkt_len = 0;
     if (announce_sap) {
-        sap_fd = sap_open_tx_socket(iface);
+        sap_fd = sap_open_tx_socket(sap_origin.family, iface);
         if (sap_fd < 0) {
             fprintf(stderr,
                     "talker: sap_open_tx_socket failed; continuing without "
                     "SAP announcements\n");
         } else {
-            sap_to.sin_family = AF_INET;
-            sap_to.sin_port   = htons(SAP_PORT);
-            inet_pton(AF_INET, SAP_IPV4_ADDR_STR, &sap_to.sin_addr);
+            if (sap_origin.family == AF_INET) {
+                struct sockaddr_in *sin = (struct sockaddr_in *)&sap_to;
+                sin->sin_family = AF_INET;
+                sin->sin_port   = htons(SAP_PORT);
+                inet_pton(AF_INET, SAP_IPV4_ADDR_STR, &sin->sin_addr);
+                sap_to_len = sizeof(*sin);
+            } else {
+                struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&sap_to;
+                sin6->sin6_family = AF_INET6;
+                sin6->sin6_port   = htons(SAP_PORT);
+                inet_pton(AF_INET6, SAP_IPV6_ADDR_STR, &sin6->sin6_addr);
+                sap_to_len = sizeof(*sin6);
+            }
             /* RFC 2974 msg-id hash: any stable 16-bit value for this
              * session. XOR low halves of session_id to get one. */
             sap_msg_id = (uint16_t)(sdp.session_id ^ (sdp.session_id >> 16));
 
             sap_pkt_len = sap_build(sap_pkt, sizeof sap_pkt,
                                     SAP_ANNOUNCE,
-                                    origin_ipv4_be, sap_msg_id,
+                                    &sap_origin, sap_msg_id,
                                     sdp_text, (size_t)sdp_len);
             if (sap_pkt_len > 0) {
                 ssize_t n = sendto(sap_fd, sap_pkt, (size_t)sap_pkt_len, 0,
-                                   (struct sockaddr *)&sap_to, sizeof sap_to);
+                                   (struct sockaddr *)&sap_to, sap_to_len);
                 if (n < 0) perror("sendto(SAP announce)");
             }
             clock_gettime(CLOCK_MONOTONIC, &last_sap_ts);
@@ -1107,24 +1628,38 @@ int main(int argc, char **argv)
                     }
                     if (new_refclk != sdp.refclk ||
                         strcmp(new_gmid, sdp.gmid_str) != 0) {
+                        /* Shared session state lives in `sdp`; the bundle
+                         * builder reads session fields off it via the
+                         * mirror populated in the emit block above. Keep
+                         * both in sync on BMCA change. */
                         sdp.refclk = new_refclk;
                         strncpy(sdp.gmid_str, new_gmid,
                                 sizeof sdp.gmid_str - 1);
                         sdp.gmid_str[sizeof sdp.gmid_str - 1] = '\0';
                         sdp.session_version++;
-                        sdp_len = sdp_build(sdp_text, sizeof sdp_text, &sdp);
+                        if (n_substreams > 1) {
+                            bundle.refclk = sdp.refclk;
+                            memcpy(bundle.gmid_str, sdp.gmid_str,
+                                   sizeof bundle.gmid_str);
+                            bundle.session_version = sdp.session_version;
+                            sdp_len = sdp_build_bundle(
+                                sdp_text, sizeof sdp_text, &bundle);
+                        } else {
+                            sdp_len = sdp_build(
+                                sdp_text, sizeof sdp_text, &sdp);
+                        }
                         if (sdp_len > 0) {
                             sap_pkt_len = sap_build(
                                 sap_pkt, sizeof sap_pkt,
                                 SAP_ANNOUNCE,
-                                origin_ipv4_be, sap_msg_id,
+                                &sap_origin, sap_msg_id,
                                 sdp_text, (size_t)sdp_len);
                         }
                     }
                 }
 
                 ssize_t n = sendto(sap_fd, sap_pkt, (size_t)sap_pkt_len, 0,
-                                   (struct sockaddr *)&sap_to, sizeof sap_to);
+                                   (struct sockaddr *)&sap_to, sap_to_len);
                 if (n < 0 && errno != EINTR) perror("sendto(SAP refresh)");
                 last_sap_ts = mono_now;
             }
@@ -1353,18 +1888,76 @@ skip_feedback:
                                        24,                   /* bit_depth */
                                        (uint16_t)frag_payload_bytes);
                 } else if (transport == TRANSPORT_RTP) {
-                    /* AES67 L24 samples are big-endian on the wire; ALSA
-                     * is LE. Swap in place, same as AVTP. */
-                    rtp_swap24_inplace(payload,
-                                       (size_t)frag_pc * (size_t)channels);
-                    rtp_hdr_build(rtp_hdr_p,
-                                  RTP_DEFAULT_PT_L24,
-                                  rtp_seq16++,
-                                  rtp_timestamp,
-                                  rtp_ssrc);
-                    /* Advance the media clock by one packet's samples for
-                     * the next emission. */
+                    /* M10 Phase A: emit one RTP packet per substream, all
+                     * sharing the current rtp_timestamp so a listener that
+                     * reassembles two or more substreams recovers sample-
+                     * accurate multichannel. n_substreams == 1 is the
+                     * single-stream fast path. Each substream carries its
+                     * own SSRC and sequence counter; PTIME and payload type
+                     * match across the bundle. */
+                    for (int s = 0; s < n_substreams && !g_stop; s++) {
+                        struct rtp_substream *ss = &substreams[s];
+                        const int ss_ch = ss->n_ch;
+
+                        /* Gather this substream's channel slice from the
+                         * interleaved audio_buf into the on-wire payload
+                         * area. Single-stream degenerates to a memcpy of
+                         * the whole microframe. */
+                        if (ss->first_ch == 0 && ss_ch == channels) {
+                            memcpy(payload, audio_buf,
+                                   (size_t)frag_pc * (size_t)ss_ch
+                                       * (size_t)bytes_per_sample);
+                        } else {
+                            const size_t ss_stride =
+                                (size_t)ss_ch * (size_t)bytes_per_sample;
+                            const size_t full_stride =
+                                (size_t)channels * (size_t)bytes_per_sample;
+                            const size_t ch_offset =
+                                (size_t)ss->first_ch * (size_t)bytes_per_sample;
+                            for (int samp = 0; samp < frag_pc; samp++) {
+                                memcpy(payload + (size_t)samp * ss_stride,
+                                       audio_buf
+                                           + (size_t)samp * full_stride
+                                           + ch_offset,
+                                       ss_stride);
+                            }
+                        }
+                        /* AES67 L24 samples are big-endian on the wire;
+                         * ALSA is LE. Swap in place, same as the AVTP
+                         * edge. */
+                        rtp_swap24_inplace(payload,
+                                           (size_t)frag_pc * (size_t)ss_ch);
+                        rtp_hdr_build(rtp_hdr_p,
+                                      RTP_DEFAULT_PT_L24,
+                                      ss->seq16++,
+                                      rtp_timestamp,
+                                      ss->ssrc);
+                        const size_t ss_frame_len =
+                            RTP_HDR_LEN
+                            + (size_t)frag_pc * (size_t)ss_ch
+                              * (size_t)bytes_per_sample;
+                        ssize_t ss_sent = sendto(data_sock,
+                                                 frame + tx_offset,
+                                                 ss_frame_len, 0,
+                                                 (struct sockaddr *)&ss->dest_ss,
+                                                 ss->dest_ss_len);
+                        if (ss_sent < 0) {
+                            if (errno == EINTR) {
+                                abort_microframe = 1;
+                                break;
+                            }
+                            perror("sendto");
+                            g_stop = 1;
+                            break;
+                        }
+                    }
+                    /* All substreams advance together. */
                     rtp_timestamp += (uint32_t)frag_pc;
+                    /* Multi-stream emission is self-contained; skip the
+                     * shared single-packet sendto that follows the AOE /
+                     * AVTP path. K is always 1 for RTP, so breaking the
+                     * fragment loop is equivalent to letting it exit. */
+                    break;
                 } else {
                     const uint8_t flags =
                         (k == K - 1) ? AOE_FLAG_LAST_IN_GROUP : 0;
@@ -1408,14 +2001,14 @@ skip_feedback:
     /* SAP: one deletion packet so controllers drop the session promptly
      * rather than waiting out the session timeout (~minutes). Best-effort. */
     if (sap_fd >= 0 && sdp_len > 0) {
-        uint8_t del_pkt[SDP_MAX_LEN + SAP_HDR_LEN + SAP_MIME_LEN];
+        uint8_t del_pkt[SDP_MAX_LEN + SAP_HDR_LEN_V6 + SAP_MIME_LEN];
         int del_len = sap_build(del_pkt, sizeof del_pkt,
                                 SAP_DELETION,
-                                origin_ipv4_be, sap_msg_id,
+                                &sap_origin, sap_msg_id,
                                 sdp_text, (size_t)sdp_len);
         if (del_len > 0) {
             ssize_t n = sendto(sap_fd, del_pkt, (size_t)del_len, 0,
-                               (struct sockaddr *)&sap_to, sizeof sap_to);
+                               (struct sockaddr *)&sap_to, sap_to_len);
             (void)n;
         }
         close(sap_fd);
