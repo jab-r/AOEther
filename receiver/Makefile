@@ -10,6 +10,8 @@ SRCS      := \
     ../common/packet.c \
     ../common/avtp.c \
     ../common/rtp.c \
+    ../common/sdp.c \
+    ../common/sap.c \
     ../common/mdns.c \
     ../common/avdecc.c
 
@@ -42,7 +44,7 @@ endif
 .PHONY: all clean
 all: $(BUILD)/receiver
 
-$(BUILD)/receiver: $(SRCS) ../common/packet.h ../common/avtp.h ../common/rtp.h ../common/mdns.h ../common/avdecc.h | $(BUILD)
+$(BUILD)/receiver: $(SRCS) ../common/packet.h ../common/avtp.h ../common/rtp.h ../common/sdp.h ../common/sap.h ../common/mdns.h ../common/avdecc.h | $(BUILD)
 	$(LINK) $(CFLAGS) $(INCLUDES) $(SRCS) -o $@ $(LDLIBS)
 
 $(BUILD):

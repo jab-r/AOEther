@@ -3,6 +3,8 @@
 #include "mdns.h"
 #include "packet.h"
 #include "rtp.h"
+#include "sap.h"
+#include "sdp.h"
 
 #include <pthread.h>
 
@@ -202,7 +204,12 @@ static void usage(const char *prog)
         "                       so talkers and avahi-browse can discover it\n"
         "  --name NAME          instance name for --announce and --avdecc (default: hostname)\n"
         "  --avdecc             start an AVDECC listener entity (Milan/Hive discovery);\n"
-        "                       requires la_avdecc submodule built — see docs/recipe-avdecc.md\n",
+        "                       requires la_avdecc submodule built — see docs/recipe-avdecc.md\n"
+        "  --list-sap [SECS]    passive AES67 SAP listener: join 239.255.255.255:9875,\n"
+        "                       dedupe sessions by (origin, msg_id), print each one\n"
+        "                       with a ready-to-run receiver command, then exit.\n"
+        "                       SECS (default 5) is the listen window. Does not open\n"
+        "                       the DAC; --iface is the only other required option.\n",
         prog, DEFAULT_UDP_PORT, DEFAULT_CHANNELS, DEFAULT_RATE_HZ, DEFAULT_LATENCY_US);
 }
 
@@ -246,6 +253,8 @@ int main(int argc, char **argv)
     int announce = 0;
     const char *announce_name = NULL;
     int avdecc_enabled = 0;
+    int list_sap = 0;
+    int list_sap_secs = 5;
 
     static const struct option opts[] = {
         { "iface",       required_argument, 0, 'i' },
@@ -262,6 +271,7 @@ int main(int argc, char **argv)
         { "announce",    no_argument,       0, 1001 },
         { "name",        required_argument, 0, 'N' },
         { "avdecc",      no_argument,       0, 'V' },
+        { "list-sap",    optional_argument, 0, 1002 },
         { "help",        no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
@@ -288,13 +298,139 @@ int main(int argc, char **argv)
         case 1001: announce = 1; break;
         case 'N': announce_name = optarg; break;
         case 'V': avdecc_enabled = 1; break;
+        case 1002:
+            list_sap = 1;
+            if (optarg) list_sap_secs = atoi(optarg);
+            if (list_sap_secs < 1) list_sap_secs = 1;
+            break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
     }
-    if (!iface || !dac) {
+    if (!iface) {
         usage(argv[0]);
         return 2;
+    }
+    if (!list_sap && !dac) {
+        usage(argv[0]);
+        return 2;
+    }
+
+    /* --list-sap: sniff SAP announcements and print each unique session
+     * with a ready-to-run receiver command, then exit. Does not touch
+     * ALSA or any transport sockets. */
+    if (list_sap) {
+        int sfd = sap_open_rx_socket(iface);
+        if (sfd < 0) return 1;
+
+        fprintf(stderr,
+                "receiver: listening for SAP announcements on %s:%d via %s "
+                "for %d s\n",
+                SAP_IPV4_ADDR_STR, SAP_PORT, iface, list_sap_secs);
+
+        struct seen {
+            uint32_t origin_be;
+            uint16_t msg_id;
+        };
+        enum { SEEN_CAP = 64 };
+        struct seen seen_tbl[SEEN_CAP];
+        int seen_n = 0;
+        int printed = 0;
+
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (;;) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long remaining_ms =
+                list_sap_secs * 1000
+                - (long)((now.tv_sec - t0.tv_sec) * 1000
+                         + (now.tv_nsec - t0.tv_nsec) / 1000000);
+            if (remaining_ms <= 0) break;
+
+            struct pollfd pfd = { .fd = sfd, .events = POLLIN };
+            int pr = poll(&pfd, 1,
+                          remaining_ms < 1000 ? (int)remaining_ms : 1000);
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                perror("poll(sap)");
+                break;
+            }
+            if (pr == 0) continue;
+
+            uint8_t buf[4096];
+            struct sockaddr_in src_addr;
+            socklen_t src_len = sizeof src_addr;
+            ssize_t n = recvfrom(sfd, buf, sizeof buf, 0,
+                                 (struct sockaddr *)&src_addr, &src_len);
+            if (n <= 0) continue;
+
+            enum sap_kind kind;
+            uint32_t origin_be;
+            uint16_t msg_id;
+            const char *sdp_text;
+            size_t sdp_len;
+            if (sap_parse(buf, (size_t)n, &kind, &origin_be, &msg_id,
+                          &sdp_text, &sdp_len) < 0) {
+                continue;
+            }
+            if (kind == SAP_DELETION) continue;
+
+            int dup = 0;
+            for (int i = 0; i < seen_n; i++) {
+                if (seen_tbl[i].origin_be == origin_be &&
+                    seen_tbl[i].msg_id == msg_id) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup) continue;
+            if (seen_n < SEEN_CAP) {
+                seen_tbl[seen_n].origin_be = origin_be;
+                seen_tbl[seen_n].msg_id    = msg_id;
+                seen_n++;
+            }
+
+            struct sdp_params sp;
+            if (sdp_parse(sdp_text, sdp_len, &sp) < 0) continue;
+
+            char origin_str[INET_ADDRSTRLEN] = "?";
+            inet_ntop(AF_INET, &origin_be, origin_str, sizeof origin_str);
+
+            printed++;
+            printf("\n  [%d] session=\"%s\"\n", printed, sp.session_name);
+            printf("      origin=%s  dest=%s:%u\n",
+                   origin_str,
+                   sp.dest_ip ? sp.dest_ip : "?",
+                   (unsigned)sp.port);
+            printf("      fmt=%s rate=%u ch=%u pt=%u ptime=%.3fms refclk=%s\n",
+                   sp.encoding == SDP_ENC_L16 ? "L16" : "L24",
+                   (unsigned)sp.sample_rate_hz,
+                   (unsigned)sp.channels,
+                   (unsigned)sp.payload_type,
+                   (double)sp.ptime_us / 1000.0,
+                   sp.refclk == SDP_REFCLK_PTP_TRACEABLE ? "ptp" : "none");
+            printf("      cmd:\n");
+            printf("        sudo receiver --iface %s --dac hw:CARD=...,DEV=0 \\\n"
+                   "                      --transport rtp --group %s --port %u \\\n"
+                   "                      --channels %u --rate %u\n",
+                   iface,
+                   sp.dest_ip ? sp.dest_ip : "239.X.X.X",
+                   (unsigned)sp.port,
+                   (unsigned)sp.channels,
+                   (unsigned)sp.sample_rate_hz);
+        }
+        close(sfd);
+        if (printed == 0) {
+            fprintf(stderr,
+                    "receiver: no SAP announcements seen in %d s — check\n"
+                    "  * the talker is running with --announce-sap\n"
+                    "  * the switch/router doesn't block multicast to 239.255.255.255\n"
+                    "  * the right --iface is selected\n",
+                    list_sap_secs);
+            return 1;
+        }
+        return 0;
     }
     if (udp_port < 1 || udp_port > 65535) {
         fprintf(stderr, "receiver: --port out of range\n");

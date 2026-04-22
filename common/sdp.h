@@ -29,10 +29,17 @@ enum sdp_refclk {
     /* a=ts-refclk:ptp=IEEE1588-2008:traceable
      * a=mediaclk:direct=0
      * Claims PTP-disciplined timing without pinning to a specific
-     * grandmaster identity. AES67 permits this when the talker doesn't
-     * know the GM's clock identity yet (linuxptp exposes it but it's
-     * fiddly to read cross-process). */
+     * grandmaster identity. AES67 permits this when the talker can't
+     * read the current grandmaster clock identity (e.g., ptp4l isn't
+     * reachable, or pmc isn't installed). */
     SDP_REFCLK_PTP_TRACEABLE = 1,
+    /* a=ts-refclk:ptp=IEEE1588-2008:<gmid>:<domain>
+     * a=mediaclk:direct=0
+     * Pins the specific grandmaster identity and PTP domain. Strict
+     * AES67 controllers (some Dante Domain Manager configs, Ravenna
+     * endpoints) require this before they'll lock. The gmid is read
+     * from pmc; see common/ptp_pmc.c. */
+    SDP_REFCLK_PTP_GMID      = 2,
 };
 
 struct sdp_params {
@@ -71,6 +78,13 @@ struct sdp_params {
     uint32_t    ptime_us;
 
     enum sdp_refclk refclk;
+
+    /* Only consulted when refclk == SDP_REFCLK_PTP_GMID. gmid is the
+     * RFC 7273 rendering of the 8-byte grandmaster clock identity
+     * ("hh-hh-hh-hh-hh-hh-hh-hh"); domain is the PTP domain number
+     * advertised by ptp4l. */
+    char    gmid_str[32];
+    uint8_t ptp_domain;
 };
 
 /* Render the SDP as a NUL-terminated text block into `out`. Returns the

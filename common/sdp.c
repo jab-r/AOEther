@@ -43,10 +43,17 @@ int sdp_build(char *out, size_t out_cap, const struct sdp_params *p)
         snprintf(c_line, sizeof c_line, "c=IN IP4 %s\r\n", p->dest_ip);
 
     const char *refclk_block = "";
+    char refclk_buf[128];
     if (p->refclk == SDP_REFCLK_PTP_TRACEABLE) {
         refclk_block =
             "a=ts-refclk:ptp=IEEE1588-2008:traceable\r\n"
             "a=mediaclk:direct=0\r\n";
+    } else if (p->refclk == SDP_REFCLK_PTP_GMID && p->gmid_str[0]) {
+        snprintf(refclk_buf, sizeof refclk_buf,
+                 "a=ts-refclk:ptp=IEEE1588-2008:%s:%u\r\n"
+                 "a=mediaclk:direct=0\r\n",
+                 p->gmid_str, (unsigned)p->ptp_domain);
+        refclk_block = refclk_buf;
     }
 
     int n = snprintf(out, out_cap,
@@ -206,7 +213,27 @@ int sdp_parse(const char *text, size_t len, struct sdp_params *p)
             continue;
         }
         if (starts_with(line, llen, "a=ts-refclk:ptp=")) {
-            p->refclk = SDP_REFCLK_PTP_TRACEABLE;
+            /* Two common forms:
+             *   a=ts-refclk:ptp=IEEE1588-2008:traceable
+             *   a=ts-refclk:ptp=IEEE1588-2008:<gmid>:<domain> */
+            const char *rest = line + strlen("a=ts-refclk:ptp=");
+            size_t rlen = llen - strlen("a=ts-refclk:ptp=");
+            char tmp[128];
+            copy_bounded(tmp, sizeof tmp, rest, rlen);
+            char profile[32], id_or_flag[48];
+            unsigned domain;
+            int got = sscanf(tmp, "%31[^:]:%47[^:]:%u",
+                             profile, id_or_flag, &domain);
+            if (got == 2 && strcmp(id_or_flag, "traceable") == 0) {
+                p->refclk = SDP_REFCLK_PTP_TRACEABLE;
+            } else if (got == 3) {
+                p->refclk = SDP_REFCLK_PTP_GMID;
+                strncpy(p->gmid_str, id_or_flag, sizeof p->gmid_str - 1);
+                p->gmid_str[sizeof p->gmid_str - 1] = '\0';
+                p->ptp_domain = (uint8_t)domain;
+            } else {
+                p->refclk = SDP_REFCLK_PTP_TRACEABLE;
+            }
             continue;
         }
     }
