@@ -37,7 +37,8 @@ Flags:
 - `--group IP` — multicast group to join (IP mode only). IPv4 in 224.0.0.0/4 or IPv6 in ff00::/8. Omit for unicast.
 - `--channels N` — channel count (1..64, default 2). Must match the talker.
 - `--rate HZ` — PCM only: one of 44100, 48000, 88200, 96000, 176400, 192000 (default 48000). Must match the talker. Ignored for DSD — rate is implied by `--format`.
-- `--format FMT` — `pcm` (default) or `dsd64 | dsd128 | dsd256 | dsd512` (M6). DSD uses `SND_PCM_FORMAT_DSD_U8`; DACs requiring `DSD_U32_BE` / `DSD_U16_LE` are a follow-up. See [`docs/recipe-dsd.md`](../docs/recipe-dsd.md).
+- `--format FMT` — `pcm` (default) or `dsd64 | dsd128 | dsd256` (M6). DSD512+ needs packet splitting (deferred to M8). See [`docs/recipe-dsd.md`](../docs/recipe-dsd.md).
+- `--alsa-format FMT` — ALSA sample format. Defaults: PCM → `pcm_s24_3le`; DSD → `dsd_u8`. Override for DSD with `dsd_u8 | dsd_u16_le | dsd_u16_be | dsd_u32_le | dsd_u32_be` to match whatever your DAC's `snd_usb_audio` quirk exposes; the receiver handles the transpose and endian conversion on ingress.
 - `--latency-us N` — ALSA period latency hint (default 5000 µs). Generous on purpose; the Mode C loop corrects ppm-scale drift slowly and the buffer also absorbs talker-side `timerfd` jitter.
 - `--no-feedback` — disable FEEDBACK emission. **Diagnostic only** — the positive control for the soak test (design.md §M1 test 7): with feedback off, the stream is expected to drift and xrun within minutes, confirming Mode C is doing real work when it's on.
 - `--announce` — publish this receiver via mDNS-SD (`_aoether._udp`) so talkers and `avahi-browse` can discover it without static MAC/IP configuration (M7 Phase A). Requires `libavahi-client-dev` at build time and `avahi-daemon` at runtime; without them the data path still works and the flag prints a "not compiled in" message. See [`docs/recipe-discovery.md`](../docs/recipe-discovery.md).
@@ -48,8 +49,8 @@ Needs `CAP_NET_RAW` for the raw sockets in L2 mode; easiest path is `sudo`. IP m
 ## What it does, exactly
 
 - Opens two `AF_PACKET` sockets: one for RX on EtherType `0x88B5` (data — or `0x22F0` with `--transport avtp`), one for TX on `0x88B6` (Mode C FEEDBACK).
-- Accepts only data frames whose format code matches `--format`: `0x11` (PCM s24le-3) for `--format pcm`, or `0x30..0x33` for `--format dsd64..dsd512`.
-- Opens the named ALSA device at the matching ALSA format (`S24_3LE` for PCM, `DSD_U8` for native DSD), with soft-resample disabled.
+- Accepts only data frames whose format code matches `--format`: `0x11` (PCM s24le-3) for `--format pcm`, or `0x30..0x32` for `--format dsd64..dsd256`.
+- Opens the named ALSA device at whichever format `--alsa-format` selected (default `S24_3LE` for PCM, `DSD_U8` for native DSD), with soft-resample disabled. For wider DSD variants (`DSD_U16_*` / `DSD_U32_*`) the receiver deinterleaves wire bytes into per-channel streams (buffering up to N-1 bytes per channel across packet boundaries) and repacks into ALSA's N-byte frames, reversing byte order within each group for the `_LE` variants.
 - Forwards payload bytes directly into `snd_pcm_writei`. ALSA is the jitter buffer; `snd_usb_audio` is the UAC2 stack and runs UAC2 async feedback with the DAC.
 - On xrun (`EPIPE`) calls `snd_pcm_prepare`, re-seeds the rate estimator, and continues.
 - Tracks sequence-number gaps for loss reporting; no reorder buffer in M1.
