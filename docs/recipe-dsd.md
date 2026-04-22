@@ -1,12 +1,12 @@
 # Recipe: native DSD end-to-end
 
-Native DSD transport via the AOE wrapper (Mode 1 / Mode 3). PCM and DoP paths are unchanged; this recipe focuses on what M6 adds.
+Native DSD transport via the AOE wrapper (Mode 1 / Mode 3). PCM and DoP paths are unchanged.
 
-For the wire-format byte layout see [`wire-format.md`](wire-format.md) §"Native DSD".
+For the wire-format byte layout see [`wire-format.md`](wire-format.md) §"Native DSD"; for per-microframe packet splitting (used by DSD512 and higher) see §"Cadence and fragmentation".
 
-## What works in M6
+## What works
 
-- Talker accepts `--format dsd64 | dsd128 | dsd256` and emits raw DSD bits on the wire with format codes `0x30..0x32`.
+- Talker accepts `--format dsd64 | dsd128 | dsd256 | dsd512 | dsd1024 | dsd2048` and emits raw DSD bits on the wire with format codes `0x30..0x35`. DSD512 and higher are carried via per-microframe packet splitting — at stereo that's 2 fragments per microframe for DSD512, 3 for DSD1024, 6 for DSD2048 — with no receiver-side reassembly state (each fragment is a complete AoE data frame). Receiver-side ALSA support for these rates depends on the DAC's `snd_usb_audio` quirk entry; most current DSD1024 DACs are already wired up in recent Linux kernels.
 - Receiver accepts the same `--format` values plus an `--alsa-format` override to match the ALSA DSD format your DAC's `snd_usb_audio` quirk exposes:
   - `dsd_u8` (default) — wire bytes pass through 1:1, zero reorder.
   - `dsd_u16_le` / `dsd_u16_be` — receiver deinterleaves into per-channel streams and repacks at 2-byte granularity, byte-reversing within each 2-byte group for `_le`.
@@ -17,7 +17,6 @@ For the wire-format byte layout see [`wire-format.md`](wire-format.md) §"Native
 
 ## What does NOT work yet
 
-- **DSD512 and higher.** DSD512 stereo needs ~353 bytes per channel per USB microframe, which overflows the wire format's `u8 payload_count` field (max 255). DSD1024 stereo at ~705 bytes per channel additionally breaks the 1500-byte MTU. Both land in M8 with the packet-splitting work and the `last-in-group` reassembly flag.
 - **DFF (.dff) file reading.** AOEther ships a DSF reader (Sony `.dsf`) but not a DSF-Interchange-File-Format reader. DFF is a straightforward follow-up — its bit order already matches the AOE wire format (MSB-first) — but is deferred alongside the per-DAC quirk matrix.
 - **DoP mode is not wired up.** The wire format reserves codes `0x20..0x23` for DoP (PCM s24le-3 with 0x05 / 0xFA marker bytes at inflated rates), and talker/receiver framework would accept them, but the talker has no DoP encoder source yet. If a DAC works only through DoP and not native DSD, use PCM mode for now and wait for the DoP encoder.
 

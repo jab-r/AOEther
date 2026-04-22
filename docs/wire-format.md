@@ -80,7 +80,7 @@ All multi-byte integer fields are big-endian.
 | 0 | Magic | 1 | `u8` | Constant `0xA0`. Receivers MUST discard frames with any other value. |
 | 1 | Version | 1 | `u8` | Protocol version. Currently `0x01`. Receivers SHOULD discard frames with unrecognized versions. |
 | 2 | Stream ID | 2 | `u16` BE | Identifies the logical audio stream. Allocated by the talker at stream setup. |
-| 4 | Sequence Number | 4 | `u32` BE | Monotonically increasing per stream, wraps at 2^32. Receivers use this to detect loss and reorder if needed. |
+| 4 | Sequence Number | 4 | `u32` BE | Monotonically increasing **per packet** (not per microframe), wraps at 2^32. Every wire packet — including every fragment of a split microframe — takes the next sequence number. Receivers use this to detect loss. See §"Cadence" for how this interacts with fragmentation. |
 | 8 | Presentation Time | 4 | `u32` BE | Low 32 bits of the gPTP timestamp (nanoseconds) at which the first sample in this packet should be presented. Zero when no PTP is available (M1–M2). |
 | 12 | Channel Count | 1 | `u8` | Number of audio channels, 1 to 64. |
 | 13 | Format | 1 | `u8` | Format code; see table below. |
@@ -118,7 +118,7 @@ Bit 2:       marker
 Bits 3-7:    reserved (must be 0 on transmit, ignored on receive)
 ```
 
-- **last-in-group (bit 0):** Set on the final packet of a microframe when a single microframe's audio is split across multiple packets (e.g., DSD2048 stereo where 2822 bytes per microframe exceeds MTU). When split is not in use, this bit is always 1.
+- **last-in-group (bit 0):** Set on the final packet of a microframe when a single microframe's audio is split across multiple packets (see §"Cadence" for the fragmentation rules). For a non-fragmented microframe the only packet in the group is also the last in the group, so the bit is always set. Equivalently: receivers MAY treat this bit as "microframe boundary" — the packet after a `last-in-group=1` starts a new group.
 - **discontinuity (bit 1):** Set by the talker when it knows there's a gap in continuity (e.g., after a talker restart or source reconnect). Receivers use this to reset jitter buffer state without reporting an underrun.
 - **marker (bit 2):** Application-defined. May be used in future for stream-level metadata (e.g., stream start, loudness event). Receivers pass through.
 
@@ -181,13 +181,45 @@ DSD rate determines average bytes per microframe per channel:
 
 Because these are non-integer, the talker alternates packet sizes (e.g., 44 and 45 bytes) to achieve the average rate over time. The exact alternation pattern is implementation-defined; receivers MUST accept any legal `payload_count` ≥ 1.
 
-## Cadence
+## Cadence and fragmentation
 
-Packets are emitted at a nominal rate of 8000 packets per second per stream, matching the USB High-Speed microframe rate. Each packet is timed to correspond to one USB microframe on the receiver's USB output path.
+One *microframe* of audio is the nominal output of a 125 µs USB High-Speed period. The talker emits microframes at 8000 groups per second per stream, aligned to the USB microframe cadence on the receiver's USB OUT path.
 
-For payload sizes that exceed the MTU (native DSD2048 stereo is 2822 bytes per microframe, exceeding the standard 1500-byte MTU), the talker splits a single microframe's audio across multiple packets transmitted in immediate succession. The last packet in the group sets the `last-in-group` flag. All packets within a group share the same sequence number and presentation time; the receiver reassembles them into a single contiguous audio unit for the USB OUT endpoint.
+Each microframe's audio travels in one *group* of one or more data packets. A group is always at least one packet — in the common case where `payload_count × channels × bytes_per_sample + header + Ethernet overhead` fits in the MTU *and* `payload_count ≤ 255`, every group is a single packet with `last-in-group=1`.
 
-**Example:** DSD2048 stereo microframe = 2 × 1411.2 = ~2822 bytes per microframe. Split into two packets of ~1411 bytes each (payloads, plus 16-byte headers), both with the same sequence number. First packet has `last-in-group` cleared; second has it set.
+Two conditions force fragmentation:
+
+1. **`payload_count` overflow.** The field is `u8`, so DSD formats above DSD256 (which need 352.8 + bytes/channel/microframe) cannot be carried in a single packet regardless of MTU.
+2. **MTU overflow.** A microframe that would produce a payload larger than `1500 − header` bytes must be split. Very-high-rate multichannel PCM (e.g., 22.2 at 192 kHz) and DSD1024/2048 both hit this.
+
+### Fragmentation rules
+
+When a talker produces a microframe with `pc` bytes-or-samples per channel:
+
+- Compute `max_frag_pc = min(255, floor((1500 − 14 − 16) / (channels × bytes_per_sample)))` for Mode 1 / Mode 3. (For Mode 3 subtract the IP/UDP overhead additionally — AOE talkers use `floor((MTU − L3 − L4 − 16) / (channels × bytes_per_sample))`.)
+- Fragment count `K = ceil(pc / max_frag_pc)`.
+- Distribute `pc` across K fragments so no fragment exceeds `max_frag_pc`. The canonical distribution is front-loaded: the first `pc mod K` fragments get `ceil(pc/K)`; the remainder get `floor(pc/K)`. Receivers MUST NOT depend on the exact distribution, only on the invariant that each fragment's `payload_count ≥ 1` and `≤ max_frag_pc`.
+- Emit the K fragments in immediate succession. Each fragment is a complete, standalone AoE data frame:
+  - Consecutive `sequence` numbers `seq..seq+K-1` (the stream's packet counter advances once per fragment, not once per group).
+  - Same `stream_id`, `channel_count`, `format`, `presentation_time` across all fragments of the group.
+  - Per-fragment `payload_count` from the distribution above.
+  - `flags.last-in-group = 0` on fragments `0..K-2`; `= 1` on fragment `K-1`.
+- Payload for fragment `k` is a contiguous byte range from the microframe's interleaved audio, starting at sample-or-byte offset `sum(frag_pc[0..k-1])` per channel. This works because AoE's per-sample (PCM) / per-byte (DSD) channel interleave means the first N samples-or-bytes of every channel are always the leading `N × channels × bytes_per_sample` bytes of the microframe buffer.
+
+### Receiver handling
+
+No group-level reassembly state is required. Each fragment is a valid AoE data frame on its own, and writing its payload to ALSA/USB produces the correct continuous audio stream — fragments arrive in order, their per-channel byte ranges concatenate losslessly, and the sum of per-fragment `payload_count`s equals the microframe's `pc`. Receivers MAY surface `last-in-group=0` packet counts as a stat.
+
+Fragment loss is noted by the existing per-packet sequence-gap detection. A missing middle fragment produces a short write at ALSA for that microframe; a missing last fragment likewise. Both are equivalent to a tiny underrun and recovered by ALSA's own buffer management.
+
+### Examples
+
+Frame sizes below include the 14-byte Ethernet header, 16-byte AoE header, and 4-byte FCS (30 B) but are quoted inclusive of FCS to match the §"Frame size examples" table convention.
+
+- **Stereo PCM 48 kHz/24, nominal.** `pc=6` samples, payload = 36 B, fits MTU, `max_frag_pc ≥ 246` → K=1. Single packet with `last-in-group=1`.
+- **Stereo DSD512, nominal.** `pc≈353` bytes/ch. `max_frag_pc = min(255, floor(1470/2)) = 255` → K=2. Fragment 0: 177 B/ch, total payload 354 B, frame 388 B, `last-in-group=0`. Fragment 1: 176 B/ch, total payload 352 B, frame 386 B, `last-in-group=1`.
+- **Stereo DSD1024, nominal.** `pc≈706` bytes/ch. `max_frag_pc = min(255, 735) = 255` → K=3. Fragments of 236 B, 235 B, 235 B per channel. Frame sizes 506/504/504 B. Last fragment has `last-in-group=1`.
+- **Stereo DSD2048, nominal.** `pc≈1411` bytes/ch. K=6. Fragments of 236 B once then 235 B × 5 per channel. Frame sizes 506 B then 504 B × 5.
 
 ## Frame size examples
 
@@ -201,8 +233,10 @@ For payload sizes that exceed the MTU (native DSD2048 stereo is 2822 bytes per m
 | 32ch PCM 48 kHz/24 | 576 B | 610 B |
 | 32ch PCM 96 kHz/24 | 1152 B | 1186 B |
 | Stereo Native DSD64 | 88 B | 122 B |
-| Stereo Native DSD512 | 704 B | 738 B |
-| Stereo Native DSD2048 | 2822 B total → 2 pkts of 1411 B | 2 × 1445 B |
+| Stereo Native DSD256 | 352 B | 386 B |
+| Stereo Native DSD512 | 706 B total → 2 frags of ~353 B | 2 × ~387 B |
+| Stereo Native DSD1024 | 1411 B total → 3 frags of ~471 B | 3 × ~505 B |
+| Stereo Native DSD2048 | 2822 B total → 6 frags of ~471 B | 6 × ~505 B |
 
 ## Mode 2 (AVTP AAF)
 

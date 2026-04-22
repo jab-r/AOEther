@@ -480,15 +480,26 @@ RT1170 USB host stack enumerates a target DAC and streams stereo PCM from Ethern
 
 **Goal:** Full Atmos on Linux receivers; DSD1024 / DSD2048 on MCU; move from "working prototype" to "deployable streamer."
 
-**Deliverables:**
-- Linux: 7.1.4 PCM Atmos bed, 22.2 streams, 24-hour soak, multi-receiver topologies, failure-mode docs.
-- MCU: multichannel PCM, native DSD64 through DSD1024, DSD2048 stereo. Per-DAC quirk table for major DSD DACs.
-- Linux ALSA: investigate native DSD1024/2048 exposure; propose patches if needed.
-- Deployment recipes (listening room, home theater, small venue, audiophile rack).
-- Debian packages for talker and Linux receiver; firmware image for MCU receiver.
-- Project website with docs and examples.
+Ships in pieces as sub-features land rather than as one atomic milestone. Items below are marked **[shipped]**, **[open]**, or **[hardware-blocked]** to reflect the actual state.
 
-**Time estimate:** 4–6 weekends across tracks plus calendar time for soak runs.
+**Wire-format / talker / receiver:**
+- **[shipped]** *Packet splitting for DSD512+ and high-rate multichannel PCM.* Talkers split a microframe whose per-channel `payload_count` exceeds the `u8` limit (255) or whose total payload exceeds MTU into K fragments emitted back-to-back, with per-fragment monotonic sequence numbers, shared `presentation_time` / `stream_id`, and `flags.last-in-group=1` only on the final fragment. Receivers require no group-level reassembly state — each fragment is a standalone AoE data frame that writes to ALSA unmodified, and per-fragment sequence gaps feed the existing loss counter. AVTP AAF keeps its single-packet-per-microframe constraint; fragmentation applies only to Mode 1 / Mode 3. See `wire-format.md` §"Cadence and fragmentation".
+- **[shipped]** *DSD512 / DSD1024 / DSD2048 talker and receiver support.* `--format dsd512 | dsd1024 | dsd2048` (wire codes `0x33`/`0x34`/`0x35`) is accepted on both sides now that packet splitting is in place. At stereo the wire splits DSD512 into 2 fragments/microframe, DSD1024 into 3, DSD2048 into 6. Receiver-side playback depends on the DAC's `snd_usb_audio` quirk entry — modern DSD1024 DACs are already wired up in mainline Linux; DSD2048 DAC availability is narrower but the wire path is live.
+- **[open]** *Runtime format reconfiguration via AECP `SET_STREAM_FORMAT` / `SET_SAMPLING_RATE`.* Phase B tracked this here. Needs a live ALSA reopen + fractional-accumulator retune.
+- **[open]** *DFF (`.dff`) file reader on the talker.* DFF's bit order matches the AOE wire format so no bit-reverse is needed; otherwise parallel to the DSF reader.
+- **[open]** *DoP encoder.* Format codes `0x20..0x23` are wire-reserved; wiring up a PCM-wrapped-DSD source is a modest talker-side addition.
+
+**Hardware-dependent tracks:**
+- **[hardware-blocked]** 7.1.4 PCM Atmos bed, 22.2 streams, 24-hour soak, multi-receiver topologies, failure-mode docs. Packet splitting unblocks 22.2 @ 192 kHz wire-format-wise; validation wants multichannel DAC hardware.
+- **[hardware-blocked]** MCU: multichannel PCM, native DSD64 through DSD2048. Per-DAC quirk table for major DSD DACs.
+- **[hardware-blocked]** Linux ALSA: investigate upstream quirk-entry coverage for DSD1024/2048; propose patches for any DACs mainline doesn't yet recognize.
+
+**Packaging / deployment:**
+- **[open]** Deployment recipes (listening room, home theater, small venue, audiophile rack).
+- **[open]** Debian packages for talker and Linux receiver; firmware image for MCU receiver.
+- **[open]** Project website with docs and examples.
+
+**Time estimate:** 4–6 weekends across tracks plus calendar time for soak runs. Wire-format / talker / receiver pieces land in individual PRs as they're ready; hardware-dependent validation is gated on physical access.
 
 ### M9 — Ravenna / AES67 interop
 

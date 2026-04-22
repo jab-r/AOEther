@@ -27,7 +27,7 @@ struct audio_source *audio_source_dsd_silence_open(int channels, int dsd_byte_ra
  * deinterleaves DSF's 4096-byte-per-channel blocks into AOE's byte-
  * granular wire interleave and bit-reverses each byte when the file is
  * stored LSB-first (the usual bits_per_sample=1 case). Supported rates:
- * DSD64 / DSD128 / DSD256; DSD512+ is rejected pending the M8 packet-
- * splitting extension. The caller must verify the DSF's reported channels
- * and rate match --format / --channels, exactly as for the WAV source. */
+ * DSD64 through DSD2048 (DSD512+ via per-microframe packet splitting on the
+ * wire). The caller must verify the DSF's reported channels and rate match
+ * --format / --channels, exactly as for the WAV source. */
 struct audio_source *audio_source_dsf_open(const char *path);

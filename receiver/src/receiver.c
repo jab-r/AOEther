@@ -33,7 +33,9 @@
 #define DSD64_BYTE_RATE   352800
 #define DSD128_BYTE_RATE  705600
 #define DSD256_BYTE_RATE  1411200
-/* DSD512 exceeds the u8 payload_count limit — needs packet splitting (M8). */
+#define DSD512_BYTE_RATE  2822400     /* M8: carried via per-microframe fragmentation. */
+#define DSD1024_BYTE_RATE 5644800
+#define DSD2048_BYTE_RATE 11289600
 
 /* Defaults match M1's previous hardcoded values. */
 #define DEFAULT_CHANNELS      2
@@ -42,8 +44,10 @@
 #define FEEDBACK_PERIOD_MS    20
 #define POLL_TIMEOUT_MS       FEEDBACK_PERIOD_MS
 
-/* Packet RX buffer: largest legal M2 frame is 12 ch × 3 B × 48 samples
- * (192 kHz microframe) = 1728 B plus 30 B header. 4 KiB is plenty. */
+/* Packet RX buffer: AOE fragmentation keeps every wire packet ≤ MTU
+ * (fragment payload ≤ 1470 B after header overhead), and AVTP keeps its
+ * single-packet-per-microframe constraint within the same MTU. 4 KiB
+ * comfortably holds one frame plus headers. */
 #define RX_BUF_BYTES     4096
 
 /* IP/UDP default port (interim; see docs/wire-format.md). */
@@ -83,9 +87,9 @@ static int parse_format(const char *s, struct stream_format *f)
         { AOE_FMT_NATIVE_DSD64,  1, DSD64_BYTE_RATE,  1, "dsd64"  },
         { AOE_FMT_NATIVE_DSD128, 1, DSD128_BYTE_RATE, 1, "dsd128" },
         { AOE_FMT_NATIVE_DSD256, 1, DSD256_BYTE_RATE, 1, "dsd256" },
-        /* DSD512 and higher need packet splitting: nominal bytes/ch per
-         * microframe exceeds the wire format's u8 payload_count field (255).
-         * Lifting that is M8 scope. */
+        { AOE_FMT_NATIVE_DSD512, 1, DSD512_BYTE_RATE, 1, "dsd512" },
+        { AOE_FMT_NATIVE_DSD1024,1, DSD1024_BYTE_RATE,1, "dsd1024" },
+        { AOE_FMT_NATIVE_DSD2048,1, DSD2048_BYTE_RATE,1, "dsd2048" },
     };
     for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); i++) {
         if (strcmp(s, table[i].name) == 0) {
@@ -176,8 +180,10 @@ static void usage(const char *prog)
         "  --group IP           multicast group to join (IP mode, optional;\n"
         "                       IPv4 in 224.0.0.0/4 or IPv6 in ff00::/8)\n"
         "  --format FMT         pcm | dsd64 | dsd128 | dsd256\n"
+        "                       | dsd512 | dsd1024 | dsd2048\n"
         "                       default pcm. AVTP transport is pcm-only.\n"
-        "                       DSD512+ needs packet splitting, deferred to M8.\n"
+        "                       DSD512+ arrives as split fragments — see\n"
+        "                       docs/wire-format.md §\"Cadence\".\n"
         "  --alsa-format FMT    ALSA sample format. Default picks from --format:\n"
         "                         pcm → pcm_s24_3le; dsd* → dsd_u8.\n"
         "                       DSD override: dsd_u8 | dsd_u16_le | dsd_u16_be |\n"
