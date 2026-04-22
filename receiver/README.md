@@ -42,7 +42,8 @@ Flags:
 - `--latency-us N` — ALSA period latency hint (default 5000 µs). Generous on purpose; the Mode C loop corrects ppm-scale drift slowly and the buffer also absorbs talker-side `timerfd` jitter.
 - `--no-feedback` — disable FEEDBACK emission. **Diagnostic only** — the positive control for the soak test (design.md §M1 test 7): with feedback off, the stream is expected to drift and xrun within minutes, confirming Mode C is doing real work when it's on.
 - `--announce` — publish this receiver via mDNS-SD (`_aoether._udp`) so talkers and `avahi-browse` can discover it without static MAC/IP configuration (M7 Phase A). Requires `libavahi-client-dev` at build time and `avahi-daemon` at runtime; without them the data path still works and the flag prints a "not compiled in" message. See [`docs/recipe-discovery.md`](../docs/recipe-discovery.md).
-- `--name NAME` — instance name to publish (default: hostname). Avahi appends " #2", " #3" on collisions.
+- `--name NAME` — instance name for `--announce` and `--avdecc` (default: hostname). Avahi appends " #2", " #3" on mDNS collisions.
+- `--avdecc` — start an AVDECC listener entity (Milan/Hive discovery, M7 Phase B). Requires the la_avdecc submodule and a built `avdecc/build/libaoether_avdecc.a`; without those the flag prints a "rebuild with la_avdecc" message and the data path still works. See [`docs/recipe-avdecc.md`](../docs/recipe-avdecc.md).
 
 Needs `CAP_NET_RAW` for the raw sockets in L2 mode; easiest path is `sudo`. IP mode doesn't require root for port 8805.
 

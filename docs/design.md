@@ -447,15 +447,19 @@ Simple-home-network path: receivers publish themselves as `_aoether._udp` with T
 - Talker-side auto-select (picking a receiver from the discovered set). A `--dest=mdns:NAME` shorthand is a follow-up; for now browse output is piped into the talker invocation manually.
 - Expressing full capability matrices in TXT records (e.g. "PCM up to 192 kHz **and** DSD256"). Each run publishes one concrete configuration; capability matrices are Phase B's job.
 
-#### Phase B — AVDECC entity model
+#### Phase B — AVDECC entity model via la_avdecc
 
-Milan-controller path. Linux side implements an IEEE 1722.1 entity model (ADP advertising, ACMP CONNECT_TX/RX, AECP AEM READ_DESCRIPTOR) sufficient for Hive and other Milan controllers to discover AOEther endpoints and establish streams. Capability descriptors are populated from DAC-level discovery (supported rates, channel counts, whether the DAC supports Milan-compatible formats). Interop target is Hive's "Connect" workflow working end-to-end against AOEther listeners and talkers without manual stream ID / MAC entry.
+Milan-controller path. Linux side ships an IEEE 1722.1 entity backed by [L-Acoustics' open-source la_avdecc library](https://github.com/L-Acoustics/avdecc) so Hive and other Milan controllers can discover AOEther endpoints and establish streams without manual stream ID / MAC entry.
 
-**Deliverables:**
-- `common/avdecc.{h,c}` — ADP / ACMP / AECP PDU encode/decode, descriptor tables, state machine for the listener and talker roles.
-- Receiver: `--avdecc` flag starts the entity responder. `READ_DESCRIPTOR(ENTITY, CONFIGURATION, STREAM_INPUT, AUDIO_UNIT, LOCALE, STRINGS)` gets Hive to render the entity correctly.
-- Talker: matching responder on the talker side so streams advertised in AOEther show up in Hive's talker list.
-- `docs/recipe-avdecc.md` with Hive bring-up, screenshots, and troubleshooting.
+**Why la_avdecc:** it is the reference implementation Hive itself is built on, handles the Milan/ATDECC state machines correctly out of the box, and saves AOEther from owning the protocol-quirk surface. Tradeoff: it is C++17 (CMake, libpcap, Boost), which makes AVDECC the first C++ dependency in an otherwise pure-C codebase. We keep the main binaries C11 by pushing the library into a small static archive (`avdecc/build/libaoether_avdecc.a`) and exposing a C-shaped wrapper in `common/avdecc.{h,c}`. Receiver and talker Makefiles detect the archive and link it when present; without it `--avdecc` prints a helpful error and the data path keeps working.
+
+Ships in small steps so reviews stay tractable:
+
+1. **Step 1 — scaffolding (shipped).** Submodule wired, CMake build glue produces the static archive, C wrapper in place, `--avdecc` flag on both binaries, recipe doc.
+2. **Step 2 — ADP advertising (shipped).** `avdecc/src/entity.cpp` opens a PCap-backed `ProtocolInterface`, creates an `AggregateEntity` with entity name + group name + firmware version, and enables ADP advertising with `listenerStreamSinks=1` (listener) or `talkerStreamSources=1` (talker). Hive's controller pane renders the entity row.
+3. **Step 3 — full descriptor tree (shipped).** Configuration tree gains STREAM_INPUT (listener) or STREAM_OUTPUT (talker) at 48 kHz / 24-bit / stereo AAF, parented under AUDIO_UNIT with STREAM_PORT + AUDIO_CLUSTER, plus AVB_INTERFACE (with the real iface MAC), CLOCK_SOURCE (Internal), and CLOCK_DOMAIN. Hive enables Connect on the stream; protocol-level ACMP CONNECT succeeds and la_avdecc updates the stream's internal connection state.
+4. **Step 4 — ACMP CONNECT_TX/RX drives the AOEther data path.** A poll thread inside the entity watches la_avdecc's dynamic model for connection-state changes and fires `on_bind(peer_mac, stream_id)` / `on_unbind()` into the receiver and talker main loops. Receiver side: learned talker MAC overrides the first-frame-learns fallback; talker side: ACMP-sourced dest MAC overrides `--dest-mac`. Clicking Connect in Hive now produces audio without any CLI flags on either side.
+5. **Step 5 — capability matrix in descriptor tree.** Supported stream formats expand from a single hardcoded AAF-48k-2ch to the full matrix the receiver's DAC advertises (multi-rate, multi-channel, Milan-compatible subset). Controllers pick a compatible format automatically.
 
 **Out of scope for Phase B (tracked as follow-ups):**
 - MSRP stream reservation. Deferred to the TSN hardening track.

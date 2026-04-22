@@ -1,3 +1,4 @@
+#include "avdecc.h"
 #include "avtp.h"
 #include "mdns.h"
 #include "packet.h"
@@ -163,7 +164,9 @@ static void usage(const char *prog)
         "  --no-feedback        do not emit Mode C FEEDBACK frames (diagnostic)\n"
         "  --announce           publish this receiver via mDNS-SD (_aoether._udp)\n"
         "                       so talkers and avahi-browse can discover it\n"
-        "  --name NAME          instance name to publish (default: hostname)\n",
+        "  --name NAME          instance name for --announce and --avdecc (default: hostname)\n"
+        "  --avdecc             start an AVDECC listener entity (Milan/Hive discovery);\n"
+        "                       requires la_avdecc submodule built — see docs/recipe-avdecc.md\n",
         prog, DEFAULT_UDP_PORT, DEFAULT_CHANNELS, DEFAULT_RATE_HZ, DEFAULT_LATENCY_US);
 }
 
@@ -206,6 +209,7 @@ int main(int argc, char **argv)
     int udp_port = DEFAULT_UDP_PORT;
     int announce = 0;
     const char *announce_name = NULL;
+    int avdecc_enabled = 0;
 
     static const struct option opts[] = {
         { "iface",       required_argument, 0, 'i' },
@@ -219,13 +223,14 @@ int main(int argc, char **argv)
         { "alsa-format", required_argument, 0, 'A' },
         { "latency-us",  required_argument, 0, 'l' },
         { "no-feedback", no_argument,       0, 'n' },
-        { "announce",    no_argument,       0, 'A' },
+        { "announce",    no_argument,       0, 1001 },
         { "name",        required_argument, 0, 'N' },
+        { "avdecc",      no_argument,       0, 'V' },
         { "help",        no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "i:d:T:P:G:C:r:F:l:nAN:h", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:d:T:P:G:C:r:F:l:nAN:Vh", opts, NULL)) != -1) {
         switch (c) {
         case 'i': iface = optarg; break;
         case 'd': dac = optarg; break;
@@ -243,8 +248,9 @@ int main(int argc, char **argv)
         case 'A': alsa_format_s = optarg; break;
         case 'l': latency_us = atoi(optarg); break;
         case 'n': feedback_enabled = 0; break;
-        case 'A': announce = 1; break;
+        case 1001: announce = 1; break;
         case 'N': announce_name = optarg; break;
+        case 'V': avdecc_enabled = 1; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -528,6 +534,27 @@ int main(int argc, char **argv)
         if (!mdns) {
             fprintf(stderr,
                     "receiver: mDNS-SD publication failed (continuing without announce)\n");
+        }
+    }
+
+    /* AVDECC entity (M7 Phase B). Milan controllers like Hive discover
+     * AOEther listeners through this entity and use ACMP CONNECT_RX to
+     * bind a peer talker at runtime. Currently scaffolding only — the
+     * descriptor tree and ACMP handler are filled in by step 2. */
+    struct aoether_avdecc *avdecc = NULL;
+    if (avdecc_enabled) {
+        struct aoether_avdecc_config cfg = {
+            .role        = AOETHER_AVDECC_LISTENER,
+            .entity_name = announce_name,
+            .iface       = iface,
+            .channels    = channels,
+            .rate_hz     = rate_hz,
+            .format_name = fmt.name,
+        };
+        avdecc = aoether_avdecc_open(&cfg, NULL, NULL, NULL);
+        if (!avdecc) {
+            fprintf(stderr,
+                    "receiver: AVDECC entity open failed (continuing without --avdecc)\n");
         }
     }
 
@@ -852,5 +879,6 @@ check_feedback:
     if (ctl_sock != data_sock) close(ctl_sock);
     close(data_sock);
     aoether_mdns_close(mdns);
+    aoether_avdecc_close(avdecc);
     return 0;
 }

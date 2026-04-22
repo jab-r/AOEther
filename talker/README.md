@@ -32,7 +32,9 @@ Flags:
 - `--capture hw:CARD=...` — ALSA PCM name when `--source alsa`. Point at one half of a `snd-aloop` pair to receive from Roon/UPnP/PipeWire; see `docs/recipe-*.md`.
 - `--channels N` — channel count (1..64, default 2). Receiver must match.
 - `--rate HZ` — PCM only: one of 44100, 48000, 88200, 96000, 176400, 192000 (default 48000). Ignored for DSD — rate is implied by `--format`.
-- `--format FMT` — `pcm` (default) or `dsd64 | dsd128 | dsd256` (M6). DSD512+ needs packet splitting (deferred to M8). AVTP transport is PCM-only and rejects `dsd*` at startup. See [`docs/recipe-dsd.md`](../docs/recipe-dsd.md).
+- `--format FMT` — `pcm` (default) or `dsd64 | dsd128 | dsd256 | dsd512` (M6). AVTP transport is PCM-only and rejects `dsd*` at startup. See [`docs/recipe-dsd.md`](../docs/recipe-dsd.md).
+- `--avdecc` — start an AVDECC talker entity (Milan/Hive discovery, M7 Phase B). Requires the la_avdecc submodule and a built `avdecc/build/libaoether_avdecc.a`. See [`docs/recipe-avdecc.md`](../docs/recipe-avdecc.md).
+- `--name NAME` — entity name for `--avdecc` (default: hostname + "-talker").
 
 Needs `CAP_NET_RAW` to open `AF_PACKET` in L2 mode; easiest path is `sudo`. IP mode doesn't require root in principle (bind on ephemeral port is unprivileged), but if you want to bind to port 8805 < 1024 you'd need capabilities anyway — 8805 is fine without.
 

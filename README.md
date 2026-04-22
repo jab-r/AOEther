@@ -100,6 +100,7 @@ AOEther doesn't implement Roon, UPnP, or AirPlay natively — it bridges them vi
 - [`docs/recipe-milan.md`](docs/recipe-milan.md) — Milan / AVTP interop: emit AAF to a Milan listener or receive from a Milan talker (M5)
 - [`docs/recipe-dsd.md`](docs/recipe-dsd.md) — native DSD64–DSD512 end-to-end (M6, silence smoke-test; real .dsf playback arrives in M8)
 - [`docs/recipe-discovery.md`](docs/recipe-discovery.md) — mDNS-SD receiver discovery via `--announce` and `aoether-browse` (M7 Phase A)
+- [`docs/recipe-avdecc.md`](docs/recipe-avdecc.md) — AVDECC discovery with Hive via `--avdecc`, backed by la_avdecc (M7 Phase B)
 
 The same talker and receiver binaries run under every recipe; only the source daemon changes. AirPlay (shairport-sync) and Spotify Connect (librespot) plug in with the same pattern.
 
