@@ -18,6 +18,7 @@ SRCS      := \
     ../common/rtp.c \
     ../common/sdp.c \
     ../common/sap.c \
+    ../common/ptp_pmc.c \
     ../common/avdecc.c
 
 # AVDECC entity (M7 Phase B) is optional. See receiver/Makefile for
@@ -35,7 +36,7 @@ endif
 .PHONY: all clean
 all: $(BUILD)/talker
 
-$(BUILD)/talker: $(SRCS) src/audio_source.h ../common/packet.h ../common/avtp.h ../common/rtp.h ../common/sdp.h ../common/sap.h ../common/avdecc.h | $(BUILD)
+$(BUILD)/talker: $(SRCS) src/audio_source.h ../common/packet.h ../common/avtp.h ../common/rtp.h ../common/sdp.h ../common/sap.h ../common/ptp_pmc.h ../common/avdecc.h | $(BUILD)
 	$(LINK) $(CFLAGS) $(INCLUDES) $(SRCS) -o $@ $(LDLIBS)
 
 $(BUILD):

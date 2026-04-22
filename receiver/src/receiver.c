@@ -3,6 +3,8 @@
 #include "mdns.h"
 #include "packet.h"
 #include "rtp.h"
+#include "sap.h"
+#include "sdp.h"
 
 #include <pthread.h>
 
@@ -202,7 +204,17 @@ static void usage(const char *prog)
         "                       so talkers and avahi-browse can discover it\n"
         "  --name NAME          instance name for --announce and --avdecc (default: hostname)\n"
         "  --avdecc             start an AVDECC listener entity (Milan/Hive discovery);\n"
-        "                       requires la_avdecc submodule built — see docs/recipe-avdecc.md\n",
+        "                       requires la_avdecc submodule built — see docs/recipe-avdecc.md\n"
+        "  --list-sap [SECS]    passive AES67 SAP listener: join 239.255.255.255:9875,\n"
+        "                       dedupe sessions by (origin, msg_id), print each one\n"
+        "                       with a ready-to-run receiver command, then exit.\n"
+        "                       SECS (default 5) is the listen window. Does not open\n"
+        "                       the DAC; --iface is the only other required option.\n"
+        "  --sdp PATH           M10 Phase C: read an AES67 SDP from PATH. Single-m=\n"
+        "                       SDPs are applied as --transport rtp + --group / --port /\n"
+        "                       --channels / --rate overrides. Bundled (multi-m=) SDPs\n"
+        "                       are parsed and their substream layout is logged; full\n"
+        "                       multi-stream receive lands with Phase D hardware interop.\n",
         prog, DEFAULT_UDP_PORT, DEFAULT_CHANNELS, DEFAULT_RATE_HZ, DEFAULT_LATENCY_US);
 }
 
@@ -246,6 +258,9 @@ int main(int argc, char **argv)
     int announce = 0;
     const char *announce_name = NULL;
     int avdecc_enabled = 0;
+    int list_sap = 0;
+    int list_sap_secs = 5;
+    const char *sdp_path = NULL;
 
     static const struct option opts[] = {
         { "iface",       required_argument, 0, 'i' },
@@ -262,6 +277,8 @@ int main(int argc, char **argv)
         { "announce",    no_argument,       0, 1001 },
         { "name",        required_argument, 0, 'N' },
         { "avdecc",      no_argument,       0, 'V' },
+        { "list-sap",    optional_argument, 0, 1002 },
+        { "sdp",         required_argument, 0, 1003 },
         { "help",        no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
@@ -288,13 +305,282 @@ int main(int argc, char **argv)
         case 1001: announce = 1; break;
         case 'N': announce_name = optarg; break;
         case 'V': avdecc_enabled = 1; break;
+        case 1002:
+            list_sap = 1;
+            if (optarg) list_sap_secs = atoi(optarg);
+            if (list_sap_secs < 1) list_sap_secs = 1;
+            break;
+        case 1003: sdp_path = optarg; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
     }
-    if (!iface || !dac) {
+    if (!iface) {
         usage(argv[0]);
         return 2;
+    }
+    if (!list_sap && !dac) {
+        usage(argv[0]);
+        return 2;
+    }
+
+    /* M10 Phase C — ingest a bundled SDP. Single-m= SDPs are used as a
+     * convenience: parsed fields override --group / --port / --channels
+     * / --rate so the operator can drop a controller-issued SDP into
+     * the receiver without hand-copying numbers. Multi-m= SDPs are
+     * parsed and the substream layout is printed, but the receive loop
+     * itself is deferred — landing full reassembly + multi-socket poll
+     * alongside hardware interop (Phase D) keeps untested code out of
+     * the tree. */
+    if (sdp_path) {
+        FILE *fp = fopen(sdp_path, "rb");
+        if (!fp) {
+            fprintf(stderr, "receiver: --sdp %s: %s\n",
+                    sdp_path, strerror(errno));
+            return 2;
+        }
+        char sdp_buf[SDP_MAX_LEN];
+        size_t sdp_n = fread(sdp_buf, 1, sizeof sdp_buf - 1, fp);
+        fclose(fp);
+        if (sdp_n == 0) {
+            fprintf(stderr, "receiver: --sdp %s is empty\n", sdp_path);
+            return 2;
+        }
+        sdp_buf[sdp_n] = '\0';
+
+        struct sdp_params  session;
+        struct sdp_media_parsed media[16];
+        size_t n_media = 0;
+        if (sdp_parse_bundle(sdp_buf, sdp_n,
+                             &session, media,
+                             sizeof media / sizeof media[0],
+                             &n_media) < 0) {
+            fprintf(stderr,
+                    "receiver: --sdp %s: could not parse as AES67 SDP\n",
+                    sdp_path);
+            return 2;
+        }
+
+        fprintf(stderr,
+                "receiver: --sdp parsed: session \"%s\", %zu substream%s, "
+                "%s refclk\n",
+                session.session_name[0] ? session.session_name : "(unnamed)",
+                n_media, n_media == 1 ? "" : "s",
+                session.refclk == SDP_REFCLK_PTP_GMID     ? "ptp:gmid" :
+                session.refclk == SDP_REFCLK_PTP_TRACEABLE ? "ptp:traceable" :
+                                                             "none");
+        int total_channels = 0;
+        for (size_t i = 0; i < n_media; i++) {
+            fprintf(stderr,
+                    "receiver:   substream %zu (mid=%d): %u ch @ %u Hz "
+                    "L%s → %s:%u ptime=%u.%03u ms\n",
+                    i, media[i].mid,
+                    (unsigned)media[i].channels,
+                    (unsigned)media[i].sample_rate_hz,
+                    media[i].encoding == SDP_ENC_L16 ? "16" : "24",
+                    media[i].dest_ip[0] ? media[i].dest_ip : "(no c=)",
+                    (unsigned)media[i].port,
+                    (unsigned)(media[i].ptime_us / 1000),
+                    (unsigned)(media[i].ptime_us % 1000));
+            total_channels += media[i].channels;
+        }
+
+        if (n_media > 1) {
+            fprintf(stderr,
+                    "receiver: bundled SDP with %zu substreams (total %d "
+                    "channels) parsed successfully. Multi-stream receive "
+                    "(M10 Phase C receive-side reassembly) is not yet "
+                    "wired through the main data-path; it lands alongside "
+                    "hardware interop validation (Phase D). For today's "
+                    "test rigs: run one receiver per substream with "
+                    "--group pointing at that substream's multicast "
+                    "address.\n",
+                    n_media, total_channels);
+            return 2;
+        }
+
+        /* Single-m= SDP: inject its fields as if --group / --port /
+         * --channels / --rate had been provided. Explicit CLI values
+         * win if the user also set them. */
+        transport = TRANSPORT_RTP;
+        if (!group_s && media[0].dest_ip[0]) group_s = media[0].dest_ip;
+        if (udp_port == DEFAULT_UDP_PORT && media[0].port)
+            udp_port = media[0].port;
+        if (channels == DEFAULT_CHANNELS && media[0].channels)
+            channels = media[0].channels;
+        if (rate_hz == DEFAULT_RATE_HZ && media[0].sample_rate_hz)
+            rate_hz = media[0].sample_rate_hz;
+        fprintf(stderr,
+                "receiver: --sdp single-stream: applied "
+                "--transport rtp --group %s --port %u --channels %d "
+                "--rate %d\n",
+                group_s ? group_s : "(unset)", udp_port, channels, rate_hz);
+    }
+
+    /* --list-sap: sniff SAP announcements (both IPv4 and IPv6) and print
+     * each unique session with a ready-to-run receiver command, then exit.
+     * Does not touch ALSA or any transport sockets. Each SAP family runs
+     * on its own socket: IPv4 joins 239.255.255.255 and IPv6 joins
+     * ff0e::2:7ffe. We accept whichever (or both) the kernel can open. */
+    if (list_sap) {
+        int sfd_v4 = sap_open_rx_socket(AF_INET, iface);
+        int sfd_v6 = sap_open_rx_socket(AF_INET6, iface);
+        if (sfd_v4 < 0 && sfd_v6 < 0) {
+            fprintf(stderr,
+                    "receiver: could not open any SAP RX socket (v4 or v6) "
+                    "on %s\n", iface);
+            return 1;
+        }
+
+        fprintf(stderr,
+                "receiver: listening for SAP announcements on %s for %d s\n"
+                "          v4: %s%s\n"
+                "          v6: %s%s\n",
+                iface, list_sap_secs,
+                sfd_v4 >= 0 ? SAP_IPV4_ADDR_STR : "(unavailable)",
+                sfd_v4 >= 0 ? ":9875" : "",
+                sfd_v6 >= 0 ? "[" SAP_IPV6_ADDR_STR "]" : "(unavailable)",
+                sfd_v6 >= 0 ? ":9875" : "");
+
+        struct seen {
+            int family;
+            union { uint32_t v4_be; uint8_t v6[16]; } origin;
+            uint16_t msg_id;
+        };
+        enum { SEEN_CAP = 64 };
+        struct seen seen_tbl[SEEN_CAP];
+        int seen_n = 0;
+        int printed = 0;
+
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (;;) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long remaining_ms =
+                list_sap_secs * 1000
+                - (long)((now.tv_sec - t0.tv_sec) * 1000
+                         + (now.tv_nsec - t0.tv_nsec) / 1000000);
+            if (remaining_ms <= 0) break;
+
+            struct pollfd pfds[2];
+            int npfds = 0;
+            int idx_v4 = -1, idx_v6 = -1;
+            if (sfd_v4 >= 0) {
+                pfds[npfds].fd = sfd_v4;
+                pfds[npfds].events = POLLIN;
+                idx_v4 = npfds++;
+            }
+            if (sfd_v6 >= 0) {
+                pfds[npfds].fd = sfd_v6;
+                pfds[npfds].events = POLLIN;
+                idx_v6 = npfds++;
+            }
+
+            int pr = poll(pfds, npfds,
+                          remaining_ms < 1000 ? (int)remaining_ms : 1000);
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                perror("poll(sap)");
+                break;
+            }
+            if (pr == 0) continue;
+
+            for (int p = 0; p < npfds; p++) {
+                if (!(pfds[p].revents & POLLIN)) continue;
+                int rfd = pfds[p].fd;
+
+                uint8_t buf[4096];
+                struct sockaddr_storage src_addr;
+                socklen_t src_len = sizeof src_addr;
+                ssize_t n = recvfrom(rfd, buf, sizeof buf, 0,
+                                     (struct sockaddr *)&src_addr, &src_len);
+                if (n <= 0) continue;
+                (void)idx_v4; (void)idx_v6;   /* indices kept for clarity */
+
+                enum sap_kind kind;
+                struct sap_origin origin;
+                uint16_t msg_id;
+                const char *sdp_text;
+                size_t sdp_len;
+                if (sap_parse(buf, (size_t)n, &kind, &origin, &msg_id,
+                              &sdp_text, &sdp_len) < 0) {
+                    continue;
+                }
+                if (kind == SAP_DELETION) continue;
+
+                int dup = 0;
+                for (int i = 0; i < seen_n; i++) {
+                    if (seen_tbl[i].family != origin.family) continue;
+                    if (seen_tbl[i].msg_id != msg_id) continue;
+                    int match = (origin.family == AF_INET)
+                        ? (seen_tbl[i].origin.v4_be == origin.addr.v4_be)
+                        : (memcmp(seen_tbl[i].origin.v6, origin.addr.v6, 16) == 0);
+                    if (match) { dup = 1; break; }
+                }
+                if (dup) continue;
+                if (seen_n < SEEN_CAP) {
+                    seen_tbl[seen_n].family = origin.family;
+                    seen_tbl[seen_n].msg_id = msg_id;
+                    if (origin.family == AF_INET)
+                        seen_tbl[seen_n].origin.v4_be = origin.addr.v4_be;
+                    else
+                        memcpy(seen_tbl[seen_n].origin.v6,
+                               origin.addr.v6, 16);
+                    seen_n++;
+                }
+
+                struct sdp_params sp;
+                if (sdp_parse(sdp_text, sdp_len, &sp) < 0) continue;
+
+                char origin_str[INET6_ADDRSTRLEN] = "?";
+                if (origin.family == AF_INET)
+                    inet_ntop(AF_INET, &origin.addr.v4_be,
+                              origin_str, sizeof origin_str);
+                else
+                    inet_ntop(AF_INET6, origin.addr.v6,
+                              origin_str, sizeof origin_str);
+
+                printed++;
+                printf("\n  [%d] session=\"%s\"\n", printed, sp.session_name);
+                printf("      origin=%s  dest=%s:%u  family=%s\n",
+                       origin_str,
+                       sp.dest_ip ? sp.dest_ip : "?",
+                       (unsigned)sp.port,
+                       sp.family == SDP_ADDR_IP6 ? "IP6" : "IP4");
+                printf("      fmt=%s rate=%u ch=%u pt=%u ptime=%.3fms refclk=%s\n",
+                       sp.encoding == SDP_ENC_L16 ? "L16" : "L24",
+                       (unsigned)sp.sample_rate_hz,
+                       (unsigned)sp.channels,
+                       (unsigned)sp.payload_type,
+                       (double)sp.ptime_us / 1000.0,
+                       sp.refclk == SDP_REFCLK_PTP_TRACEABLE ? "ptp" : "none");
+                printf("      cmd:\n");
+                printf("        sudo receiver --iface %s --dac hw:CARD=...,DEV=0 \\\n"
+                       "                      --transport rtp --group %s --port %u \\\n"
+                       "                      --channels %u --rate %u\n",
+                       iface,
+                       sp.dest_ip ? sp.dest_ip
+                           : (sp.family == SDP_ADDR_IP6 ? "ff3e::X" : "239.X.X.X"),
+                       (unsigned)sp.port,
+                       (unsigned)sp.channels,
+                       (unsigned)sp.sample_rate_hz);
+            }
+        }
+        if (sfd_v4 >= 0) close(sfd_v4);
+        if (sfd_v6 >= 0) close(sfd_v6);
+        if (printed == 0) {
+            fprintf(stderr,
+                    "receiver: no SAP announcements seen in %d s — check\n"
+                    "  * the talker is running with --announce-sap\n"
+                    "  * the switch/router doesn't block multicast to\n"
+                    "    %s (v4) or %s (v6)\n"
+                    "  * the right --iface is selected\n",
+                    list_sap_secs,
+                    SAP_IPV4_ADDR_STR, SAP_IPV6_ADDR_STR);
+            return 1;
+        }
+        return 0;
     }
     if (udp_port < 1 || udp_port > 65535) {
         fprintf(stderr, "receiver: --port out of range\n");
