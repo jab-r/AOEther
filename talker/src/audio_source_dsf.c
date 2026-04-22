@@ -175,15 +175,16 @@ struct audio_source *audio_source_dsf_open(const char *path)
         munmap((void *)map, sb.st_size);
         return NULL;
     }
-    /* AOEther currently carries DSD64/128/256; DSD512+ lands in M8 with
-     * the packet-splitting extension. Catch DSD512+ DSF files here rather
-     * than letting the rate-mismatch error downstream obscure what's going on. */
-    if (sampling_freq != 2822400 && sampling_freq != 5644800 &&
-        sampling_freq != 11289600) {
+    /* AOEther carries DSD64/128/256/512/1024/2048 on the wire; DSD512+ is
+     * delivered as split fragments per microframe (see wire-format.md
+     * §"Cadence and fragmentation"). */
+    if (sampling_freq != 2822400  && sampling_freq != 5644800 &&
+        sampling_freq != 11289600 && sampling_freq != 22579200 &&
+        sampling_freq != 45158400 && sampling_freq != 90316800) {
         fprintf(stderr,
                 "dsf: sampling frequency %u Hz not supported "
-                "(AOEther carries DSD64/128/256 = 2822400/5644800/11289600 Hz; "
-                "DSD512+ requires the packet-splitting extension deferred to M8)\n",
+                "(AOEther accepts DSD64/128/256/512/1024/2048 = "
+                "2822400/5644800/11289600/22579200/45158400/90316800 Hz)\n",
                 sampling_freq);
         munmap((void *)map, sb.st_size);
         return NULL;

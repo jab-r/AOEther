@@ -40,8 +40,9 @@
 #define DSD64_BYTE_RATE       352800       /* 2.8224 MHz / 8 */
 #define DSD128_BYTE_RATE      705600
 #define DSD256_BYTE_RATE      1411200
-/* DSD512 (2.8224 MB/s/ch) exceeds the wire format's u8 payload_count (255)
- * and needs packet splitting — deferred to M8. */
+#define DSD512_BYTE_RATE      2822400       /* M8: enabled by packet splitting. */
+#define DSD1024_BYTE_RATE     5644800       /* Wire: ~3 fragments/microframe stereo. */
+#define DSD2048_BYTE_RATE     11289600      /* Wire: ~6 fragments/microframe stereo. */
 
 /* Ethernet II data payload max (frame - eth header) for standard 1500 MTU. */
 #define ETH_MTU_PAYLOAD       1500
@@ -96,8 +97,9 @@ static int parse_format(const char *s, struct stream_format *f)
         { AOE_FMT_NATIVE_DSD64,   1, DSD64_BYTE_RATE,     1, "dsd64"  },
         { AOE_FMT_NATIVE_DSD128,  1, DSD128_BYTE_RATE,    1, "dsd128" },
         { AOE_FMT_NATIVE_DSD256,  1, DSD256_BYTE_RATE,    1, "dsd256" },
-        /* DSD512+ overflows the wire format's u8 payload_count field; it
-         * lands in M8 alongside the packet-splitting work. */
+        { AOE_FMT_NATIVE_DSD512,  1, DSD512_BYTE_RATE,    1, "dsd512" },
+        { AOE_FMT_NATIVE_DSD1024, 1, DSD1024_BYTE_RATE,   1, "dsd1024" },
+        { AOE_FMT_NATIVE_DSD2048, 1, DSD2048_BYTE_RATE,   1, "dsd2048" },
     };
     for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); i++) {
         if (strcmp(s, table[i].name) == 0) {
@@ -203,8 +205,10 @@ static void usage(const char *prog)
         "\n"
         "Stream format:\n"
         "  --format  FMT                pcm | dsd64 | dsd128 | dsd256\n"
-        "                               default pcm. DoP and DSD512+ are deferred\n"
-        "                               (DSD512+ needs packet splitting → M8).\n"
+        "                             | dsd512 | dsd1024 | dsd2048\n"
+        "                               default pcm. DSD512+ uses per-microframe\n"
+        "                               packet splitting (wire-format.md §Cadence).\n"
+        "                               DoP remains deferred.\n"
         "                               AVTP transport carries pcm only.\n"
         "  --channels N                 channel count (1..64, default %d)\n"
         "  --rate    HZ                 44100|48000|88200|96000|176400|192000 (default %d)\n"
@@ -343,28 +347,78 @@ int main(int argc, char **argv)
         return 2;
     } else if (!is_dsd && source_is_dsd) {
         fprintf(stderr,
-                "talker: --source %s requires --format dsd64|dsd128|dsd256\n",
+                "talker: --source %s requires --format dsd64|dsd128|dsd256|dsd512|dsd1024|dsd2048\n",
                 source);
         return 2;
     }
 
-    /* MTU check: at worst we need nominal samples-per-microframe plus a
-     * small drift margin, times channels × bytes. Plus eth (14) + protocol
-     * header (16 for AOE, 24 for AVTP-AAF). */
+    /* MTU sizing and fragmentation parameters.
+     *
+     * AOE paths (Mode 1 / Mode 3) support per-microframe fragmentation: a
+     * single microframe is split into K packets when either payload_count
+     * (u8) or the MTU would otherwise overflow. See docs/wire-format.md
+     * §"Cadence and fragmentation".
+     *
+     * AVTP AAF does not fragment — splitting an AAF stream across multiple
+     * 1722 frames per microframe breaks interop with strict Milan listeners.
+     * AAF configs that overflow MTU are rejected at startup. */
     const size_t proto_hdr_len = (transport == TRANSPORT_AVTP) ? AVTP_HDR_LEN
                                                                : AOE_HDR_LEN;
     const double nominal_spm = (double)rate_hz / 1000.0 / MICROFRAMES_PER_MS;
-    const int max_samples_per_packet = (int)(nominal_spm + 0.5) + 4;
-    const size_t max_payload = (size_t)max_samples_per_packet * channels * bytes_per_sample;
-    const size_t max_frame = sizeof(struct ether_header) + proto_hdr_len + max_payload;
-    if (max_payload + proto_hdr_len > ETH_MTU_PAYLOAD) {
+    const int max_samples_per_microframe = (int)(nominal_spm + 0.5) + 4;
+    const size_t max_microframe_payload =
+        (size_t)max_samples_per_microframe * channels * bytes_per_sample;
+
+    /* Per-fragment upper bound on payload_count: clamped by the u8 field
+     * and by the worst-case per-fragment MTU budget. Fragmentation is an
+     * AOE-only path, so we compute this for L2/IP only. */
+    int max_frag_pc = 0;
+    if (transport != TRANSPORT_AVTP) {
+        const size_t per_ch_unit = (size_t)channels * bytes_per_sample;
+        if (per_ch_unit == 0) {
+            fprintf(stderr, "talker: invalid per-channel unit\n");
+            return 2;
+        }
+        size_t mtu_budget_pc =
+            (ETH_MTU_PAYLOAD - proto_hdr_len) / per_ch_unit;
+        if (mtu_budget_pc > 255) mtu_budget_pc = 255;
+        if (mtu_budget_pc < 1) {
+            fprintf(stderr,
+                    "talker: ch=%d bps=%d — a single sample/byte per channel "
+                    "does not fit the 1500 B MTU (payload unit %zu B).\n",
+                    channels, bytes_per_sample, per_ch_unit);
+            return 2;
+        }
+        max_frag_pc = (int)mtu_budget_pc;
+    }
+
+    /* Startup MTU check. AVTP always rejects overflow; AOE only rejects the
+     * pathological "one sample doesn't fit" case handled above. */
+    if (transport == TRANSPORT_AVTP &&
+        max_microframe_payload + proto_hdr_len > ETH_MTU_PAYLOAD) {
         fprintf(stderr,
-                "talker: ch=%d rate=%d needs %zu-byte frames — exceeds 1500-byte MTU.\n"
-                "  (Packet splitting for very-high-rate multichannel is deferred; try\n"
-                "  fewer channels or a lower rate. Worst-case payload = %zu B.)\n",
-                channels, rate_hz, max_frame, max_payload);
+                "talker: ch=%d rate=%d under AVTP AAF needs %zu-byte payload "
+                "— exceeds 1500-byte MTU.\n"
+                "  AAF does not support per-microframe fragmentation (would "
+                "break Milan interop). Try --transport l2 or --transport ip, "
+                "or reduce channels / rate.\n",
+                channels, rate_hz,
+                max_microframe_payload + proto_hdr_len);
         return 2;
     }
+
+    /* Per-frame buffer sizing:
+     *   - `frame` holds one transmission unit = Ethernet header + proto
+     *     header + one fragment's payload (for AOE) or one full microframe
+     *     (for AVTP).
+     *   - `audio_buf` holds one full microframe's audio bytes, read from
+     *     the source in one `read()` call and then sliced into fragments.
+     *     AVTP reads into this too and copies once into `frame`. */
+    const size_t max_frag_payload =
+        (transport == TRANSPORT_AVTP)
+            ? max_microframe_payload
+            : ((size_t)max_frag_pc * channels * bytes_per_sample);
+    const size_t max_frame = sizeof(struct ether_header) + proto_hdr_len + max_frag_payload;
 
     /* AVTP AAF only carries integer PCM rates from the standard nsr table.
      * Reject AOE rates that don't have an AAF code. */
@@ -460,7 +514,7 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "talker: DSF file is ch=%d rate=%d (DSD bytes/s/ch); "
                     "talker configured ch=%d rate=%d. They must match — "
-                    "use --format dsd64|dsd128|dsd256 matching the file, "
+                    "use --format dsd64|dsd128|dsd256|dsd512|dsd1024|dsd2048 matching the file, "
                     "and --channels to match.\n",
                     src->channels, src->rate, channels, rate_hz);
             src->close(src);
@@ -636,7 +690,11 @@ int main(int argc, char **argv)
     }
 
     uint8_t *frame = calloc(1, max_frame);
-    if (!frame) return 1;
+    uint8_t *audio_buf = calloc(1, max_microframe_payload);
+    if (!frame || !audio_buf) {
+        fprintf(stderr, "talker: out of memory allocating frame/audio buffers\n");
+        return 1;
+    }
 
     /* L2 / AVTP have an Ethernet header prefix; IP mode does not. */
     if (transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) {
@@ -667,17 +725,29 @@ int main(int argc, char **argv)
         | (uint64_t)STREAM_ID;
     uint8_t avtp_seq8 = 0;
 
+    /* Predicted fragment count for the nominal microframe. K=1 is the
+     * common case; larger values report the split that will be applied
+     * to DSD512+ and high-rate multichannel PCM. AVTP reports "no-frag". */
+    int nominal_K = 1;
+    if (transport != TRANSPORT_AVTP && max_frag_pc > 0) {
+        int nominal_pc = (int)(nominal_spm + 0.5);
+        if (nominal_pc < 1) nominal_pc = 1;
+        nominal_K = (nominal_pc + max_frag_pc - 1) / max_frag_pc;
+    }
+
     if (transport == TRANSPORT_L2 || transport == TRANSPORT_AVTP) {
         const char *label = (transport == TRANSPORT_AVTP) ? "avtp" : "l2";
         fprintf(stderr,
                 "talker: transport=%s iface=%s ifindex=%d\n"
                 "        src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x\n"
-                "        fmt=%s ch=%d rate=%d pps=8000 nominal_spp=%.2f max_spp=%d max_frame=%zuB feedback=on\n",
+                "        fmt=%s ch=%d rate=%d pps=8000 nominal_spp=%.2f max_frag_pc=%d frags/microframe=%d max_frame=%zuB feedback=on\n",
                 label, iface, ifindex,
                 src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
                 dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3], dest_mac[4], dest_mac[5],
                 transport == TRANSPORT_AVTP ? "AAF_INT24(BE)" : format_s,
-                channels, rate_hz, nominal_spm, max_samples_per_packet, max_frame);
+                channels, rate_hz, nominal_spm,
+                transport == TRANSPORT_AVTP ? 0 : max_frag_pc,
+                nominal_K, max_frame);
     } else {
         char ip_str[INET6_ADDRSTRLEN] = {0};
         if (dest_family == AF_INET) {
@@ -692,13 +762,13 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "talker: transport=ip dest=%s:%d family=%s %s\n"
                 "        iface=%s ifindex=%d\n"
-                "        fmt=%s ch=%d rate=%d pps=8000 nominal_spp=%.2f max_spp=%d max_payload=%zuB feedback=on\n",
+                "        fmt=%s ch=%d rate=%d pps=8000 nominal_spp=%.2f max_frag_pc=%d frags/microframe=%d max_payload=%zuB feedback=on\n",
                 ip_str, udp_port,
                 dest_family == AF_INET ? "v4" : "v6",
                 dest_is_multicast ? "multicast" : "unicast",
                 iface, ifindex,
                 format_s, channels, rate_hz,
-                nominal_spm, max_samples_per_packet,
+                nominal_spm, max_frag_pc, nominal_K,
                 max_frame - sizeof(struct ether_header));
     }
 
@@ -857,73 +927,124 @@ int main(int argc, char **argv)
         }
         if (ticks > 1) late_wakeups++;
 
-        /* 4. Emit `ticks` packets. Each packet's payload_count is the
-         *    integer part of the accumulator; residual carries forward. */
+        /* 4. Emit `ticks` microframes. Each microframe carries `pc`
+         *    bytes-or-samples per channel. In the common case a microframe
+         *    becomes one packet; DSD512+ and high-rate multichannel PCM are
+         *    split into K back-to-back fragments with consecutive sequence
+         *    numbers and last-in-group set only on fragment K-1. AVTP paths
+         *    never fragment (single packet per microframe). */
         for (uint64_t i = 0; i < ticks && !g_stop; i++) {
             sample_accum += samples_per_microframe;
             int pc = (int)sample_accum;
             if (pc < 1) pc = 1;
-            if (pc > max_samples_per_packet) pc = max_samples_per_packet;
+            if (pc > max_samples_per_microframe) pc = max_samples_per_microframe;
             sample_accum -= pc;
 
-            if (src->read(src, payload, (size_t)pc) < 0) {
+            /* Read one microframe of audio into the standalone audio_buf.
+             * The source writes `pc` samples/bytes per channel, interleaved
+             * per AOE wire format (sample-interleaved for PCM, byte-
+             * interleaved for DSD). Slices of this buffer become valid
+             * per-fragment payloads with a simple byte-range split, because
+             * the first N units per channel are always the first
+             * N × channels × bytes_per_sample bytes of the buffer. */
+            if (src->read(src, audio_buf, (size_t)pc) < 0) {
                 g_stop = 1;
                 break;
             }
 
-            const size_t payload_bytes =
-                (size_t)pc * channels * bytes_per_sample;
-            size_t frame_len_total =
-                sizeof(struct ether_header) + proto_hdr_len + payload_bytes;
-
+            /* Fragment count and per-fragment pc distribution. AVTP is
+             * always K=1; AOE uses max_frag_pc computed at startup. */
+            int K;
+            int base, rem;
             if (transport == TRANSPORT_AVTP) {
-                /* AAF carries 24-bit samples big-endian; ALSA gives us LE.
-                 * Swap in place before transmit. */
-                avtp_swap24_inplace(payload,
-                                    (size_t)pc * (size_t)channels);
-                avtp_aaf_hdr_build(avtp_hdr_p,
-                                   avtp_stream_id,
-                                   avtp_seq8++,
-                                   0,                    /* avtp_timestamp (no PTP yet) */
-                                   AAF_FORMAT_INT24,
-                                   avtp_nsr_code,
-                                   (uint16_t)channels,
-                                   24,                   /* bit_depth */
-                                   (uint16_t)payload_bytes);
+                K = 1;
+                base = pc;
+                rem  = 0;
             } else {
-                aoe_hdr_build(aoe_hdr_p, STREAM_ID, seq, 0,
-                              (uint8_t)channels, format_code, (uint8_t)pc,
-                              AOE_FLAG_LAST_IN_GROUP);
+                K = (pc + max_frag_pc - 1) / max_frag_pc;
+                if (K < 1) K = 1;
+                base = pc / K;
+                rem  = pc % K;   /* first `rem` fragments get base+1 */
             }
 
-            /* If Hive has bound us via ACMP CONNECT_TX, override the CLI
-             * --dest-mac on egress. AVDECC is L2-only; the IP path keeps
-             * its static --dest-ip. */
+            /* If AVDECC bound us this tick, steer the destination for all
+             * fragments of this microframe together. Taking the snapshot
+             * once per microframe (not per fragment) keeps a group's
+             * fragments on the same peer even if an unbind races a send. */
+            int steer_avdecc = 0;
+            uint8_t avdecc_mac_snap[6];
             if (transport != TRANSPORT_IP) {
                 pthread_mutex_lock(&g_avdecc_mu);
                 if (g_avdecc_dest_valid) {
-                    struct ether_header *eth = (struct ether_header *)frame;
-                    memcpy(eth->ether_dhost, g_avdecc_dest_mac, 6);
-                    memcpy(data_to_ll.sll_addr, g_avdecc_dest_mac, 6);
+                    memcpy(avdecc_mac_snap, g_avdecc_dest_mac, 6);
+                    steer_avdecc = 1;
                 }
                 pthread_mutex_unlock(&g_avdecc_mu);
+                if (steer_avdecc) {
+                    struct ether_header *eth = (struct ether_header *)frame;
+                    memcpy(eth->ether_dhost, avdecc_mac_snap, 6);
+                    memcpy(data_to_ll.sll_addr, avdecc_mac_snap, 6);
+                }
             }
 
-            ssize_t sent;
-            if (transport == TRANSPORT_IP) {
-                sent = sendto(data_sock, frame + tx_offset, frame_len_total - tx_offset, 0,
-                              (struct sockaddr *)&dest_ss, dest_ss_len);
-            } else {
-                sent = sendto(data_sock, frame, frame_len_total, 0,
-                              (struct sockaddr *)&data_to_ll, sizeof(data_to_ll));
+            int off_units = 0;
+            int abort_microframe = 0;
+            for (int k = 0; k < K && !g_stop; k++) {
+                const int frag_pc = base + (k < rem ? 1 : 0);
+                const size_t frag_payload_bytes =
+                    (size_t)frag_pc * channels * bytes_per_sample;
+                const size_t audio_offset =
+                    (size_t)off_units * channels * bytes_per_sample;
+
+                /* Copy this fragment's audio slice into the frame payload
+                 * area. For AVTP K=1 so this copies the whole microframe. */
+                memcpy(payload, audio_buf + audio_offset, frag_payload_bytes);
+
+                if (transport == TRANSPORT_AVTP) {
+                    /* AAF samples are big-endian on the wire; ALSA is LE.
+                     * Swap in place after the memcpy above. */
+                    avtp_swap24_inplace(payload,
+                                        (size_t)frag_pc * (size_t)channels);
+                    avtp_aaf_hdr_build(avtp_hdr_p,
+                                       avtp_stream_id,
+                                       avtp_seq8++,
+                                       0,                    /* avtp_timestamp (no PTP yet) */
+                                       AAF_FORMAT_INT24,
+                                       avtp_nsr_code,
+                                       (uint16_t)channels,
+                                       24,                   /* bit_depth */
+                                       (uint16_t)frag_payload_bytes);
+                } else {
+                    const uint8_t flags =
+                        (k == K - 1) ? AOE_FLAG_LAST_IN_GROUP : 0;
+                    aoe_hdr_build(aoe_hdr_p, STREAM_ID, seq, 0,
+                                  (uint8_t)channels, format_code,
+                                  (uint8_t)frag_pc, flags);
+                }
+
+                const size_t frame_len_total =
+                    sizeof(struct ether_header) + proto_hdr_len + frag_payload_bytes;
+
+                ssize_t sent;
+                if (transport == TRANSPORT_IP) {
+                    sent = sendto(data_sock, frame + tx_offset,
+                                  frame_len_total - tx_offset, 0,
+                                  (struct sockaddr *)&dest_ss, dest_ss_len);
+                } else {
+                    sent = sendto(data_sock, frame, frame_len_total, 0,
+                                  (struct sockaddr *)&data_to_ll,
+                                  sizeof(data_to_ll));
+                }
+                if (sent < 0) {
+                    if (errno == EINTR) { abort_microframe = 1; break; }
+                    perror("sendto");
+                    g_stop = 1;
+                    break;
+                }
+                seq++;
+                off_units += frag_pc;
             }
-            if (sent < 0) {
-                if (errno == EINTR) break;
-                perror("sendto");
-                g_stop = 1;
-                break;
-            }
-            seq++;
+            if (abort_microframe) break;
         }
     }
 
@@ -937,6 +1058,7 @@ int main(int argc, char **argv)
     if (fb_sock != data_sock) close(fb_sock);
     close(data_sock);
     free(frame);
+    free(audio_buf);
     aoether_avdecc_close(avdecc);
     return 0;
 }
