@@ -46,6 +46,8 @@
 #include <la/avdecc/internals/entityEnums.hpp>
 #include <la/avdecc/internals/entityModelTree.hpp>
 #include <la/avdecc/internals/entityModelTypes.hpp>
+#include <la/avdecc/internals/protocolAcmpdu.hpp>
+#include <la/avdecc/internals/protocolDefines.hpp>
 #include <la/avdecc/internals/protocolInterface.hpp>
 #include <la/avdecc/internals/uniqueIdentifier.hpp>
 
@@ -96,6 +98,36 @@ static void setFixedString(model::AvdeccFixedString &dst, const std::string &s)
     dst = model::AvdeccFixedString{ s };
 }
 
+struct AoetherEntity;
+
+/* Observer on the ProtocolInterface that watches ACMP traffic and fires
+ * on_bind / on_unbind when our entity becomes the target of a Connect or
+ * Disconnect command.  Runs on la_avdecc's executor thread — callbacks
+ * invoked here must be reentrancy-safe relative to the C main loops
+ * that consume them.  The C-side wrappers in receiver.c / talker.c use
+ * a small mutex-guarded struct for exactly that. */
+class AcmpObserver final : public ProtocolInterface::Observer {
+public:
+    AcmpObserver(AoetherEntity *parent, aoether_avdecc_role role, UniqueIdentifier ourEID) noexcept
+        : _parent{ parent }, _role{ role }, _ourEID{ ourEID } {}
+
+    void onAcmpCommand(ProtocolInterface* const, la::avdecc::protocol::Acmpdu const &pdu) noexcept override
+    {
+        handle(pdu);
+    }
+    void onAcmpResponse(ProtocolInterface* const, la::avdecc::protocol::Acmpdu const &pdu) noexcept override
+    {
+        handle(pdu);
+    }
+
+private:
+    void handle(la::avdecc::protocol::Acmpdu const &pdu) noexcept;
+
+    AoetherEntity          *_parent;
+    aoether_avdecc_role     _role;
+    UniqueIdentifier        _ourEID;
+};
+
 struct AoetherEntity {
     aoether_avdecc_bind_cb   on_bind   { nullptr };
     aoether_avdecc_unbind_cb on_unbind { nullptr };
@@ -104,7 +136,66 @@ struct AoetherEntity {
     EndStation::UniquePointer endStation { nullptr, nullptr };
     AggregateEntity          *aggEntity  { nullptr }; // owned by endStation
     model::EntityTree         entityTree {};
+
+    std::unique_ptr<AcmpObserver> observer;
+    bool                          bound { false };
 };
+
+void AcmpObserver::handle(la::avdecc::protocol::Acmpdu const &pdu) noexcept
+{
+    using Msg = la::avdecc::protocol::AcmpMessageType;
+    const Msg msg = pdu.getMessageType();
+
+    /* Does this PDU pertain to us?  For listeners we watch RX-side
+     * messages whose listener_entity_id matches our EID; for talkers
+     * we watch TX-side messages whose talker_entity_id matches us. */
+    const UniqueIdentifier tgt = (_role == AOETHER_AVDECC_LISTENER)
+                                 ? pdu.getListenerEntityID()
+                                 : pdu.getTalkerEntityID();
+    if (tgt != _ourEID) return;
+
+    const bool isListenerConnect    = (_role == AOETHER_AVDECC_LISTENER) &&
+                                      (msg == Msg::ConnectRxResponse);
+    const bool isListenerDisconnect = (_role == AOETHER_AVDECC_LISTENER) &&
+                                      (msg == Msg::DisconnectRxResponse);
+    const bool isTalkerConnect      = (_role == AOETHER_AVDECC_TALKER) &&
+                                      (msg == Msg::ConnectTxCommand);
+    const bool isTalkerDisconnect   = (_role == AOETHER_AVDECC_TALKER) &&
+                                      (msg == Msg::DisconnectTxCommand);
+
+    if (isListenerConnect || isTalkerConnect) {
+        const auto mac = pdu.getStreamDestAddress();
+        std::uint64_t streamID = 0;
+        if (_role == AOETHER_AVDECC_LISTENER) {
+            /* Listener: identifying a specific talker by its EID +
+             * unique ID is more precise than the multicast MAC. For
+             * now we surface the dest MAC (what AOEther's listener
+             * actually filters on) and pack the talker's stream
+             * identifier into the 64-bit stream_id field. */
+            streamID = (static_cast<std::uint64_t>(pdu.getTalkerEntityID().getValue()) & 0xFFFFFFFFFFFFull) |
+                       (static_cast<std::uint64_t>(pdu.getTalkerUniqueID()) << 48);
+        } else {
+            streamID = (static_cast<std::uint64_t>(pdu.getListenerEntityID().getValue()) & 0xFFFFFFFFFFFFull) |
+                       (static_cast<std::uint64_t>(pdu.getListenerUniqueID()) << 48);
+        }
+
+        uint8_t peerMac[6];
+        std::memcpy(peerMac, mac.data(), 6);
+
+        std::fprintf(stderr,
+                     "avdecc: ACMP %s → bind peer=%02x:%02x:%02x:%02x:%02x:%02x stream_id=0x%016llx\n",
+                     isListenerConnect ? "CONNECT_RX_RESPONSE" : "CONNECT_TX_COMMAND",
+                     peerMac[0], peerMac[1], peerMac[2], peerMac[3], peerMac[4], peerMac[5],
+                     static_cast<unsigned long long>(streamID));
+
+        _parent->bound = true;
+        if (_parent->on_bind) _parent->on_bind(peerMac, streamID, _parent->user);
+    } else if ((isListenerDisconnect || isTalkerDisconnect) && _parent->bound) {
+        std::fprintf(stderr, "avdecc: ACMP DISCONNECT → unbind\n");
+        _parent->bound = false;
+        if (_parent->on_unbind) _parent->on_unbind(_parent->user);
+    }
+}
 
 /* Build a full EntityTree Hive can render + offer Connect on.
  *
@@ -356,9 +447,21 @@ extern "C" void *aoether_avdecc_cpp_open(const struct aoether_avdecc_config *cfg
         /* Not fatal — entity exists, just not advertising. */
     }
 
+    /* Register our ACMP observer on the ProtocolInterface so Hive's
+     * Connect / Disconnect actions reach the AOEther data path. */
+    if (auto *pi = e->endStation->getProtocolInterface()) {
+        e->observer = std::make_unique<AcmpObserver>(e, cfg->role, ci.entityID);
+        try {
+            pi->registerObserver(e->observer.get());
+        } catch (const std::exception &ex) {
+            std::fprintf(stderr, "avdecc: registerObserver failed: %s\n", ex.what());
+            e->observer.reset();
+        }
+    }
+
     std::fprintf(stderr,
                  "avdecc: entity up (role=%s name=\"%s\" iface=%s EID=0x%016llx)\n"
-                 "        [Phase B step 3 — stream visible in Hive; ACMP→data-path is step 4]\n",
+                 "        [Phase B step 4 — ACMP wired to data path]\n",
                  cfg->role == AOETHER_AVDECC_LISTENER ? "listener" : "talker",
                  name.c_str(),
                  cfg->iface,
@@ -370,6 +473,14 @@ extern "C" void aoether_avdecc_cpp_close(void *impl)
 {
     if (!impl) return;
     auto *e = static_cast<AoetherEntity *>(impl);
+    if (e->observer && e->endStation) {
+        if (auto *pi = e->endStation->getProtocolInterface()) {
+            try {
+                pi->unregisterObserver(e->observer.get());
+            } catch (...) { /* best-effort on shutdown */ }
+        }
+    }
+    e->observer.reset();
     if (e->aggEntity) {
         e->aggEntity->disableEntityAdvertising(std::nullopt);
         e->aggEntity = nullptr; /* owned by endStation */
