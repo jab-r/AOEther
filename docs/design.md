@@ -2,7 +2,7 @@
 
 **Status:** Draft v1.5 — M1–M4 merged to main; M5 (AVTP AAF) and M6 (native DSD64–DSD512) code complete on their feature branches
 **Audience:** Contributors, reviewers, early adopters
-**License:** Apache 2.0 (proposed)
+**License:** GNU GPL-3.0-or-later
 
 **Major revision from v0.3:** Architectural pivot to **Topology B (player mode)** as the primary receiver architecture. The receiver is the USB *host* driving a USB DAC, not the USB *gadget* presented to an upstream computer. This sidesteps the `f_uac2` patching problem entirely because Linux's `snd_usb_audio` already supports native DSD up to DSD1024 via per-DAC quirks. Topology A (gadget mode, for pro-AV / DAW integration) is deferred to a later-milestone "pro" track.
 
@@ -795,7 +795,7 @@ sudo ./build/receiver --iface eth0 --dac hw:CARD=Dragonfly,DEV=0
 
 **Why defer Topology A?** The audience that needs gadget mode (pro-AV, DAW integration) is served well by existing Milan-certified gear. The audience that doesn't have a good open-source option (audiophile DSD streaming to USB DACs, now including WiFi) is served by Topology B. Starting with the underserved audience builds a user base faster; Topology A can layer on when Topology B is solid.
 
-**Why Apache 2.0?** Pro AV vendors are commercial; GPL blocks their contributions. Patent grant matters for TSN-related patents.
+**Why GPL-3.0-or-later?** Earlier drafts of this document proposed Apache 2.0 with the argument that it would attract pro-AV vendor contributions that GPL would block. That calculus shifted once the Milan control-plane story anchored on `la_avdecc` (L-Acoustics' AVDECC reference implementation), which is itself LGPL-3 / GPL-3 dual-licensed — the AOEther receiver that speaks AVDECC links against la_avdecc, so AOEther being GPL-3 aligns cleanly with the ecosystem we're actually interoperating with instead of creating license friction at every Milan integration point. GPL-3's patent grant (Section 11) addresses the TSN-patent concern that originally motivated Apache's explicit grant, and "or-later" keeps the door open to GPL-4+ when it ships. The trade-off is accepted: downstream users who want to ship AOEther inside a closed-source product can't — they must upstream their changes or pick different software. That's the right direction for a project whose value-add is open clock-discipline and open wire-format; closed-source forks of the clock-discipline code would erode exactly the interop story the project exists to advance.
 
 **Why three hardware tiers?** Single-tier forces bad tradeoffs. RPi for cheap entry, Tier 2 for hardware PTP / Milan, MCU for embedded product form factor.
 

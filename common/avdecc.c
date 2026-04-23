@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* la_avdecc-backed AVDECC entity.  See avdecc.h for API contract.
  *
  * This file is the C entry point.  When AOETHER_HAVE_AVDECC is defined

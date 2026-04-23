@@ -115,7 +115,7 @@ The same talker and receiver binaries run under every recipe; only the source da
 
 ## License
 
-[Apache 2.0](LICENSE). Contributions welcome; see `CONTRIBUTING.md`.
+[GNU GPL-3.0-or-later](LICENSE). Contributions welcome; see `CONTRIBUTING.md`.
 
 ## Credits
 
