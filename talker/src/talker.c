@@ -400,6 +400,14 @@ static void usage(const char *prog)
         "  --file   PATH                WAV file for --source wav,\n"
         "                               DSF file for --source dsf\n"
         "  --capture hw:CARD=...        ALSA capture device, required with --source alsa\n"
+        "  --capture-buffer-ms MS       ALSA capture ring depth, 20..1000, default 100.\n"
+        "                               Bounds minimum time between hold-last-sample\n"
+        "                               fills under positive DAC drift. At 20 ppm / 48 kHz,\n"
+        "                               100 ms buys ~85 min per fill; 200 ms ~170 min;\n"
+        "                               500 ms ~7 h. Each fill is one held sample (~20 µs\n"
+        "                               plateau, not a click — inaudible on program material).\n"
+        "                               Raise for long continuous sessions; DLNA recipe\n"
+        "                               recommends 200.\n"
         "\n"
         "Stream format:\n"
         "  --format  FMT                pcm | dsd64 | dsd128 | dsd256\n"
@@ -414,9 +422,11 @@ static void usage(const char *prog)
         "\n"
         "PCM payload is s24le-3 (24-bit little-endian packed). Native DSD payload is\n"
         "raw DSD bits, MSB-first within each byte, interleaved by channel. Sources\n"
-        "must match channels, rate, and format exactly — AOEther never resamples.\n"
+        "must match channels, rate, and format exactly — AOEther performs no continuous\n"
+        "sample-rate conversion. (Upstream source underruns at the capture edge resolve\n"
+        "by hold-last-sample, expected at inaudible rates; see --capture-buffer-ms.)\n"
         "For music playback, point --capture at one half of a snd-aloop pair\n"
-        "and route Roon/UPnP/AirPlay/PipeWire at the other half; see\n"
+        "and route Roon/UPnP/AirPlay/PipeWire/DLNA at the other half; see\n"
         "docs/recipe-*.md.\n"
         "\n"
         "Discovery / control plane:\n"
@@ -451,6 +461,7 @@ int main(int argc, char **argv)
     int channels_per_stream = 8;   /* M10 Phase A: AES67 cap, first-fit split */
     struct rtp_stream_spec explicit_specs[MAX_RTP_SUBSTREAMS];
     int n_explicit_specs = 0;
+    int capture_buffer_ms = 100;   /* ALSA capture ring depth; bounds held-sample cadence. */
 
     static const struct option opts[] = {
         { "iface",     required_argument, 0, 'i' },
@@ -474,6 +485,7 @@ int main(int argc, char **argv)
         { "ptp-domain",    required_argument, 0, 1006 },
         { "channels-per-stream", required_argument, 0, 1007 },
         { "stream",    required_argument, 0, 1008 },
+        { "capture-buffer-ms", required_argument, 0, 1009 },
         { "help",      no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
@@ -538,6 +550,14 @@ int main(int argc, char **argv)
                 return 2;
             }
             n_explicit_specs++;
+            break;
+        case 1009:
+            capture_buffer_ms = atoi(optarg);
+            if (capture_buffer_ms < 20 || capture_buffer_ms > 1000) {
+                fprintf(stderr,
+                        "talker: --capture-buffer-ms must be 20..1000\n");
+                return 2;
+            }
             break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
@@ -978,7 +998,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "talker: --capture hw:... required with --source alsa\n");
             return 2;
         }
-        src = audio_source_alsa_open(capture_pcm, channels, rate_hz);
+        src = audio_source_alsa_open(capture_pcm, channels, rate_hz,
+                                     capture_buffer_ms * 1000);
     } else if (strcmp(source, "dsdsilence") == 0) {
         src = audio_source_dsd_silence_open(channels, rate_hz);
     } else if (strcmp(source, "dsf") == 0) {
@@ -1994,10 +2015,17 @@ skip_feedback:
         }
     }
 
+    uint64_t held_frames = 0, held_events = 0;
+    if (src && src->get_stats) {
+        src->get_stats(src, &held_frames, &held_events);
+    }
     fprintf(stderr,
-            "talker: shutting down; sent=%u late_wakeups=%llu fb_rx=%llu fb_ignored=%llu\n",
+            "talker: shutting down; sent=%u late_wakeups=%llu fb_rx=%llu "
+            "fb_ignored=%llu held_fill_frames=%llu held_fill_events=%llu\n",
             seq, (unsigned long long)late_wakeups,
-            (unsigned long long)fb_rx, (unsigned long long)fb_ignored);
+            (unsigned long long)fb_rx, (unsigned long long)fb_ignored,
+            (unsigned long long)held_frames,
+            (unsigned long long)held_events);
 
     /* SAP: one deletion packet so controllers drop the session promptly
      * rather than waiting out the session timeout (~minutes). Best-effort. */

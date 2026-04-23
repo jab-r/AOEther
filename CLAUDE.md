@@ -57,7 +57,7 @@ This is **Mode C** and is the baseline operating mode from M1 onward. **Mode A**
 
 Non-negotiable data-path rules (from `design.md` Goals / Non-goals):
 
-- No sample-rate conversion, ever. If talker and DAC disagree on format, fail stream setup cleanly.
+- No continuous sample-rate conversion. No running-rate resampler anywhere in the audio data path. If talker and DAC disagree on format, fail stream setup cleanly. The one bounded exception: hold-last-sample tail-repeat at the talker's ALSA capture edge, invoked only when a rate-fixed upstream source (gmrender, MPD-file) cannot follow a positive-drift DAC. See `design.md` §"Clock architecture" §"What happens when the upstream source can't rate-match."
 - No per-sample DSP, no mixing, no effects in the receiver.
 - Jitter buffer on the receiver; underrun substitutes silence, never blocks.
 - The talker's `timerfd` **never retunes** under Mode C — drift is absorbed by per-packet payload size, not timer period. If you find yourself wanting to adjust the timer by ppm increments, you're solving the wrong problem.

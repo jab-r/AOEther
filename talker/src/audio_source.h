@@ -2,6 +2,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 struct audio_source {
     int (*read)(struct audio_source *src, void *buf, size_t frames);
@@ -10,11 +11,26 @@ struct audio_source {
     int rate;
     int bytes_per_sample;
     void *opaque;
+    /* Optional: report capture-edge "held-last-sample" statistics. Implemented
+     * by sources that can underrun against a DAC-driven consumption rate
+     * (e.g. ALSA capture from snd-aloop) — NULL for file / test-tone / DSF
+     * sources where there is no upstream-vs-consumer rate mismatch to
+     * absorb. See design.md §"Clock architecture" for how this relates to
+     * extending UAC2 async feedback across Ethernet. */
+    void (*get_stats)(struct audio_source *src,
+                      uint64_t *held_frames_out,
+                      uint64_t *held_events_out);
 };
 
 struct audio_source *audio_source_test_open(int channels, int rate, int bytes_per_sample);
 struct audio_source *audio_source_wav_open(const char *path);
-struct audio_source *audio_source_alsa_open(const char *pcm_name, int channels, int rate);
+/* ALSA capture with a caller-specified ring-buffer depth. `buffer_us` bounds
+ * the minimum time between hold-last-sample fills under positive DAC drift:
+ * at 20 ppm and 48 kHz, 100 ms buys ~85 minutes per fill, 200 ms buys ~170
+ * minutes, 500 ms buys ~7 hours. Each fill is one held sample (~20 µs) which
+ * is inaudible on program material — not a transient, just a brief plateau. */
+struct audio_source *audio_source_alsa_open(const char *pcm_name, int channels,
+                                            int rate, int buffer_us);
 
 /* DSD silence source (M6). `dsd_byte_rate` is bits/sec/channel ÷ 8; for
  * DSD64 it's 352800, for DSD256 it's 1411200. `read()` returns the idle
