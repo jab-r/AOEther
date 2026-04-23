@@ -78,4 +78,4 @@ Be kind. Assume good faith. Disagreements about technical direction are fine and
 
 ## License
 
-By contributing you agree your contributions are licensed under the project's [Apache 2.0 License](LICENSE).
+By contributing you agree your contributions are licensed under the project's [GNU GPL-3.0-or-later License](LICENSE). Source files carry an `SPDX-License-Identifier: GPL-3.0-or-later` header; keep that header in any file you add.

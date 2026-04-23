@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
 
 /* Small wrapper around Avahi client for publishing one mDNS-SD service.

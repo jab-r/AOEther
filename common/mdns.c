@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Avahi-backed mDNS-SD publisher. See mdns.h for API contract.
  *
  * Build with `-DAOETHER_HAVE_AVAHI` and `-lavahi-client -lavahi-common` to

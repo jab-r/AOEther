@@ -6,7 +6,7 @@ Target: you have a UPnP controller app and a UPnP media server (or just a contro
 
 **Clock adaptation**: gmrender-resurrect is a naïve ALSA writer — it doesn't track sink rate and runs at nominal. Under Mode C's DAC-disciplined sink rate, expect the kernel loopback to push back on gmrender occasionally (< 1 event per hour at typical 20 ppm crystal spreads), which gmrender handles as a transient xrun and recovers from. Audible as a very occasional soft tick; fine for casual listening. If you're an audiophile who can't tolerate even that, use the Roon recipe instead — RoonBridge is adaptive.
 
-**License note**: gmrender-resurrect is GPL2-licensed; you install it separately via apt. AOEther itself stays Apache 2.0.
+**License note**: gmrender-resurrect is GPL-2-licensed and a separate runtime dependency installed via apt. AOEther itself is GPL-3-or-later — the two processes only exchange audio samples over an ALSA loopback, so there's no linking relationship that would constrain either side.
 
 ## One-time setup (talker box)
 

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
 
 /* IEEE 1722-2016 AVTP transport for AOEther (Mode 2, Milan interop).
