@@ -4,7 +4,7 @@ UPnP MediaRenderer is the open-standard protocol used by controllers like Bubble
 
 Target: you have a UPnP controller app and a UPnP media server (or just a controller that can push URLs), and you want the rendered output to play through AOEther to a remote USB DAC.
 
-**Clock adaptation**: gmrender-resurrect is a naïve ALSA writer — it doesn't track sink rate and runs at nominal. Under Mode C's DAC-disciplined sink rate, expect the kernel loopback to push back on gmrender occasionally (< 1 event per hour at typical 20 ppm crystal spreads), which gmrender handles as a transient xrun and recovers from. Audible as a very occasional soft tick; fine for casual listening. If you're an audiophile who can't tolerate even that, use the Roon recipe instead — RoonBridge is adaptive.
+**Clock adaptation**: gmrender-resurrect writes at nominal rate, so it does not participate in Mode C's rate-match directly. The talker's ALSA capture edge absorbs the residual source-vs-DAC drift via hold-last-sample tail-repeat: when the capture ring runs dry, the last-read frame is repeated into the gap. At typical 20 ppm DAC drift this settles at roughly one repeated sample per second — ~20 µs plateaus, never a transient, inaudible on program material. The capture ring depth is set by `--capture-buffer-ms` on the talker (default 100 ms). For DLNA / UPnP use we recommend **`--capture-buffer-ms 200`**, which buys ~170 minutes between hold events during transient drift and makes the steady-state artifact rate indistinguishable from bit-exact. See `docs/design.md` §"Clock architecture" for the full framing.
 
 **License note**: gmrender-resurrect is GPL-2-licensed and a separate runtime dependency installed via apt. AOEther itself is GPL-3-or-later — the two processes only exchange audio samples over an ALSA loopback, so there's no linking relationship that would constrain either side.
 
@@ -63,7 +63,8 @@ sudo ./talker/build/talker \
     --iface eno1 \
     --dest-mac <pi-mac> \
     --source alsa \
-    --capture hw:Loopback,1,0
+    --capture hw:Loopback,1,0 \
+    --capture-buffer-ms 200
 
 # On the Pi
 sudo ./receiver/build/receiver \
