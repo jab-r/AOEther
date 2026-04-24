@@ -175,10 +175,46 @@ static void alsa_close(struct audio_source *src)
     free(src);
 }
 
-struct audio_source *audio_source_alsa_open(const char *pcm_name, int channels,
+/* Map our capture-format string to the ALSA format and channel-byte count.
+ * The format strings match the receiver's --alsa-format vocabulary so the
+ * loopback-side and DAC-side configurations read identically. */
+struct capture_variant {
+    const char       *name;
+    snd_pcm_format_t  alsa_format;
+    int               bytes_per_sample;
+};
+
+static int resolve_capture_format(const char *s, struct capture_variant *v)
+{
+    if (!s) return -1;
+    static const struct capture_variant table[] = {
+        { "pcm_s24_3le", SND_PCM_FORMAT_S24_3LE, 3 },
+        { "dsd_u8",      SND_PCM_FORMAT_DSD_U8,  1 },
+    };
+    for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); i++) {
+        if (strcmp(s, table[i].name) == 0) {
+            *v = table[i];
+            return 0;
+        }
+    }
+    return -1;
+}
+
+struct audio_source *audio_source_alsa_open(const char *pcm_name,
+                                            const char *capture_format,
+                                            int channels,
                                             int rate, int buffer_us)
 {
     if (buffer_us <= 0) buffer_us = 100000;   /* 100 ms default */
+
+    struct capture_variant cv;
+    if (resolve_capture_format(capture_format, &cv) < 0) {
+        fprintf(stderr,
+                "alsa capture: --capture-format %s unsupported "
+                "(want pcm_s24_3le or dsd_u8)\n",
+                capture_format ? capture_format : "(null)");
+        return NULL;
+    }
 
     snd_pcm_t *pcm = NULL;
     int err = snd_pcm_open(&pcm, pcm_name, SND_PCM_STREAM_CAPTURE,
@@ -190,7 +226,7 @@ struct audio_source *audio_source_alsa_open(const char *pcm_name, int channels,
     }
 
     err = snd_pcm_set_params(pcm,
-                             SND_PCM_FORMAT_S24_3LE,
+                             cv.alsa_format,
                              SND_PCM_ACCESS_RW_INTERLEAVED,
                              (unsigned int)channels,
                              (unsigned int)rate,
@@ -198,9 +234,9 @@ struct audio_source *audio_source_alsa_open(const char *pcm_name, int channels,
                              (unsigned int)buffer_us);
     if (err < 0) {
         fprintf(stderr,
-                "alsa capture: set_params on %s (S24_3LE ch=%d rate=%d): %s\n"
+                "alsa capture: set_params on %s (%s ch=%d rate=%d): %s\n"
                 "  (AOEther locks this format; configure your source daemon to match.)\n",
-                pcm_name, channels, rate, snd_strerror(err));
+                pcm_name, cv.name, channels, rate, snd_strerror(err));
         snd_pcm_close(pcm);
         return NULL;
     }
@@ -221,7 +257,7 @@ struct audio_source *audio_source_alsa_open(const char *pcm_name, int channels,
 
     struct audio_source *src = calloc(1, sizeof(*src));
     struct alsa_state *st = calloc(1, sizeof(*st));
-    uint8_t *last = calloc(1, (size_t)channels * 3);
+    uint8_t *last = calloc(1, (size_t)channels * (size_t)cv.bytes_per_sample);
     if (!src || !st || !last) {
         free(src);
         free(st);
@@ -231,7 +267,7 @@ struct audio_source *audio_source_alsa_open(const char *pcm_name, int channels,
     }
     st->pcm = pcm;
     st->channels = channels;
-    st->bytes_per_sample = 3;
+    st->bytes_per_sample = cv.bytes_per_sample;
     st->last_sample = last;
     st->have_last_sample = 0;
     st->held_frames = 0;
@@ -242,7 +278,7 @@ struct audio_source *audio_source_alsa_open(const char *pcm_name, int channels,
     src->get_stats = alsa_get_stats;
     src->channels = channels;
     src->rate = rate;
-    src->bytes_per_sample = 3;
+    src->bytes_per_sample = cv.bytes_per_sample;
     src->opaque = st;
 
     /* Report the actually-granted buffer depth — ALSA / the kernel may
@@ -250,10 +286,10 @@ struct audio_source *audio_source_alsa_open(const char *pcm_name, int channels,
     snd_pcm_uframes_t got_buf = 0, got_period = 0;
     snd_pcm_get_params(pcm, &got_buf, &got_period);
     fprintf(stderr,
-            "alsa capture: %s opened (S24_3LE ch=%d rate=%d "
+            "alsa capture: %s opened (%s ch=%d rate=%d "
             "buffer=%u frames (%u us requested, %u us granted) "
             "period=%u frames)\n",
-            pcm_name, channels, rate,
+            pcm_name, cv.name, channels, rate,
             (unsigned)got_buf,
             (unsigned)buffer_us,
             rate > 0 ? (unsigned)((uint64_t)got_buf * 1000000ULL / (uint64_t)rate) : 0u,

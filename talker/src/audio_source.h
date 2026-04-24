@@ -28,8 +28,21 @@ struct audio_source *audio_source_wav_open(const char *path);
  * the minimum time between hold-last-sample fills under positive DAC drift:
  * at 20 ppm and 48 kHz, 100 ms buys ~85 minutes per fill, 200 ms buys ~170
  * minutes, 500 ms buys ~7 hours. Each fill is one held sample (~20 µs) which
- * is inaudible on program material — not a transient, just a brief plateau. */
-struct audio_source *audio_source_alsa_open(const char *pcm_name, int channels,
+ * is inaudible on program material — not a transient, just a brief plateau.
+ *
+ * `capture_format` selects the ALSA hardware format opened on the capture
+ * device, matching whatever the upstream renderer (snd-aloop's other half)
+ * is writing. Supported values:
+ *   "pcm_s24_3le" — 3 bytes/channel, AOE PCM wire-format compatible.
+ *   "dsd_u8"      — 1 byte/channel, AOE native-DSD wire-format compatible
+ *                   (1:1 byte passthrough, no per-byte reordering).
+ * DSD wider variants (dsd_u16_le, dsd_u16_be, dsd_u32_le, dsd_u32_be) are
+ * not yet supported on capture — for the snd-aloop bridge pattern the
+ * operator controls both sides of the loopback and can pin the renderer to
+ * dsd_u8. */
+struct audio_source *audio_source_alsa_open(const char *pcm_name,
+                                            const char *capture_format,
+                                            int channels,
                                             int rate, int buffer_us);
 
 /* DSD silence source (M6). `dsd_byte_rate` is bits/sec/channel ÷ 8; for
