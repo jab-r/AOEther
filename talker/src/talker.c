@@ -400,6 +400,11 @@ static void usage(const char *prog)
         "  --file   PATH                WAV file for --source wav,\n"
         "                               DSF / DFF file for --source dsf / dff\n"
         "  --capture hw:CARD=...        ALSA capture device, required with --source alsa\n"
+        "  --capture-format FMT         pcm_s24_3le | dsd_u8 (default picks from --format:\n"
+        "                               pcm → pcm_s24_3le; dsd* → dsd_u8). Must match the\n"
+        "                               format opened by the upstream renderer on the other\n"
+        "                               half of snd-aloop. For native-DSD UPnP via\n"
+        "                               upmpdcli + MPD, see docs/recipe-upnp.md.\n"
         "  --capture-buffer-ms MS       ALSA capture ring depth, 20..1000, default 100.\n"
         "                               Bounds minimum time between hold-last-sample\n"
         "                               fills under positive DAC drift. At 20 ppm / 48 kHz,\n"
@@ -445,6 +450,7 @@ int main(int argc, char **argv)
     const char *source = NULL;         /* default resolved below from --format */
     const char *wav_path = NULL;
     const char *capture_pcm = NULL;
+    const char *capture_format_s = NULL;   /* default resolved below from --format */
     const char *format_s = "pcm";
     int channels = DEFAULT_CHANNELS;
     int rate_hz = DEFAULT_RATE_HZ;
@@ -486,6 +492,7 @@ int main(int argc, char **argv)
         { "channels-per-stream", required_argument, 0, 1007 },
         { "stream",    required_argument, 0, 1008 },
         { "capture-buffer-ms", required_argument, 0, 1009 },
+        { "capture-format",    required_argument, 0, 1010 },
         { "help",      no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
@@ -559,6 +566,7 @@ int main(int argc, char **argv)
                 return 2;
             }
             break;
+        case 1010: capture_format_s = optarg; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -654,6 +662,37 @@ int main(int argc, char **argv)
         }
     } else {
         rate_hz = fmt.rate_override;
+    }
+
+    /* Default --capture-format from --format if the user didn't set it, and
+     * reject PCM-wire / DSD-capture (or vice-versa) mismatches. The two
+     * supported capture variants map 1:1 to the two wire-format families:
+     * pcm_s24_3le ↔ AOE PCM s24le-3, dsd_u8 ↔ AOE native DSD bytes. */
+    if (!capture_format_s) {
+        capture_format_s = fmt.is_dsd ? "dsd_u8" : "pcm_s24_3le";
+    }
+    {
+        const int cap_is_dsd = (strcmp(capture_format_s, "dsd_u8") == 0);
+        const int cap_is_pcm = (strcmp(capture_format_s, "pcm_s24_3le") == 0);
+        if (!cap_is_dsd && !cap_is_pcm) {
+            fprintf(stderr,
+                    "talker: --capture-format %s unsupported "
+                    "(want pcm_s24_3le or dsd_u8)\n",
+                    capture_format_s);
+            return 2;
+        }
+        if (fmt.is_dsd && !cap_is_dsd) {
+            fprintf(stderr,
+                    "talker: --format %s requires --capture-format dsd_u8\n",
+                    fmt.name);
+            return 2;
+        }
+        if (!fmt.is_dsd && !cap_is_pcm) {
+            fprintf(stderr,
+                    "talker: --format %s requires --capture-format pcm_s24_3le\n",
+                    fmt.name);
+            return 2;
+        }
     }
     if (transport == TRANSPORT_AVTP && fmt.is_dsd) {
         fprintf(stderr, "talker: AVTP AAF does not carry DSD; use --transport l2 or ip with --format dsd*\n");
@@ -1000,7 +1039,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "talker: --capture hw:... required with --source alsa\n");
             return 2;
         }
-        src = audio_source_alsa_open(capture_pcm, channels, rate_hz,
+        src = audio_source_alsa_open(capture_pcm, capture_format_s,
+                                     channels, rate_hz,
                                      capture_buffer_ms * 1000);
     } else if (strcmp(source, "dsdsilence") == 0) {
         src = audio_source_dsd_silence_open(channels, rate_hz);
