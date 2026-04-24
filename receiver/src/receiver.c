@@ -142,6 +142,100 @@ static int parse_alsa_variant(const char *s, struct alsa_variant *v)
     return -1;
 }
 
+/* PLC (packet-loss concealment) — see docs/design.md §"Packet-loss concealment".
+ * Envelope runs only during detected gaps / xruns; legitimate audio is touched
+ * only by the brief ramp-back-in scale on stream resume. PCM S24_3LE only;
+ * DSD gaps fall back to AOE_DSD_IDLE_BYTE fill. */
+#define PLC_MAX_GAP_MS       100   /* beyond this we let ALSA underrun */
+#define PLC_DEFAULT_HOLD_MS  1
+#define PLC_DEFAULT_RAMP_MS  5
+
+static inline int32_t pcm_s24_3le_load(const uint8_t *p)
+{
+    int32_t v = (int32_t)p[0] | ((int32_t)p[1] << 8) | ((int32_t)p[2] << 16);
+    if (v & 0x00800000) v |= (int32_t)0xFF000000;
+    return v;
+}
+
+static inline void pcm_s24_3le_store(uint8_t *p, int32_t v)
+{
+    p[0] = (uint8_t)(v        & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+}
+
+static void plc_synthesize_pcm_s24_3le(uint8_t *buf, int gap_frames, int channels,
+                                       const int32_t *last_sample,
+                                       int hold_frames, int ramp_frames)
+{
+    int f = 0;
+    const int stride = channels * 3;
+    int h_end = hold_frames < gap_frames ? hold_frames : gap_frames;
+    for (; f < h_end; f++) {
+        uint8_t *row = buf + f * stride;
+        for (int c = 0; c < channels; c++) {
+            pcm_s24_3le_store(row + c * 3, last_sample[c]);
+        }
+    }
+    int r_end = f + ramp_frames;
+    if (r_end > gap_frames) r_end = gap_frames;
+    for (int ri = 0; f < r_end; f++, ri++) {
+        /* Linear gain from (ramp_frames-1)/ramp_frames down to 0/ramp_frames. */
+        int32_t gnum = ramp_frames - 1 - ri;
+        uint8_t *row = buf + f * stride;
+        for (int c = 0; c < channels; c++) {
+            int64_t v = ((int64_t)last_sample[c] * gnum) / (int64_t)ramp_frames;
+            pcm_s24_3le_store(row + c * 3, (int32_t)v);
+        }
+    }
+    if (f < gap_frames) {
+        memset(buf + f * stride, 0, (size_t)(gap_frames - f) * stride);
+    }
+}
+
+static void plc_rampup_pcm_s24_3le_inplace(uint8_t *buf, int frames, int channels,
+                                           int ramp_total, int *ramp_remaining)
+{
+    int r = *ramp_remaining;
+    const int stride = channels * 3;
+    for (int f = 0; f < frames && r > 0; f++, r--) {
+        int32_t gnum = ramp_total - r;
+        uint8_t *row = buf + f * stride;
+        for (int c = 0; c < channels; c++) {
+            int32_t v = pcm_s24_3le_load(row + c * 3);
+            int64_t scaled = ((int64_t)v * gnum) / (int64_t)ramp_total;
+            pcm_s24_3le_store(row + c * 3, (int32_t)scaled);
+        }
+    }
+    *ramp_remaining = r;
+}
+
+static void plc_capture_last_s24_3le(const uint8_t *buf, int frames, int channels,
+                                     int32_t *last_sample)
+{
+    if (frames <= 0) return;
+    const uint8_t *row = buf + (size_t)(frames - 1) * channels * 3;
+    for (int c = 0; c < channels; c++) {
+        last_sample[c] = pcm_s24_3le_load(row + c * 3);
+    }
+}
+
+/* Parse --plc argument: "off" | "HOLD_MS,RAMP_MS". Returns 0 on success. */
+static int parse_plc_arg(const char *s, int *hold_ms, int *ramp_ms, int *enabled)
+{
+    if (!s) return -1;
+    if (strcmp(s, "off") == 0) { *enabled = 0; return 0; }
+    char *end = NULL;
+    long h = strtol(s, &end, 10);
+    if (!end || *end != ',' || h < 0 || h > PLC_MAX_GAP_MS) return -1;
+    long r = strtol(end + 1, &end, 10);
+    if (!end || *end != '\0' || r < 0 || r > PLC_MAX_GAP_MS) return -1;
+    *hold_ms = (int)h;
+    *ramp_ms = (int)r;
+    *enabled = 1;
+    return 0;
+}
+
 static volatile sig_atomic_t g_stop;
 
 /* AVDECC bind state. An AVDECC controller (Hive) issuing CONNECT_RX on
@@ -215,8 +309,15 @@ static void usage(const char *prog)
         "                       SDPs are applied as --transport rtp + --group / --port /\n"
         "                       --channels / --rate overrides. Bundled (multi-m=) SDPs\n"
         "                       are parsed and their substream layout is logged; full\n"
-        "                       multi-stream receive lands with Phase D hardware interop.\n",
-        prog, DEFAULT_UDP_PORT, DEFAULT_CHANNELS, DEFAULT_RATE_HZ, DEFAULT_LATENCY_US);
+        "                       multi-stream receive lands with Phase D hardware interop.\n"
+        "  --plc SPEC           packet-loss concealment envelope. SPEC is either\n"
+        "                       \"off\" or \"HOLD_MS,RAMP_MS\" (default %d,%d). Hold-last\n"
+        "                       for HOLD_MS, ramp to zero over RAMP_MS, zero for the\n"
+        "                       rest of the gap, ramp back in over RAMP_MS on resume.\n"
+        "                       PCM only; DSD gaps fill with the idle byte 0x69.\n"
+        "                       See docs/design.md §\"Packet-loss concealment\".\n",
+        prog, DEFAULT_UDP_PORT, DEFAULT_CHANNELS, DEFAULT_RATE_HZ, DEFAULT_LATENCY_US,
+        PLC_DEFAULT_HOLD_MS, PLC_DEFAULT_RAMP_MS);
 }
 
 static int64_t ts_diff_ns(struct timespec a, struct timespec b)
@@ -262,6 +363,9 @@ int main(int argc, char **argv)
     int list_sap = 0;
     int list_sap_secs = 5;
     const char *sdp_path = NULL;
+    int plc_enabled = 1;
+    int plc_hold_ms = PLC_DEFAULT_HOLD_MS;
+    int plc_ramp_ms = PLC_DEFAULT_RAMP_MS;
 
     static const struct option opts[] = {
         { "iface",       required_argument, 0, 'i' },
@@ -280,6 +384,7 @@ int main(int argc, char **argv)
         { "avdecc",      no_argument,       0, 'V' },
         { "list-sap",    optional_argument, 0, 1002 },
         { "sdp",         required_argument, 0, 1003 },
+        { "plc",         required_argument, 0, 1004 },
         { "help",        no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
@@ -312,6 +417,14 @@ int main(int argc, char **argv)
             if (list_sap_secs < 1) list_sap_secs = 1;
             break;
         case 1003: sdp_path = optarg; break;
+        case 1004:
+            if (parse_plc_arg(optarg, &plc_hold_ms, &plc_ramp_ms, &plc_enabled) < 0) {
+                fprintf(stderr,
+                        "receiver: --plc must be \"off\" or \"HOLD_MS,RAMP_MS\" "
+                        "(each 0..%d)\n", PLC_MAX_GAP_MS);
+                return 2;
+            }
+            break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -907,7 +1020,27 @@ int main(int argc, char **argv)
     uint8_t buf[RX_BUF_BYTES];
     uint32_t last_seq = 0;
     int have_seq = 0;
-    uint64_t rx = 0, dropped = 0, lost = 0, underruns = 0;
+    uint64_t rx = 0, dropped = 0, lost = 0, underruns = 0, plc_frames = 0;
+
+    /* PLC state. Frames computed from rate_hz; capped at PLC_MAX_GAP_MS. The
+     * synthesis buffer is sized for max-gap × channels × 3 (S24_3LE). DSD path
+     * doesn't use this buffer — it fills with AOE_DSD_IDLE_BYTE via memset
+     * into dsd_out directly. */
+    int plc_hold_frames = plc_enabled ? (plc_hold_ms * rate_hz + 999) / 1000 : 0;
+    int plc_ramp_frames = plc_enabled ? (plc_ramp_ms * rate_hz + 999) / 1000 : 0;
+    int plc_max_gap     = (PLC_MAX_GAP_MS * rate_hz + 999) / 1000;
+    int32_t last_pcm_sample[64] = {0};
+    int plc_rampup_remaining = 0;
+    size_t plc_buf_bytes = (size_t)plc_max_gap * (size_t)channels * 3;
+    uint8_t *plc_buf = NULL;
+    if (plc_enabled && !fmt.is_dsd && plc_buf_bytes > 0) {
+        plc_buf = (uint8_t *)malloc(plc_buf_bytes);
+        if (!plc_buf) {
+            fprintf(stderr, "receiver: PLC buffer alloc (%zu bytes) failed\n",
+                    plc_buf_bytes);
+            return 1;
+        }
+    }
 
     /* DSD repack scratch for the DSD_U16 / DSD_U32 paths. Worst case is
      * channels=64 × (n_bytes-1=3 leftover + max payload_count=255) = 16512
@@ -1070,19 +1203,21 @@ int main(int argc, char **argv)
                 payload_p = buf + hdr_off + AOE_HDR_LEN;
             }
 
+            int gap_packets = 0;
             if (have_seq) {
                 /* AVTP wraps every 256 packets, RTP every 65536, AOE every
                  * 2^32. Use a width-appropriate signed-difference compare. */
                 if (transport == TRANSPORT_AVTP) {
                     int8_t d8 = (int8_t)((uint8_t)seq - (uint8_t)last_seq);
-                    if (d8 > 1) lost += (uint64_t)(d8 - 1);
+                    if (d8 > 1) gap_packets = d8 - 1;
                 } else if (transport == TRANSPORT_RTP) {
                     int16_t d16 = (int16_t)((uint16_t)seq - (uint16_t)last_seq);
-                    if (d16 > 1) lost += (uint64_t)(d16 - 1);
+                    if (d16 > 1) gap_packets = d16 - 1;
                 } else {
                     int32_t delta = (int32_t)(seq - last_seq);
-                    if (delta > 1) lost += (uint64_t)(delta - 1);
+                    if (delta > 1) gap_packets = (int)(delta - 1);
                 }
+                lost += (uint64_t)gap_packets;
             }
             last_seq = seq;
             have_seq = 1;
@@ -1175,6 +1310,67 @@ int main(int argc, char **argv)
                 alsa_frames = (size_t)af;
             }
 
+            /* PLC synthesis for detected packet-loss gap. Runs before the
+             * real-packet write so synthesized frames precede live audio in
+             * the ALSA ring. PCM S24_3LE only; DSD just fills the idle byte
+             * in a local scratch (reuses dsd_out since DSD path doesn't PLC).
+             * See docs/design.md §"Packet-loss concealment". */
+            if (plc_enabled && gap_packets > 0 && alsa_frames > 0) {
+                int gap_frames = gap_packets * (int)alsa_frames;
+                if (gap_frames > plc_max_gap) gap_frames = plc_max_gap;
+
+                snd_pcm_sframes_t pw = 0;
+                if (!fmt.is_dsd && plc_buf) {
+                    plc_synthesize_pcm_s24_3le(plc_buf, gap_frames, channels,
+                                               last_pcm_sample,
+                                               plc_hold_frames, plc_ramp_frames);
+                    pw = snd_pcm_writei(pcm, plc_buf, (snd_pcm_uframes_t)gap_frames);
+                } else if (fmt.is_dsd) {
+                    /* DSD: idle pattern 0x69 for the gap; reuse dsd_out which
+                     * is sized to RX_BUF_BYTES. Cap gap_frames by its size. */
+                    size_t dsd_row = (size_t)channels * (size_t)av.n_bytes;
+                    size_t max_dsd_frames = sizeof(dsd_out) / (dsd_row ? dsd_row : 1);
+                    if ((size_t)gap_frames > max_dsd_frames)
+                        gap_frames = (int)max_dsd_frames;
+                    memset(dsd_out, AOE_DSD_IDLE_BYTE,
+                           (size_t)gap_frames * dsd_row);
+                    pw = snd_pcm_writei(pcm, dsd_out, (snd_pcm_uframes_t)gap_frames);
+                }
+
+                if (pw == -EPIPE) {
+                    underruns++;
+                    snd_pcm_prepare(pcm);
+                    rate_bootstrapped = 0;
+                    dsd_leftover_per_ch = 0;
+                    memset(last_pcm_sample, 0, sizeof(last_pcm_sample));
+                    plc_rampup_remaining = 0;
+                } else if (pw < 0) {
+                    int r = snd_pcm_recover(pcm, (int)pw, 1);
+                    if (r < 0) {
+                        fprintf(stderr, "snd_pcm_recover (plc): %s\n", snd_strerror(r));
+                        break;
+                    }
+                    rate_bootstrapped = 0;
+                    dsd_leftover_per_ch = 0;
+                    memset(last_pcm_sample, 0, sizeof(last_pcm_sample));
+                    plc_rampup_remaining = 0;
+                } else {
+                    plc_frames += (uint64_t)pw;
+                    frames_written_total += (uint64_t)pw;
+                    if (!fmt.is_dsd) plc_rampup_remaining = plc_ramp_frames;
+                }
+            }
+
+            /* Ramp real audio back in if we just emerged from a PLC gap. */
+            if (plc_enabled && plc_rampup_remaining > 0 &&
+                !fmt.is_dsd && alsa_frames > 0) {
+                /* alsa_p for PCM points into buf (recv scratch); safe to mutate. */
+                plc_rampup_pcm_s24_3le_inplace((uint8_t *)alsa_p,
+                                               (int)alsa_frames, channels,
+                                               plc_ramp_frames,
+                                               &plc_rampup_remaining);
+            }
+
             snd_pcm_sframes_t w = 0;
             if (alsa_frames > 0) {
                 w = snd_pcm_writei(pcm, alsa_p, alsa_frames);
@@ -1184,6 +1380,8 @@ int main(int argc, char **argv)
                 snd_pcm_prepare(pcm);
                 rate_bootstrapped = 0;
                 dsd_leftover_per_ch = 0;  /* drop pending on xrun */
+                memset(last_pcm_sample, 0, sizeof(last_pcm_sample));
+                plc_rampup_remaining = 0;
             } else if (w < 0) {
                 int r = snd_pcm_recover(pcm, (int)w, 1);
                 if (r < 0) {
@@ -1192,9 +1390,16 @@ int main(int argc, char **argv)
                 }
                 rate_bootstrapped = 0;
                 dsd_leftover_per_ch = 0;
+                memset(last_pcm_sample, 0, sizeof(last_pcm_sample));
+                plc_rampup_remaining = 0;
             } else {
                 rx++;
                 frames_written_total += (uint64_t)w;
+                /* Capture last-frame per-channel samples for future PLC hold. */
+                if (plc_enabled && !fmt.is_dsd && w > 0) {
+                    plc_capture_last_s24_3le(alsa_p, (int)w, channels,
+                                             last_pcm_sample);
+                }
             }
         }
 
@@ -1263,11 +1468,13 @@ check_feedback:
     }
 
     fprintf(stderr,
-            "receiver: shutting down; rx=%llu dropped=%llu lost=%llu underruns=%llu fb_sent=%llu\n",
+            "receiver: shutting down; rx=%llu dropped=%llu lost=%llu "
+            "underruns=%llu plc_frames=%llu fb_sent=%llu\n",
             (unsigned long long)rx,
             (unsigned long long)dropped,
             (unsigned long long)lost,
             (unsigned long long)underruns,
+            (unsigned long long)plc_frames,
             (unsigned long long)fb_sent);
 
     snd_pcm_drain(pcm);
@@ -1276,5 +1483,6 @@ check_feedback:
     close(data_sock);
     aoether_mdns_close(mdns);
     aoether_avdecc_close(avdecc);
+    free(plc_buf);
     return 0;
 }

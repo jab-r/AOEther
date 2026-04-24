@@ -321,7 +321,31 @@ The receiver's jitter buffer sits between the ENET RX path and the USB OUT path.
 - **Tier 1/2:** ALSA's PCM buffer. Write via `snd_pcm_writei`; ALSA + `snd_usb_audio` hand samples to the DAC on each USB SOF. Size tuned via `snd_pcm_set_params` latency argument.
 - **Tier 3:** Hand-written lock-free SPSC ring in MCU SRAM, slots mapped to USB transfer descriptors for zero-copy.
 
-Underruns substitute silence (rather than blocking). Overruns drop oldest slot. Both report to the control plane for monitoring but never block the data path.
+Overruns drop oldest slot. Packet loss and underruns are concealed by the PLC envelope described below. Both report to the control plane for monitoring but never block the data path.
+
+### Packet-loss concealment (PLC)
+
+The data path carries no retransmission — raw L2, UDP, AVTP, and RTP all lose packets silently — so the receiver must decide what to hand the DAC for the missing frames. The naive choices are both bad:
+
+- **Zero-fill.** Produces two discontinuities bracketing the gap (a cliff from the last real sample to 0 on entry, another from 0 to the first real sample on exit). Audible as clicks on any signal that wasn't already near a zero-crossing.
+- **Pure sample-and-hold.** Continuous on entry (one click moved to exit, net improvement), but a held peak-level sample sent through a DC-coupled amp to a tweeter for hundreds of milliseconds is a real risk if the stream never resumes.
+
+So the receiver runs a three-phase envelope that combines the strengths of both. It is deliberately **not DSP on the music** — the synthesis only runs during gaps that weren't in the music to begin with, and touches zero samples of legitimate audio except for the brief ramp-back-in scaling described below.
+
+1. **Hold-last** for up to `--plc-hold-ms` (default 1 ms at 48 kHz ≈ 48 frames). Per-channel, repeat the last successfully-written PCM sample. For gaps shorter than the hold window this is the entire synthesis — one discontinuity on exit, bounded by max signal excursion, same as zero-fill's single-side click.
+2. **Linear ramp to zero** over the next `--plc-ramp-ms` (default 5 ms). Multiplies the held sample by a linear gain that steps from 1.0 down to 0.0. Puts the exit discontinuity at a guaranteed-zero value and spreads it over a raised-level edge rather than a cliff.
+3. **Zero** for the rest of the gap. DC-coupled tweeter protection: no held non-zero value persists on a long outage.
+
+When real packets resume, the first `ramp-ms` of legitimate audio is **ramp-back-in scaled** — gain goes 0.0 → 1.0 over the ramp window, then identity. This is the one place the envelope touches real samples, and it's necessary because otherwise the exit-from-zero at packet resume would itself be a discontinuity. The envelope is multiplicative; no resampling, no filtering, no per-sample prediction.
+
+Policy knobs (`--plc hold_ms,ramp_ms` on the receiver; `--plc off` disables):
+
+- **Default 1 ms hold, 5 ms ramp.** At 48 kHz that's 48 held samples + 240 ramp samples. Covers a single lost packet (~125 µs in Mode C at 8000 pps) entirely as hold, and hides a 1–5 packet burst as ramp-to-silence.
+- **Max synthesized gap ~100 ms.** Beyond that, `snd_pcm_writei` is permitted to underrun naturally; Mode C will re-bootstrap the rate estimator when real packets resume. PLC is click-avoidance, not error correction.
+- **PCM only.** DSD's 1-bit stream doesn't admit linear scaling — a held non-zero bit pattern is DC at the DAC's analog filter output, which is safe *enough*, but a ramp of a 1-bit value is meaningless. The DSD path falls back to the DSD-idle byte `0x69` (defined in `packet.h` as `AOE_DSD_IDLE_BYTE`) for the gap duration. No ramp.
+- **Last-sample state resets on ALSA xrun recovery.** After `snd_pcm_prepare` the buffer is empty and replay resumes from the next real packet; carrying the old last-sample across an xrun would reintroduce the exact click the envelope exists to avoid.
+
+**Non-goals.** No linear predictive concealment (G.711 Appendix I style). No pitch-detected waveform extrapolation (Opus/WAV-interp style). Those are per-sample DSP, explicitly disallowed by §Goals. The envelope here is scalar-gain-over-frame and nothing more.
 
 ## Milestone plan
 
