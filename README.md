@@ -104,6 +104,8 @@ AOEther doesn't implement Roon, UPnP, or AirPlay natively — it bridges them vi
 
 The same talker and receiver binaries run under every recipe; only the source daemon changes. AirPlay (shairport-sync) and Spotify Connect (librespot) plug in with the same pattern.
 
+For builders planning a fixed Atmos array (7.1.6 or 9.1.6) over a Netgear AV M4250 or similar AVB/AES67 switch, see [`docs/atmos-network-choice.md`](docs/atmos-network-choice.md) — analysis of AVB vs Ravenna for home audiophile multichannel and the decision rule between them.
+
 ## Documentation
 
 - [`docs/design.md`](docs/design.md) — full architecture and milestone plan (start here for reviewers and contributors)
