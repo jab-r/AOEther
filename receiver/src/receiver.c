@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "avdecc.h"
 #include "avtp.h"
+#include "dop.h"
 #include "mdns.h"
 #include "packet.h"
 #include "rtp.h"
@@ -70,6 +71,13 @@ static int rate_supported(int hz)
     case 44100: case 48000:
     case 88200: case 96000:
     case 176400: case 192000:
+        return 1;
+    /* M9 Phase E — DXD PCM (352.8/384) and DoP carrier rates for full
+     * Ravenna interop on the RTP path. 705.6 kHz is the DSD256-DoP
+     * carrier (Merging cap); 1411.2 kHz is the DSD512-DoP carrier (out
+     * of AES67/Ravenna spec; supported for non-Merging gear). */
+    case 352800: case 384000:
+    case 705600: case 1411200:
         return 1;
     default:
         return 0;
@@ -292,7 +300,16 @@ static void usage(const char *prog)
         "                       the receiver handles the transpose + endian conversion.\n"
         "  --channels N         stream channel count (1..64, default %d)\n"
         "  --rate HZ            PCM only: 44100|48000|88200|96000|176400|192000\n"
+        "                       | 352800|384000 (DXD, --transport rtp, M9 Phase E)\n"
+        "                       | 705600 (DSD256-DoP carrier) | 1411200 (DSD512-DoP,\n"
+        "                       out of AES67 spec)\n"
         "                       (default %d; ignored for DSD — rate is implied by --format)\n"
+        "  --unwrap-dop         under --transport rtp + --format dsd*, decode the\n"
+        "                       incoming DoP-encoded L24 stream back to native DSD\n"
+        "                       and write SND_PCM_FORMAT_DSD_U* to ALSA. Default is\n"
+        "                       passthrough — write L24 to ALSA as PCM_S24_3LE and\n"
+        "                       let the DoP-capable USB DAC handle the marker pattern.\n"
+        "                       Use this for DACs that prefer native DSD over DoP-as-PCM.\n"
         "  --latency-us N       ALSA period latency hint (default %d)\n"
         "  --no-feedback        do not emit Mode C FEEDBACK frames (diagnostic)\n"
         "  --announce           publish this receiver via mDNS-SD (_aoether._udp)\n"
@@ -366,6 +383,7 @@ int main(int argc, char **argv)
     int plc_enabled = 1;
     int plc_hold_ms = PLC_DEFAULT_HOLD_MS;
     int plc_ramp_ms = PLC_DEFAULT_RAMP_MS;
+    int unwrap_dop = 0;
 
     static const struct option opts[] = {
         { "iface",       required_argument, 0, 'i' },
@@ -385,6 +403,7 @@ int main(int argc, char **argv)
         { "list-sap",    optional_argument, 0, 1002 },
         { "sdp",         required_argument, 0, 1003 },
         { "plc",         required_argument, 0, 1004 },
+        { "unwrap-dop",  no_argument,       0, 1005 },
         { "help",        no_argument,       0, 'h' },
         { 0, 0, 0, 0 },
     };
@@ -425,6 +444,7 @@ int main(int argc, char **argv)
                 return 2;
             }
             break;
+        case 1005: unwrap_dop = 1; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
@@ -729,10 +749,35 @@ int main(int argc, char **argv)
         fprintf(stderr, "receiver: AVTP AAF does not carry DSD; use --transport l2 or ip\n");
         return 2;
     }
-    if (transport == TRANSPORT_RTP && fmt.is_dsd) {
-        fprintf(stderr, "receiver: AES67 RTP is PCM-only; use --transport l2 or ip with --format dsd*\n");
+    /* M9 Phase E — full Ravenna interop. Native DSD over RTP is carried
+     * as DoP-encoded L24 PCM at the carrier rate (DSD bit rate / 16).
+     * Two output paths:
+     *
+     *   1. Default (passthrough): write the BE-L24 stream to ALSA as
+     *      PCM_S24_3LE at the carrier rate. The DAC firmware sees the
+     *      DoP marker pattern (0xFA / 0x05) in the most significant
+     *      byte of each sample and switches to DSD internally. Works
+     *      with any DoP-capable USB DSD DAC (most modern ones do).
+     *
+     *   2. --unwrap-dop: dop_decode the L24 stream back to native DSD
+     *      bytes, channel-interleaved at byte granularity (matching
+     *      AOE's wire DSD layout), and run the existing DSD-to-ALSA
+     *      repack. For DACs that prefer SND_PCM_FORMAT_DSD_U* over
+     *      DoP-as-PCM. */
+    const int  dop_active =
+        (transport == TRANSPORT_RTP && fmt.is_dsd);
+    const uint32_t dop_carrier_hz =
+        dop_active ? dop_carrier_rate_for_dsd((uint32_t)rate_hz) : 0u;
+    if (dop_active && dop_carrier_hz == 0u) {
+        fprintf(stderr, "receiver: --format %s has no DoP carrier rate "
+                        "(internal table miss)\n", fmt.name);
         return 2;
     }
+    /* Wire-side rate seen on the RTP/L24 packets. Under DoP this is the
+     * carrier (DSD byte rate / 2); otherwise rate_hz is already the
+     * wire rate. */
+    const int wire_rate_hz =
+        dop_active ? (int)dop_carrier_hz : rate_hz;
 
     /* AVTP AAF only carries the standard NSR rates. */
     uint8_t avtp_nsr_code = 0;
@@ -746,19 +791,31 @@ int main(int argc, char **argv)
     const uint8_t expected_format_code = fmt.wire_code;
 
     /* Resolve ALSA variant. Default derives from --format; user can override
-     * for DSD when the DAC's snd_usb_audio quirk exposes only DSD_U16 / U32. */
+     * for DSD when the DAC's snd_usb_audio quirk exposes only DSD_U16 / U32.
+     * Under DoP passthrough, force PCM S24_3LE — the DAC sees the DoP
+     * marker in MSB and switches to DSD itself. */
     struct alsa_variant av;
-    if (!alsa_format_s) alsa_format_s = fmt.is_dsd ? "dsd_u8" : "pcm_s24_3le";
-    if (parse_alsa_variant(alsa_format_s, &av) < 0) {
-        fprintf(stderr, "receiver: unknown --alsa-format %s\n", alsa_format_s);
-        return 2;
-    }
-    if (av.is_dsd != fmt.is_dsd) {
-        fprintf(stderr,
-                "receiver: --alsa-format %s is %s but --format %s is %s\n",
-                alsa_format_s, av.is_dsd ? "DSD" : "PCM",
-                fmt.name, fmt.is_dsd ? "DSD" : "PCM");
-        return 2;
+    if (dop_active && !unwrap_dop) {
+        /* DoP passthrough: ALSA carries L24 PCM regardless of --format /
+         * --alsa-format. Ignore any user override here; the DAC handles
+         * the DSD interpretation downstream of ALSA. */
+        if (parse_alsa_variant("pcm_s24_3le", &av) < 0) {
+            fprintf(stderr, "receiver: internal: pcm_s24_3le lookup failed\n");
+            return 2;
+        }
+    } else {
+        if (!alsa_format_s) alsa_format_s = fmt.is_dsd ? "dsd_u8" : "pcm_s24_3le";
+        if (parse_alsa_variant(alsa_format_s, &av) < 0) {
+            fprintf(stderr, "receiver: unknown --alsa-format %s\n", alsa_format_s);
+            return 2;
+        }
+        if (av.is_dsd != fmt.is_dsd) {
+            fprintf(stderr,
+                    "receiver: --alsa-format %s is %s but --format %s is %s\n",
+                    alsa_format_s, av.is_dsd ? "DSD" : "PCM",
+                    fmt.name, fmt.is_dsd ? "DSD" : "PCM");
+            return 2;
+        }
     }
 
     /* Socket setup per transport. L2 keeps two raw AF_PACKET sockets (one
@@ -890,10 +947,15 @@ int main(int argc, char **argv)
     /* ALSA's "frame rate" differs from wire rate_hz for wider DSD formats:
      * each ALSA frame consumes av.n_bytes bytes per channel, so
      *   ALSA rate = (wire DSD byte rate per channel) / av.n_bytes.
-     * For PCM S24_3LE the two concepts coincide. */
-    const unsigned alsa_rate = fmt.is_dsd
-        ? (unsigned)rate_hz / (unsigned)av.n_bytes
-        : (unsigned)rate_hz;
+     * For PCM S24_3LE the two concepts coincide.
+     *
+     * DoP passthrough opens ALSA as PCM at the L24 carrier rate; the
+     * DAC sees DoP markers and runs DSD internally. */
+    const unsigned alsa_rate = (dop_active && !unwrap_dop)
+        ? (unsigned)wire_rate_hz
+        : (fmt.is_dsd
+            ? (unsigned)rate_hz / (unsigned)av.n_bytes
+            : (unsigned)rate_hz);
     err = snd_pcm_set_params(pcm,
                              av.alsa_format,
                              SND_PCM_ACCESS_RW_INTERLEAVED,
@@ -929,7 +991,9 @@ int main(int argc, char **argv)
     } else {
         const char *label = (transport == TRANSPORT_RTP) ? "rtp" : "ip";
         const char *wire_fmt =
-            (transport == TRANSPORT_RTP) ? "L24(BE)" : fmt.name;
+            dop_active
+                ? (unwrap_dop ? "L24(BE) DoP→DSD" : "L24(BE) DoP")
+                : ((transport == TRANSPORT_RTP) ? "L24(BE)" : fmt.name);
         fprintf(stderr,
                 "receiver: transport=%s family=%s %s port=%d%s%s\n"
                 "          iface=%s dac=%s fmt=%s alsa=%s ch=%d rate=%d alsa_rate=%u latency_us=%d feedback=%s%s\n",
@@ -1050,6 +1114,15 @@ int main(int argc, char **argv)
     uint8_t dsd_leftover[64 * 3];
     int     dsd_leftover_per_ch = 0;
 
+    /* M9 Phase E — DoP decoder state for --unwrap-dop (RTP + DSD).
+     * Persists across packets so marker parity stays in sync. */
+    struct dop_dec_state dop_dec_st = {0};
+    /* Scratch for DoP-decoded DSD bytes. Each L24 frame in produces 2
+     * DSD bytes per channel out, so worst case = (RX_BUF_BYTES / 3) * 2 ≈
+     * 2 * RX_BUF_BYTES / 3, comfortably under RX_BUF_BYTES. In-place decode
+     * is unsafe for ch >= 4 due to read/write aliasing within a frame. */
+    uint8_t dop_dsd_scratch[RX_BUF_BYTES];
+
     /* Mode C state. */
     uint64_t frames_written_total = 0;
     uint64_t last_consumed = 0;
@@ -1128,7 +1201,13 @@ int main(int argc, char **argv)
                  * PCM. No AoE header, no magic byte — the receiver decides
                  * this is RTP from --transport rtp. Format / channel
                  * validation comes from SDP in a future milestone;
-                 * for M9 Phase A we trust --rate / --channels / L24. */
+                 * for M9 Phase A we trust --rate / --channels / L24.
+                 *
+                 * M9 Phase E: under DoP (RTP + DSD format), the L24 stream
+                 * carries DSD content. With --unwrap-dop we run dop_decode
+                 * to recover native DSD bytes for ALSA's DSD_U* path; by
+                 * default we pass the L24 stream straight to ALSA as PCM
+                 * S24_3LE and let the DAC unwrap the DoP markers. */
                 if ((size_t)n < hdr_off + RTP_HDR_LEN) { dropped++; goto check_feedback; }
                 const struct rtp_hdr *rh =
                     (const struct rtp_hdr *)(buf + hdr_off);
@@ -1140,18 +1219,37 @@ int main(int argc, char **argv)
                 }
                 (void)rts; (void)rssrc;
                 payload_bytes = (size_t)n - hdr_off - RTP_HDR_LEN;
-                size_t per_sample = (size_t)channels * bytes_per_sample;
+                /* Wire is L24 (3 bytes per sample per channel) regardless
+                 * of whether the content is plain PCM or DoP-encoded DSD. */
+                const size_t wire_bps = 3u;
+                size_t per_sample = (size_t)channels * wire_bps;
                 if (per_sample == 0 || payload_bytes == 0 ||
                     payload_bytes % per_sample != 0) {
                     dropped++; goto check_feedback;
                 }
-                frames = payload_bytes / per_sample;
+                frames = payload_bytes / per_sample;  /* L24 frames per channel */
                 payload_p = buf + hdr_off + RTP_HDR_LEN;
-                /* L24 samples are big-endian; swap to ALSA LE in place. */
-                rtp_swap24_inplace(payload_p, frames * (size_t)channels);
-                /* RTP sequence is 16-bit; widen against last using the
-                 * AVTP-style 8-bit handling doesn't apply. Treat it as a
-                 * 32-bit value; the delta compare below handles wrap. */
+                if (dop_active && unwrap_dop) {
+                    /* Decode DoP into a scratch buffer (in-place is unsafe
+                     * for ch >= 4: within a frame, writes at offset 2f*ch+c
+                     * can clobber subsequent reads at offset 3f*ch+3c'+
+                     * {1,2}). The decoded DSD bytes use AOE wire layout
+                     * (byte_i * channels + c) so they feed directly into
+                     * the existing DSD-to-ALSA repack at the bottom of the
+                     * loop. */
+                    dop_decode(payload_p, dop_dsd_scratch, channels, frames,
+                               &dop_dec_st);
+                    payload_p = dop_dsd_scratch;
+                    /* Each L24 frame yields 2 DSD bytes per channel, so
+                     * the existing DSD path sees 2*frames "DSD-byte
+                     * frames" per channel. */
+                    frames = frames * 2u;
+                } else {
+                    /* L24 samples are big-endian; swap to ALSA LE in place.
+                     * Under DoP passthrough this preserves the marker in
+                     * the most-significant byte position the DAC expects. */
+                    rtp_swap24_inplace(payload_p, frames * (size_t)channels);
+                }
                 seq = (uint32_t)rseq;
             } else if (transport == TRANSPORT_AVTP) {
                 if ((size_t)n < hdr_off + AVTP_HDR_LEN) { dropped++; goto check_feedback; }
