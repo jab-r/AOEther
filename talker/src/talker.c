@@ -2,6 +2,7 @@
 #include "audio_source.h"
 #include "avdecc.h"
 #include "avtp.h"
+#include "dop.h"
 #include "packet.h"
 #include "rtp.h"
 #include "sap.h"
@@ -189,6 +190,14 @@ static int rate_supported(int hz)
     case 44100: case 48000:
     case 88200: case 96000:
     case 176400: case 192000:
+        return 1;
+    /* M9 Phase E — DXD and DoP carrier rates for full Ravenna interop.
+     * 352800/384000 are DXD PCM; 352800/705600 also serve as DoP carriers
+     * for DSD128/DSD256 (Merging caps at DSD256). 1411200 is the DSD512
+     * DoP carrier — out of AES67/Ravenna spec, supported for non-Merging
+     * gear that handles it. */
+    case 352800: case 384000:
+    case 705600: case 1411200:
         return 1;
     default:
         return 0;
@@ -422,8 +431,17 @@ static void usage(const char *prog)
         "                               DoP remains deferred.\n"
         "                               AVTP transport carries pcm only.\n"
         "  --channels N                 channel count (1..64, default %d)\n"
-        "  --rate    HZ                 44100|48000|88200|96000|176400|192000 (default %d)\n"
-        "                               (ignored for native DSD — rate is implied by --format)\n"
+        "  --rate    HZ                 44100|48000|88200|96000|176400|192000\n"
+        "                               | 352800|384000 (DXD, --transport rtp, M9 Phase E)\n"
+        "                               | 705600 (DSD256-DoP carrier, advertised\n"
+        "                                 automatically when --format dsd256 + rtp)\n"
+        "                               | 1411200 (DSD512-DoP carrier, out of\n"
+        "                                 AES67 spec) (default %d)\n"
+        "                               (ignored for native DSD — rate is implied by --format;\n"
+        "                                under --transport rtp + dsd*, AOEther emits DoP-encoded\n"
+        "                                L24 at the corresponding carrier rate per the DoP v1.1\n"
+        "                                spec — Merging-style Ravenna interop, capped at DSD256\n"
+        "                                for Merging gear; DSD512 supported for non-Merging gear)\n"
         "\n"
         "PCM payload is s24le-3 (24-bit little-endian packed). Native DSD payload is\n"
         "raw DSD bits, MSB-first within each byte, interleaved by channel. Sources\n"
@@ -698,13 +716,33 @@ int main(int argc, char **argv)
         fprintf(stderr, "talker: AVTP AAF does not carry DSD; use --transport l2 or ip with --format dsd*\n");
         return 2;
     }
-    if (transport == TRANSPORT_RTP && fmt.is_dsd) {
-        fprintf(stderr, "talker: AES67 RTP is PCM-only; use --transport l2 or ip with --format dsd*\n");
+    /* M9 Phase E — full Ravenna interop. Native DSD over RTP rides as
+     * DoP-encoded L24 PCM at the carrier rate (DSD bit rate / 16, i.e.
+     * DSD byte rate / 2). The source still produces native DSD bytes;
+     * the egress loop runs dop_encode just before the RTP send. SDP,
+     * RTP timestamp clock, and the MTU/ptime budget all use the L24
+     * carrier rate (wire), not the DSD byte rate (source). */
+    const int  dop_active = (transport == TRANSPORT_RTP && fmt.is_dsd);
+    const uint32_t dop_carrier_hz =
+        dop_active ? dop_carrier_rate_for_dsd((uint32_t)rate_hz) : 0u;
+    if (dop_active && dop_carrier_hz == 0u) {
+        fprintf(stderr, "talker: --format %s has no DoP carrier rate "
+                        "(internal table miss)\n", fmt.name);
         return 2;
     }
     const uint8_t format_code = fmt.code;
     const int bytes_per_sample = fmt.bytes_per_sample;
     const int is_dsd = fmt.is_dsd;
+    /* Wire-side units. Under DoP, the source produces 2 DSD bytes per
+     * channel for every 1 L24 carrier frame (3 wire bytes). For the MTU
+     * and SDP math we want wire-frames × wire-bytes; "samples_per_*"
+     * remains source-units (DSD bytes per channel) so the existing
+     * fractional accumulator and source.read interface are unchanged. */
+    const int wire_rate_hz =
+        dop_active ? (int)dop_carrier_hz : rate_hz;
+    const int wire_bytes_per_sample =
+        dop_active ? 3 : bytes_per_sample;
+    (void)wire_bytes_per_sample;  /* MTU math uses dop_active branch directly */
 
     /* M9 Phase B + C — build one canonical SDP for the current stream.
      * Used by --sdp-only (print and exit) and --announce-sap (periodic
@@ -780,7 +818,7 @@ int main(int argc, char **argv)
         sdp.session_id    = (uint64_t)time(NULL);
         sdp.session_version = sdp.session_id;
         sdp.encoding      = SDP_ENC_L24;
-        sdp.sample_rate_hz = (uint32_t)rate_hz;
+        sdp.sample_rate_hz = (uint32_t)wire_rate_hz;
         sdp.channels      = (uint8_t)channels;
         sdp.payload_type  = RTP_DEFAULT_PT_L24;
         sdp.ptime_us      = (uint32_t)ptime_us;
@@ -802,8 +840,9 @@ int main(int argc, char **argv)
             char host[64] = "aoether";
             gethostname(host, sizeof host - 1);
             snprintf(sdp.session_name, SDP_MAX_SESSION_NAME,
-                     "%s %uch/%u", host,
-                     (unsigned)channels, (unsigned)rate_hz);
+                     "%s %uch/%u%s", host,
+                     (unsigned)channels, (unsigned)wire_rate_hz,
+                     dop_active ? " DoP" : "");
         }
         /* Defer sdp_build (and --sdp-only exit) to after substreams[] is
          * built, so the multi-stream bundle builder has per-substream
@@ -850,8 +889,19 @@ int main(int argc, char **argv)
     const double nominal_spm =
         (double)rate_hz * (double)packet_period_ns / 1e9;
     const int max_samples_per_microframe = (int)(nominal_spm + 0.5) + 4;
+    /* Source-units per microframe (DSD bytes/ch under DoP, samples/ch
+     * elsewhere) × channels × source-bytes-per-sample. The wire
+     * payload may be different — see wire_payload below. */
     const size_t max_microframe_payload =
         (size_t)max_samples_per_microframe * channels * bytes_per_sample;
+    /* Wire-side worst case for MTU checks. Under DoP, every 2 source
+     * units (DSD bytes) become 3 wire bytes (one L24 frame). The +1/2
+     * rounds up so an odd source-unit count still fits. */
+    const size_t max_microframe_payload_wire =
+        dop_active
+            ? ((size_t)((max_samples_per_microframe + 1) / 2)
+                 * (size_t)channels * 3u)
+            : max_microframe_payload;
 
     /* Per-fragment upper bound on payload_count: clamped by the u8 field
      * and by the worst-case per-fragment MTU budget. Fragmentation is an
@@ -886,9 +936,15 @@ int main(int argc, char **argv)
             check_ch = (channels < channels_per_stream)
                      ? channels : channels_per_stream;
         }
+        /* Under DoP the wire bytes per source unit are 3/2 (DSD-byte→L24);
+         * round up odd source-unit counts. Plain PCM/AVTP keep the
+         * source-unit accounting (1:1). */
         const size_t check_payload =
-            (size_t)max_samples_per_microframe
-            * (size_t)check_ch * (size_t)bytes_per_sample;
+            dop_active
+                ? ((size_t)((max_samples_per_microframe + 1) / 2)
+                     * (size_t)check_ch * 3u)
+                : ((size_t)max_samples_per_microframe
+                     * (size_t)check_ch * (size_t)bytes_per_sample);
         if ((transport == TRANSPORT_AVTP || transport == TRANSPORT_RTP) &&
             check_payload + proto_hdr_len > ETH_MTU_PAYLOAD) {
             const char *mode_name =
@@ -917,7 +973,8 @@ int main(int argc, char **argv)
      *     into `frame`. */
     const size_t max_frag_payload =
         (transport == TRANSPORT_AVTP || transport == TRANSPORT_RTP)
-            ? max_microframe_payload
+            ? (dop_active ? max_microframe_payload_wire
+                          : max_microframe_payload)
             : ((size_t)max_frag_pc * channels * bytes_per_sample);
     const size_t max_frame = sizeof(struct ether_header) + proto_hdr_len + max_frag_payload;
 
@@ -1240,6 +1297,19 @@ int main(int argc, char **argv)
 
     uint8_t *frame = calloc(1, max_frame);
     uint8_t *audio_buf = calloc(1, max_microframe_payload);
+    /* DoP scratch: holds one substream's DSD-byte slice between the
+     * substream gather and the dop_encode → payload step. Size = max
+     * source DSD bytes for any one substream = max_samples_per_microframe
+     * × channels (worst case: substream covers all channels). Only
+     * allocated under DoP. */
+    uint8_t *dop_scratch = NULL;
+    if (dop_active) {
+        dop_scratch = calloc(1, max_microframe_payload);
+        if (!dop_scratch) {
+            fprintf(stderr, "talker: out of memory allocating DoP scratch\n");
+            return 1;
+        }
+    }
     if (!frame || !audio_buf) {
         fprintf(stderr, "talker: out of memory allocating frame/audio buffers\n");
         return 1;
@@ -1322,6 +1392,7 @@ int main(int argc, char **argv)
         socklen_t dest_ss_len;
         uint32_t ssrc;
         uint16_t seq16;
+        struct dop_enc_state dop;  /* M9 Phase E: per-substream DoP parity */
     };
     struct rtp_substream substreams[MAX_RTP_SUBSTREAMS];
     int n_substreams = 0;
@@ -1509,7 +1580,7 @@ int main(int argc, char **argv)
                 m->dest_ip       = media_dest_bufs[s];
                 m->ttl           = dest_is_multicast ? 32 : 0;
                 m->encoding      = SDP_ENC_L24;
-                m->sample_rate_hz = (uint32_t)rate_hz;
+                m->sample_rate_hz = (uint32_t)wire_rate_hz;
                 m->channels      = (uint8_t)substreams[s].n_ch;
                 m->payload_type  = RTP_DEFAULT_PT_L24;
                 m->ptime_us      = (uint32_t)ptime_us;
@@ -1636,8 +1707,9 @@ int main(int argc, char **argv)
                 dest_family == AF_INET ? "v4" : "v6",
                 dest_is_multicast ? "multicast" : "unicast",
                 iface, ifindex,
-                transport == TRANSPORT_RTP ? "L24(BE)" : format_s,
-                channels, rate_hz,
+                dop_active ? "L24(BE) DoP" :
+                    (transport == TRANSPORT_RTP ? "L24(BE)" : format_s),
+                channels, dop_active ? wire_rate_hz : rate_hz,
                 pps, nominal_spm, max_frag_pc, nominal_K,
                 max_frame - sizeof(struct ether_header),
                 feedback_enabled_for_transport ? "on" : "off",
@@ -1881,6 +1953,21 @@ skip_feedback:
             if (pc < 1) pc = 1;
             if (pc > max_samples_per_microframe) pc = max_samples_per_microframe;
             sample_accum -= pc;
+            /* DoP packs 2 DSD bytes per channel into 1 L24 frame. Round
+             * pc down to even so each microframe carries whole L24
+             * frames; the spare DSD byte (if any) is carried forward
+             * via sample_accum. Ensure pc >= 2 so we always emit at
+             * least one L24 frame. */
+            if (dop_active) {
+                if (pc & 1) {
+                    pc -= 1;
+                    sample_accum += 1.0;
+                }
+                if (pc < 2) {
+                    pc = 2;
+                    sample_accum -= 1.0;
+                }
+            }
 
             /* Read one microframe of audio into the standalone audio_buf.
              * The source writes `pc` samples/bytes per channel, interleaved
@@ -1962,48 +2049,79 @@ skip_feedback:
                      * accurate multichannel. n_substreams == 1 is the
                      * single-stream fast path. Each substream carries its
                      * own SSRC and sequence counter; PTIME and payload type
-                     * match across the bundle. */
+                     * match across the bundle.
+                     *
+                     * M9 Phase E: under DoP, each substream gathers its
+                     * channel slice as DSD bytes, runs dop_encode into
+                     * the payload area (BE L24), and emits frag_pc/2
+                     * L24 frames. The DoP encoder produces network-byte-
+                     * order L24 directly, so rtp_swap24_inplace is
+                     * skipped on this path. */
+                    const int l24_frames =
+                        dop_active ? (frag_pc / 2) : frag_pc;
                     for (int s = 0; s < n_substreams && !g_stop; s++) {
                         struct rtp_substream *ss = &substreams[s];
                         const int ss_ch = ss->n_ch;
 
-                        /* Gather this substream's channel slice from the
-                         * interleaved audio_buf into the on-wire payload
-                         * area. Single-stream degenerates to a memcpy of
-                         * the whole microframe. */
-                        if (ss->first_ch == 0 && ss_ch == channels) {
-                            memcpy(payload, audio_buf,
-                                   (size_t)frag_pc * (size_t)ss_ch
-                                       * (size_t)bytes_per_sample);
-                        } else {
-                            const size_t ss_stride =
-                                (size_t)ss_ch * (size_t)bytes_per_sample;
-                            const size_t full_stride =
-                                (size_t)channels * (size_t)bytes_per_sample;
-                            const size_t ch_offset =
-                                (size_t)ss->first_ch * (size_t)bytes_per_sample;
-                            for (int samp = 0; samp < frag_pc; samp++) {
-                                memcpy(payload + (size_t)samp * ss_stride,
-                                       audio_buf
-                                           + (size_t)samp * full_stride
-                                           + ch_offset,
-                                       ss_stride);
+                        if (dop_active) {
+                            /* Gather DSD bytes for this substream's
+                             * channel range into dop_scratch. Source is
+                             * audio_buf with `frag_pc` DSD bytes per
+                             * channel, channels-interleaved at byte
+                             * granularity. */
+                            if (ss->first_ch == 0 && ss_ch == channels) {
+                                memcpy(dop_scratch, audio_buf,
+                                       (size_t)frag_pc * (size_t)ss_ch);
+                            } else {
+                                for (int samp = 0; samp < frag_pc; samp++) {
+                                    for (int c = 0; c < ss_ch; c++) {
+                                        dop_scratch[(size_t)samp * ss_ch + c] =
+                                            audio_buf[(size_t)samp * channels
+                                                      + ss->first_ch + c];
+                                    }
+                                }
                             }
+                            dop_encode(dop_scratch, payload, ss_ch,
+                                       (size_t)l24_frames, &ss->dop);
+                        } else {
+                            /* Plain PCM gather (M9/M10 fast path). */
+                            if (ss->first_ch == 0 && ss_ch == channels) {
+                                memcpy(payload, audio_buf,
+                                       (size_t)frag_pc * (size_t)ss_ch
+                                           * (size_t)bytes_per_sample);
+                            } else {
+                                const size_t ss_stride =
+                                    (size_t)ss_ch * (size_t)bytes_per_sample;
+                                const size_t full_stride =
+                                    (size_t)channels * (size_t)bytes_per_sample;
+                                const size_t ch_offset =
+                                    (size_t)ss->first_ch * (size_t)bytes_per_sample;
+                                for (int samp = 0; samp < frag_pc; samp++) {
+                                    memcpy(payload + (size_t)samp * ss_stride,
+                                           audio_buf
+                                               + (size_t)samp * full_stride
+                                               + ch_offset,
+                                           ss_stride);
+                                }
+                            }
+                            /* AES67 L24 samples are big-endian on the wire;
+                             * ALSA is LE. Swap in place, same as the AVTP
+                             * edge. */
+                            rtp_swap24_inplace(payload,
+                                               (size_t)frag_pc * (size_t)ss_ch);
                         }
-                        /* AES67 L24 samples are big-endian on the wire;
-                         * ALSA is LE. Swap in place, same as the AVTP
-                         * edge. */
-                        rtp_swap24_inplace(payload,
-                                           (size_t)frag_pc * (size_t)ss_ch);
                         rtp_hdr_build(rtp_hdr_p,
                                       RTP_DEFAULT_PT_L24,
                                       ss->seq16++,
                                       rtp_timestamp,
                                       ss->ssrc);
+                        const size_t ss_payload_bytes =
+                            dop_active
+                                ? ((size_t)l24_frames * (size_t)ss_ch * 3u)
+                                : ((size_t)frag_pc * (size_t)ss_ch
+                                       * (size_t)bytes_per_sample);
                         const size_t ss_frame_len =
-                            RTP_HDR_LEN
-                            + (size_t)frag_pc * (size_t)ss_ch
-                              * (size_t)bytes_per_sample;
+                            RTP_HDR_LEN + ss_payload_bytes;
                         ssize_t ss_sent = sendto(data_sock,
                                                  frame + tx_offset,
                                                  ss_frame_len, 0,
@@ -2019,8 +2137,10 @@ skip_feedback:
                             break;
                         }
                     }
-                    /* All substreams advance together. */
-                    rtp_timestamp += (uint32_t)frag_pc;
+                    /* All substreams advance together. RTP timestamp clock
+                     * is the L24 carrier rate under DoP, the source rate
+                     * otherwise. */
+                    rtp_timestamp += (uint32_t)l24_frames;
                     /* Multi-stream emission is self-contained; skip the
                      * shared single-packet sendto that follows the AOE /
                      * AVTP path. K is always 1 for RTP, so breaking the

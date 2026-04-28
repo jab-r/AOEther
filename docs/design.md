@@ -550,10 +550,21 @@ Ships in phases:
 
 **Phase D — [hardware-blocked] Interop validation.** Confirmed playback with `aes67-linux-daemon` (open-source reference), Merging ANEMAN / Anubis, a Dante-with-AES67-mode device, and a Neumann or similar Ravenna endpoint.
 
-**Documented constraints:**
-- AES67 is PCM only, so DSD streams remain on Modes 1 / 3 (with AoE header). The talker / receiver reject `--transport rtp --format dsd*` at startup.
+**Phase E — [shipped] Full Ravenna interop (DXD + DoP, symmetric).** Lifts the AES67-strict rate cap and the DSD reject so AOEther interops with the Merging-class Ravenna feature set.
+Talker `rate_supported()` and receiver `rate_supported()` both gain 352800 / 384000 (DXD PCM) and 705600 / 1411200 (DoP carriers).
+Native DSD over RTP rides as DoP-encoded L24 PCM at the carrier rate (DSD bit rate / 16) per the [DoP v1.1 spec](https://dsd-guide.com/sites/default/files/white-papers/DoP_open_Standard_1v1.pdf): alternating 0xFA / 0x05 marker in the most significant byte, two DSD bytes packed into the lower two bytes per channel per frame.
+Encoder + decoder live in `common/dop.{h,c}` (~150 LoC); DSD I/O uses AOE wire layout (`byte_i * channels + c`) so the same encoder feeds Modes 1/3 if that path is later activated.
+Talker auto-rounds the per-microframe DSD-byte count to even and carries any spare DSD byte forward via the existing fractional sample accumulator; the RTP timestamp clock advances at the L24 carrier rate.
+SDP advertises the carrier rate (e.g. `L24/176400/2` for DSD64-DoP) — DoP is content-level, not signaled at the SDP layer.
+Receiver supports two output modes for incoming DoP streams: **passthrough** (default) writes the BE-L24 stream to ALSA as `SND_PCM_FORMAT_S24_3LE` at the carrier rate and lets the DAC firmware see the marker pattern in the MSB and switch to DSD itself — works with any DoP-capable USB DSD DAC; **`--unwrap-dop`** runs `dop_decode` and pushes native DSD bytes through the existing `SND_PCM_FORMAT_DSD_U*` repack path for DACs that prefer native DSD over DoP-as-PCM.
+MTU/ptime guidance: DXD and DSD256-DoP stereo fit at 250 µs ptime (≤1059 B/packet); DSD512-DoP stereo requires 125 µs (1059 B); multichannel DXD routes through the M10 multi-stream split.
+DSD512-over-DoP at 1411200 Hz L24 is **out of AES67/Ravenna spec** (Merging gear caps at DSD256); shipped for non-Merging gear that handles 1.4112 MHz L24 carriers, gated only by the runtime MTU/ptime checks.
+
+**Documented constraints (post-Phase-E):**
 - AES67 channel counts typically cap at 8 per stream; higher counts split across multiple substreams via RFC 5888 `a=group:LS` SDP bundling (M10).
 - L16 payload is wire-format-ready (`rtp_swap16_inplace` exists) but not yet plumbed as a `--format` option — s24 is AOEther's PCM lock.
+- DoP is the only DSD-over-RTP carriage AOEther emits. Vendor-specific native-DSD-over-RTP framings (e.g. AM824 DSD subtypes) are not implemented; not standard on consumer Ravenna gear.
+- DSD512-DoP is supported but out-of-spec; passes only the runtime MTU check, not any standards conformance check. Document the specific gear it works against in `docs/recipe-merging.md`.
 
 **Key risks:**
 - AES67 has enough ambiguity in practice that interop edge cases are expected. Approach: start with `aes67-linux-daemon` as a known-good reference, then expand to commercial gear with iteration.

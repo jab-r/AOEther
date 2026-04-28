@@ -353,9 +353,45 @@ SAP discovery (`--announce-sap` / `--list-sap`) follows the same family: an IPv4
 
 ### What is not in Mode 4 today
 
-- **SDP / SAP** — M9 Phase B. Without SDP, the talker and receiver must agree on format / channels / rate / destination out of band. No dynamic payload-type negotiation.
-- **PTPv2 timestamp discipline** — M9 Phase C. The RTP timestamp advances from a local monotonic clock; it is not PTP-locked. Strict AES67 listeners may tolerate this or may not, depending on their sync policy.
 - **Mode C clock feedback** — disabled entirely under `--transport rtp`. AES67 expects PTP, not UAC2-style feedback. Receivers do not emit 0x88B6 frames when running in RTP mode.
+
+### DXD and DSD-over-DoP (M9 Phase E)
+
+Mode 4 carries **DXD** PCM (352.8 / 384 kHz, 24-bit) on the same L24 wire format as the AES67-baseline 48/96 kHz path — only the rate changes. SDP advertises `L24/352800/<channels>` or `L24/384000/<channels>`; receivers that don't support those rates in their decoder will reject the session, those that do play it as PCM.
+
+**DSD over Mode 4** rides as DoP-encoded L24 PCM at the carrier rate per [DoP v1.1](https://dsd-guide.com/sites/default/files/white-papers/DoP_open_Standard_1v1.pdf). Each L24 sample carries one DoP frame:
+
+```
+ byte 0 (MSB)  byte 1        byte 2 (LSB)
++------------+--------------+--------------+
+| marker     | DSD bits 0-7 | DSD bits 8-15|
+| 0xFA / 0x05|              |              |
++------------+--------------+--------------+
+```
+
+The marker alternates per frame across **all** channels of a given frame: frame F uses marker M, frame F+1 uses the other marker, and so on. AOEther emits `0xFA` on even frames and `0x05` on odd; listeners detect either polarity and the alternation rather than a fixed starting phase.
+
+The L24 carrier rate is the DSD bit rate divided by 16 (i.e. DSD byte rate / 2), since each L24 frame carries 16 DSD bits per channel:
+
+| DSD format | DSD bit rate | DSD byte rate | DoP carrier (L24) | Notes |
+|---|---|---|---|---|
+| DSD64 | 2.8224 MHz | 352800 Hz | 176400 Hz | Standard Ravenna |
+| DSD128 | 5.6448 MHz | 705600 Hz | 352800 Hz | Standard Ravenna; same rate as DXD |
+| DSD256 | 11.2896 MHz | 1411200 Hz | 705600 Hz | Merging Ravenna max |
+| DSD512 | 22.5792 MHz | 2822400 Hz | 1411200 Hz | **Out of AES67/Ravenna spec**; supported for non-Merging gear |
+
+DoP is **content-level**, not signaled in SDP. The talker advertises plain L24 at the carrier rate; the listener detects DoP from the marker pattern in the high byte of each sample. No new SDP attributes are introduced.
+
+**DSD byte layout** within DoP frames matches AOEther's AOE wire DSD layout (`byte_i * channels + c`, MSB-first within each byte). For each L24 frame `f`, the encoder reads two DSD-byte rows (`byte_i = 2f` and `byte_i = 2f+1`) for every channel and packs them under the marker. The decoder reverses the operation. This layout choice means the DoP encoder/decoder in `common/dop.{h,c}` can drive Modes 1/3 in addition to Mode 4 if those paths are later activated; the shared DSD I/O contract is the AOE wire layout.
+
+**Receiver output paths** for DoP-carrying Mode 4 streams:
+
+- **Passthrough (default)**: write the byte-swapped L24 stream to ALSA as `SND_PCM_FORMAT_S24_3LE` at the carrier rate. Any DoP-capable USB DSD DAC sees the marker pattern in the most-significant byte and switches to DSD internally.
+- **`--unwrap-dop`**: run the DoP decoder, recover native DSD bytes (AOE-wire layout), and feed the existing `SND_PCM_FORMAT_DSD_U*` ALSA repack. For DACs that prefer native DSD over DoP-as-PCM.
+
+**MTU and ptime** at high carrier rates: 1 ms ptime exceeds 1500-byte MTU above 192 kHz stereo. Use `--ptime 250` for DXD / DSD128-DoP / DSD256-DoP stereo (≤1059 B/packet), `--ptime 125` for DSD512-DoP stereo (1059 B), or rely on the M10 multi-stream split for multichannel DXD. The talker's startup MTU check rejects configs that exceed 1500 B at the chosen ptime.
+
+**Format codes 0x20..0x23** in the AoE-header table above are reserved for DoP-in-AOE-modes (Modes 1/3) and are not currently emitted or accepted by the talker / receiver. The Mode 4 DoP path documented here uses standard L24 PCM payload (no AOE-format-code field involved); only the L24 sample content is special.
 
 ### Multi-stream SDP bundling (M10)
 
