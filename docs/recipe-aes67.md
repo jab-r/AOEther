@@ -180,6 +180,6 @@ Substitute your talker's host IP for `192.168.1.100`. For the low-latency profil
 - No payload-type negotiation — talker emits PT=96 unconditionally, receiver accepts any PT. Controllers negotiate PT through SDP in practice, so this rarely matters.
 - L16 encoding path exists in the common module but isn't exposed as a `--format` option yet.
 - 44.1 kHz / 88.2 kHz / 176.4 kHz work at the wire level but AES67 deployments overwhelmingly use 48 kHz / 96 kHz / 192 kHz.
-- `--transport rtp --format dsd*` is rejected; AES67 is PCM-only. DSD streams remain on Modes 1 / 3.
+- **DXD (352.8 / 384 kHz) and DSD-via-DoP** ship in M9 Phase E for full Ravenna interop. The talker/receiver still target the AES67 baseline (48 / 96 / 192 kHz PCM); for DXD or DSD with Merging-class gear see [`recipe-merging.md`](recipe-merging.md). Standard AES67 listeners (Neumann, Genelec, Dante) cap at 96 kHz and don't consume DXD or DoP — point those at the baseline rates.
 - Multichannel beyond stereo works but AES67 conventions cap per-stream channel count at 8; higher counts should be split into multiple sessions.
 - `--ptp` re-reads gmid via `pmc` every 30 s (not on every BMCA change). In the worst case a fresh master takes ≤30 s to propagate into SDP. If you need tighter tracking, reduce `SAP_ANNOUNCE_INTERVAL_S`.

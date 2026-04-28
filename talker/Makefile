@@ -15,6 +15,7 @@ SRCS      := \
     src/audio_source_dff.c \
     ../common/packet.c \
     ../common/avtp.c \
+    ../common/dop.c \
     ../common/rtp.c \
     ../common/sdp.c \
     ../common/sap.c \
@@ -36,7 +37,7 @@ endif
 .PHONY: all clean
 all: $(BUILD)/talker
 
-$(BUILD)/talker: $(SRCS) src/audio_source.h ../common/packet.h ../common/avtp.h ../common/rtp.h ../common/sdp.h ../common/sap.h ../common/ptp_pmc.h ../common/avdecc.h | $(BUILD)
+$(BUILD)/talker: $(SRCS) src/audio_source.h ../common/packet.h ../common/avtp.h ../common/dop.h ../common/rtp.h ../common/sdp.h ../common/sap.h ../common/ptp_pmc.h ../common/avdecc.h | $(BUILD)
 	$(LINK) $(CFLAGS) $(INCLUDES) $(SRCS) -o $@ $(LDLIBS)
 
 $(BUILD):
